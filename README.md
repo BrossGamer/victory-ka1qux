@@ -27,10 +27,10 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
 | Light in shadow | 🟡 | the title's own ray-traced light runs, on by default (`VICTORY_RAYS=0` turns it off): its structures are built and traced, and shaded faces of buildings, trees and characters get bounced light, where without it they are near black. Four runs on the street, 5 to 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 to 0.1 s more |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
-| Frame rate | 🟡 | with the switches below, in the open world on a street with about 6,100 draws a frame: a median of 0.42 s a frame (about 2.4 frames a second), 0.33 s at best; the same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main and 0.53 s before the write marks (below). An earlier build, in a lighter view of about 2,000 draws, took 0.32 s. With victory-fork's speed defaults a frame took 144 to 150 ms in steady open-world views on an earlier build, but the picture is not right with them yet (below) |
+| Frame rate | 🟡 | in the open world on a street with about 6,000 draws a frame, with ray-traced light: a median of 0.33 to 0.35 s a frame (about 3 frames a second), 0.26 s at best, with victory-fork's speed defaults (submissions sent ahead of the card), measured in three launches with the picture right; without them 0.53 to 0.56 s. The same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
-| Tests | ✅ | `cargo test --workspace` runs 785 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| Tests | ✅ | `cargo test --workspace` runs 803 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
@@ -270,8 +270,11 @@ Venglovsky), #191 (gdawid94), #196 (JaumeMarRib), #237 (fffluffy-dev), #282
 NetherySiloX), #1069 (alexis27yt). From upstream VIctory's open pull
 requests: the BCPack fixes #2648 and #2649 (chaseb64), the mesh dispatch
 of #2624 (andrewpozdnakov7-jpg), and the BCPack, tiling and write-mark speed-ups
-#2735, #2736 and #2755 (brainbudt). Through victory-fork #1112 (KyleS98), two
-translator fixes of DexNom/VIctory.
+#2735, #2736 and #2755 (brainbudt), the wave64 mask set by halves #2783
+(BastienRodz) and audio that keeps up with slow frames #2788 (0xkn0wh3r3). Through victory-fork #1112 (KyleS98), two
+translator fixes of DexNom/VIctory; victory-fork #1126 (Vladimir-Human): more
+exact DXIL clean-up passes (loop-invariant code motion, local and shared-memory
+forwarding, redundant barriers).
 
 ## Running it
 
@@ -304,23 +307,25 @@ target\diag\victory.exe translate --cache --pipelines --used-pipelines `
 # The switches the state above was measured with.
 $env:VICTORY_INDIRECT_CLAMP = "0"   # the clamp of indirect arguments has dropped geometry here
 $env:VICTORY_SKIP_MOVIES    = "1"
-$env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
-$env:VICTORY_CARD_BUFFERS_MIN_MB = "16"; $env:VICTORY_CARD_BUFFERS_MB = "512"
-$env:VICTORY_LATE_WAIT_LISTS = "128"
+$env:VICTORY_COMMIT_RESERVE_MB = "6144"  # stop filling the card with texture copies when the
+                                         # PC has less than this left to commit (see above)
 # $env:VICTORY_RAYS = "0"            # without the title's ray-traced light (on by default)
-# $env:VICTORY_COMMIT_RESERVE_MB = "6144"  # stop filling the card with texture copies when the
-#                                         # PC has less than this left to commit (see below)
+# The slower, older settings (no submissions sent ahead of the card):
+# $env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
+# $env:VICTORY_CARD_BUFFERS_MIN_MB = "16"; $env:VICTORY_CARD_BUFFERS_MB = "512"
+# $env:VICTORY_LATE_WAIT_LISTS = "128"
 
 target\diag\victory.exe run "$g\<the title's exe>" --execute
 ```
 
-The last three lines of switches turn off victory-fork's newer speed defaults
-(sending submissions ahead of the card). Measured on this card with this build,
-they bring a frame from a median of 0.50 s down to 0.29 s (0.17 s at best),
-and in the open world from 0.33 s to 0.144 to 0.150 s in steady views (about
-7 frames a second), with no failure in a 17-minute session. Baked hair and skin
-still come out wrong with them (too light now, black on an earlier build), so
-they are off in the recommended settings until that is fixed.
+victory-fork's speed defaults send submissions ahead of the card. On this card
+they bring the street from a median of 0.53 to 0.56 s down to 0.33 to 0.35 s a
+frame, with skin, hair and clothes right in three launches (on earlier builds
+baked hair and skin came out wrong with them; the bakes' sources now go first in
+the texture queue). `VICTORY_BAKE_SETTLE=1` makes the two seconds after each
+character bake run with every submission waited for, and
+`VICTORY_STALE_AFTER_FLIGHTS=1` keeps a slot's old view until the submissions in
+the air are done; both are off, as the picture came out right without them.
 
 The frame rate is drawn in the top left corner of the window
 (`VICTORY_FPS_COUNTER=0` turns it off; victory-fork's main).
