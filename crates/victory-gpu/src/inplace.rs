@@ -1293,8 +1293,22 @@ mod tests {
             rig.store(&placed.buffer, placed.bias + 16, &[0xa5; 64]).unwrap();
             assert!(same((start + 16) as *const u8, &[0xa5; 64]), "the GPU's write is at the title's address");
             drop(placed);
+            drop(rig);
             // Half of it decommitted: turned down, the host not asked.
-            assert_ne!(mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT), 0);
+            // Windows refuses to decommit memory a heap is still open on,
+            // and the host lets go of the heap a moment after its last
+            // reference is dropped (the decommit failed in 3 runs of 8 on a
+            // Radeon RX 7800 XT with the other tests running beside it), so
+            // it is asked again for a while.
+            let mut freed = 0;
+            for _ in 0..500 {
+                freed = mem::VirtualFree(base.add(2 * K64).cast(), K64, mem::MEM_DECOMMIT);
+                if freed != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_ne!(freed, 0, "the memory is decommitted once the heap on it is gone");
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

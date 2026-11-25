@@ -20,6 +20,8 @@ pub mod agility;
 #[cfg(windows)]
 pub mod caps;
 #[cfg(all(windows, feature = "diagnostics"))]
+mod bake_probe;
+#[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;

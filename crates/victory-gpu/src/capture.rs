@@ -338,6 +338,54 @@ pub(crate) fn save_read_back(
     }
 }
 
+/// Reads a host texture back (every submission has run: the caller is at a
+/// frame's present) and gives `f` its first subresource's rows, the
+/// description and the row pitch. For the bake probe. `None` for a texture
+/// that is not a plain 2D one.
+pub(crate) fn with_rows<R>(
+    host: &crate::host::Host,
+    copy: &crate::resource::HostTexture,
+    f: impl FnOnce(&[u8], &D3D12_RESOURCE_DESC, &D3D12_SUBRESOURCE_FOOTPRINT) -> R,
+) -> Option<R> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let texture = &copy.texture;
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        return None;
+    }
+    let list = host.new_list().ok()?;
+    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, copy.state.load(Relaxed)) as i32);
+    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: an open list of ours and a live texture.
+    let read = unsafe {
+        if state != source {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, state, source)]);
+        }
+        let read = read_back(&host.device, &list.list, texture);
+        if state != source {
+            list.list
+                .ResourceBarrier(&[crate::host::transition(texture, source, state)]);
+        }
+        read
+    };
+    list.close();
+    host.execute(&[&list]);
+    let (buffer, footprint) = read?;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy finished; the mapping spans the footprint's rows.
+    unsafe {
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        let f_ = footprint.Footprint;
+        let len = f_.RowPitch as usize * f_.Height as usize;
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let out = f(rows, &d, &f_);
+        buffer.Unmap(0, None);
+        Some(out)
+    }
+}
+
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
 /// `VICTORY_CAPTURE_FRAMES` render to or write, in first-use order, saved
 /// at that frame's present as `frame-<n>-<i>-<resource>-<w>x<h>-f<format>.png`
