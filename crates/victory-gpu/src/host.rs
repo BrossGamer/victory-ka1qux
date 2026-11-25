@@ -2390,7 +2390,7 @@ fn late_stage() -> u8 {
 /// turns the relay off (`crate::shadow::relay`).
 pub(crate) fn one_flight_asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ONE_FLIGHT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ONE_FLIGHT").is_some_and(|v| v == "1" || v == "2"))
 }
 
 /// The title's submissions return before the card is done, one in the air
@@ -2452,7 +2452,10 @@ fn one_flight_prewarm() -> bool {
 /// had already run; prewarms and their microseconds; microseconds the card
 /// stood with nothing to run between the moment it had run everything
 /// (seen by [`late_helper`]) and the next submission sent.
-static ONE_FLIGHT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// With [`two_flights`]: submissions sent with one in the air; settled
+/// first because they read what it may write, or because two were in the
+/// air.
+static ONE_FLIGHT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// When [`late_helper`] saw the card run everything sent (microseconds,
 /// [`now_us`] + 1; 0: not since the last send).
@@ -3080,18 +3083,91 @@ fn late_blocked(runs: &[&HostList]) -> Option<usize> {
         }
         (line.written.clone(), line.by_copy.clone(), immed)
     };
-    blocked_by(&written, &by_copy, &immed, runs, true)
+    blocked_by(&written, &by_copy, &immed, runs, true, false)
+}
+
+/// What `runs`' shaders, read-backs and bottom-of-pipe writes may write of
+/// title memory: joined, per copy, and the bottom-of-pipe writes, as the
+/// line keeps them for flights.
+fn what_runs_write(runs: &[&HostList]) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize)>, Vec<(usize, usize)>) {
+    let declared = declared_writes(runs);
+    let backs: Vec<(usize, usize)> = runs
+        .iter()
+        .flat_map(|l| {
+            l.deferred()
+                .backs
+                .iter()
+                .filter(|&&(_, _, [row, rows, _])| row > 0 && rows > 0)
+                .map(|&(_, at, [row, rows, pitch])| (at, at.saturating_add(rows.saturating_sub(1).saturating_mul(pitch).saturating_add(row))))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut written = Vec::new();
+    join_ranges(&mut written, declared.iter().flat_map(|(_, r)| r.iter().copied()).chain(backs.iter().copied()));
+    let mut by_copy = Vec::new();
+    join_copy_ranges(
+        &mut by_copy,
+        declared
+            .iter()
+            .flat_map(|(shadow, ranges)| {
+                let owner = std::sync::Arc::as_ptr(shadow) as usize;
+                ranges.iter().map(move |&(a, b)| (owner, a, b))
+            })
+            .chain(backs.iter().map(|&(a, b)| (0, a, b))),
+    );
+    let mut immed = Vec::new();
+    join_ranges(
+        &mut immed,
+        runs.iter().flat_map(|l| l.deferred().writes.iter().map(|&(at, _, n)| (at, at.saturating_add(n))).collect::<Vec<_>>()),
+    );
+    (written, by_copy, immed)
+}
+
+/// Whether `next` may go to the card in one host submission with `taken`
+/// (`crate::queue`'s joined parts) and keep the order of every submission
+/// waited for: preparing `next` (its title buffer copies, fills, textures,
+/// refreshes of other copies over the same bytes, steps of ours) reads
+/// nothing `taken` may write, which would only be there once `taken` has
+/// run and been copied back.
+pub(crate) fn joinable(taken: &[&HostList], next: &[&HostList]) -> bool {
+    let (written, by_copy, immed) = what_runs_write(taken);
+    blocked_by(&written, &by_copy, &immed, next, false, true).is_none()
+}
+
+/// With [`one_flight`] at 2 (`VICTORY_ONE_FLIGHT=2`): a submission is sent
+/// with one flight still in the air, unsettled, when preparing it reads
+/// nothing that flight may write ([`blocked_by`], strictly), and settles it
+/// first otherwise or when two are in the air.
+///
+/// Why: with one flight the title's thread comes back at once and waits for
+/// the card, then copies back and prepares the next submission while the
+/// card stands idle (161 ms a frame on the street, run owO): the card only
+/// ever has one submission. With the switch the next one is prepared while
+/// the card runs the one before, when nothing it reads can change by that.
+/// Two flights in the air are settled together (one copy-back of every
+/// range either declared, against the bytes from before the first: a range
+/// declared again keeps its first snapshot).
+fn two_flights() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| one_flight() && std::env::var_os("VICTORY_ONE_FLIGHT").is_some_and(|v| v == "2"))
+}
+
+/// Flights in the air ([`late`]).
+fn flights_in_air() -> usize {
+    line().line.iter().filter(|l| matches!(l, Late::Run(_))).count()
 }
 
 /// [`late_blocked`] against `written` (joined), `by_copy` (per owner), and
 /// `immed` (bottom-of-pipe writes); `count` whether the kind of read is
-/// counted for the frame line.
+/// counted for the frame line; `strict`: every read of what may be written
+/// counts, none is left to a check after landing (`fill_ahead`).
 fn blocked_by(
     written: &[(usize, usize)],
     by_copy: &[(usize, usize, usize)],
     immed: &[(usize, usize)],
     runs: &[&HostList],
     count: bool,
+    strict: bool,
 ) -> Option<usize> {
     if written.is_empty() && immed.is_empty() {
         return None;
@@ -3109,7 +3185,7 @@ fn blocked_by(
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !any_written(dst, dst + len) && fill_ahead::on() {
+                        if !strict && !any_written(dst, dst + len) && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -3127,7 +3203,7 @@ fn blocked_by(
                     if any_written(src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if !strict && fill_ahead::on() {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -4026,12 +4102,16 @@ fn late_line(frames: f64) {
         tracing::info!(
             "one flight at a time per frame (VICTORY_ONE_FLIGHT=1): {:.1} submissions settled the one before them, {:.1} of \
              those found the card done with it; {:.1} prewarms of the next refreshes, {:.1} ms; the card stood with nothing \
-             to run {:.1} ms (from when it was seen done to the next work sent)",
+             to run {:.1} ms (from when it was seen done to the next work sent); with VICTORY_ONE_FLIGHT=2: {:.1} sent with \
+             one in the air, {:.1} settled it first as they read what it may write, {:.1} as two were in the air",
             o[0],
             o[1],
             o[2],
             o[3] / 1000.0,
             o[4] / 1000.0,
+            o[5],
+            o[6],
+            o[7],
         );
     }
     {
@@ -6169,7 +6249,29 @@ impl Host {
         // what they write.
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
+        } else if one_flight()
+            && flying()
+            && two_flights()
+            && flights_in_air() < 2
+            && {
+                let (written, by_copy, immed) = {
+                    let line = line();
+                    (line.written.clone(), line.by_copy.clone(), line.immed_writes())
+                };
+                let blocked = blocked_by(&written, &by_copy, &immed, runs, false, true).is_some();
+                if blocked {
+                    ONE_FLIGHT[6].fetch_add(1, Ordering::Relaxed);
+                }
+                !blocked
+            }
+        {
+            // Prepared while the card runs the one in the air
+            // ([`two_flights`]).
+            ONE_FLIGHT[5].fetch_add(1, Ordering::Relaxed);
         } else if one_flight() && flying() {
+            if two_flights() && flights_in_air() >= 2 {
+                ONE_FLIGHT[7].fetch_add(1, Ordering::Relaxed);
+            }
             // One flight at a time: settled before anything of this one
             // is prepared ([`one_flight`]), after its refreshes are made
             // once while the card still runs it.
@@ -6191,7 +6293,7 @@ impl Host {
                 // landed: their copy-back's end, not the card's other work.
                 relay_wait(why, |line| {
                     let immed = line.immed_writes();
-                    blocked_by(&line.written, &line.by_copy, &immed, runs, false).is_none()
+                    blocked_by(&line.written, &line.by_copy, &immed, runs, false, false).is_none()
                 });
             } else {
                 self.settle(&mut submitted, why);
