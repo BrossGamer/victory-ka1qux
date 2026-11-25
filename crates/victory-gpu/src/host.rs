@@ -7166,6 +7166,76 @@ impl HostList {
         deferred.refreshed.clear();
     }
 
+    /// Whether shaders recorded in the list so far may write title memory
+    /// `[address, address + len)`: a range they declared written
+    /// ([`Shadow::gpu_writes`](crate::shadow::Shadow::gpu_writes)) holds a
+    /// part of it.
+    pub(crate) fn shaders_wrote(&self, address: usize, len: usize) -> bool {
+        let end = address.saturating_add(len);
+        self.deferred()
+            .copies
+            .iter()
+            .any(|step| matches!(step, Step::GpuWrite(_, at, n, _) if *at < end && address < at.saturating_add(*n)))
+    }
+
+    /// A title buffer copy of `len` bytes from `src` to `dst` (title
+    /// addresses) whose source shaders recorded earlier in the list write:
+    /// run on the card, between the two host copies, behind those shaders,
+    /// and the destination declared written, so that it reaches title memory
+    /// when the list has run. At submission, where the CPU does a title's
+    /// copy, the shaders have not run yet: the copy took what the source
+    /// held before them (the structure builder's sizes after a build, which
+    /// the title copies out of the builder's buffer this way to read them,
+    /// came out as the previous build's or as zeros). False if either side
+    /// has no host copy or the list has no enhanced barriers; the caller
+    /// then copies at submission. After victory-fork pull request 994
+    /// (PiloteCode), commit fd26fb66.
+    pub(crate) fn copy_on_card(&self, dst: u64, src: u64, len: u64) -> bool {
+        use windows::core::Interface;
+        let (Some(from), Some(to)) = (crate::shadow::find(src, len), crate::shadow::find(dst, len)) else {
+            return false;
+        };
+        let Ok(l7) = self.list.cast::<ID3D12GraphicsCommandList7>() else {
+            return false;
+        };
+        // The destination's title bytes first; then its range is the card's.
+        to.refresh(self, dst, len);
+        to.gpu_writes(self, dst, len);
+        let barrier = |before_sync, after_sync, before, after| D3D12_GLOBAL_BARRIER {
+            SyncBefore: before_sync,
+            SyncAfter: after_sync,
+            AccessBefore: before,
+            AccessAfter: after,
+        };
+        let barriers = |b: &[D3D12_GLOBAL_BARRIER]| D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_GLOBAL,
+            NumBarriers: b.len() as u32,
+            Anonymous: D3D12_BARRIER_GROUP_0 { pGlobalBarriers: b.as_ptr() },
+        };
+        let before = [barrier(
+            D3D12_BARRIER_SYNC_ALL,
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+            D3D12_BARRIER_ACCESS_COPY_SOURCE | D3D12_BARRIER_ACCESS_COPY_DEST,
+        )];
+        let after = [barrier(
+            D3D12_BARRIER_SYNC_COPY,
+            D3D12_BARRIER_SYNC_ALL,
+            D3D12_BARRIER_ACCESS_COPY_DEST,
+            D3D12_BARRIER_ACCESS_UNORDERED_ACCESS | D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_COPY_SOURCE,
+        )];
+        // SAFETY: an open list; both buffers are live host copies the list
+        // keeps until it is reset.
+        unsafe {
+            l7.Barrier(&[barriers(&before)]);
+            self.list.CopyBufferRegion(&to.buffer, to.offset(dst), &from.buffer, from.offset(src), len);
+            l7.Barrier(&[barriers(&after)]);
+        }
+        self.keep(&to.buffer);
+        self.keep(&from.buffer);
+        true
+    }
+
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
@@ -7480,6 +7550,13 @@ impl HostList {
 
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
+    /// Whether the list asked about `key` since its reset ([`first_use`]).
+    ///
+    /// [`first_use`]: HostList::first_use
+    pub(crate) fn asked(&self, key: usize) -> bool {
+        self.deferred().textures.contains(&key)
+    }
+
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
     }
