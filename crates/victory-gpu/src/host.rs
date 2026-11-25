@@ -8371,6 +8371,20 @@ impl Meter {
                 );
             }
         }
+        {
+            let [same, again, made] =
+                [0, 1, 2].map(|i| crate::descriptor::host::SAME_VIEWS[i].swap(0, Ordering::Relaxed));
+            if same + again + made > 0 {
+                tracing::info!(
+                    "buffer view records per frame: {:.0} named the view their slot showed and left it as it was, \
+                     {:.0} were made (VICTORY_SAME_VIEWS=0: all made); the pass over buffer views looked at {:.0} \
+                     slots made already (VICTORY_PASS_REVISITS=1: it looks again at every slot it made)",
+                    same as f64 / frames,
+                    again as f64 / frames,
+                    made as f64 / frames
+                );
+            }
+        }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);

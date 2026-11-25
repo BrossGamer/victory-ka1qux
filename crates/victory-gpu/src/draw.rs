@@ -1667,6 +1667,9 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         split_add(split::SLOTS, slots.len() as u64);
+        // The slots made here are not marked for the next pass again
+        // (`descriptor::host`, `VICTORY_PASS_REVISITS`).
+        let in_pass = crate::descriptor::host::HeapPass::enter();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1720,6 +1723,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        drop(in_pass);
         let views = ranges.len() as u32;
         split_add(split::SLOTS_US, micros(started));
         let refreshing = std::time::Instant::now();

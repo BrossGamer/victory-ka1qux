@@ -39,16 +39,26 @@ impl<T> BufferViews<T> {
     }
 
     fn written(&self, index: u32, buffer: bool) {
+        if self.noted(index, buffer) {
+            self.changed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(index);
+        }
+    }
+
+    /// [`BufferViews::written`] for a slot the pass over buffer views is
+    /// making itself ([`in_heap_pass`]): it takes the slot's range at
+    /// once, so the slot is not looked at again by the next pass. True if
+    /// the slot is (or was) one of the buffer views.
+    fn noted(&self, index: u32, buffer: bool) -> bool {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if buffer {
             slots.insert(index);
-        } else if !slots.remove(&index) {
-            return;
+            true
+        } else {
+            slots.remove(&index)
         }
-        self.changed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(index);
     }
 
     pub(crate) fn begin_pass(&self) -> (Vec<u32>, std::sync::MutexGuard<'_, BufferRanges<T>>) {
@@ -85,6 +95,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// Per slot, a fingerprint of the buffer view its host descriptor was
+    /// last made from (the view and the title memory it reads; 0: none),
+    /// for a record that names the same view again ([`same_views`]). Set
+    /// after the slot is made, cleared whenever the slot's host resource
+    /// changes ([`HostHeap::keep`]); taken after `made`. Made on first use.
+    shown: Mutex<Vec<u64>>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1280,6 +1296,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            shown: Mutex::new(Vec::new()),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -2109,7 +2126,16 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
-        self.buffers.written(index, stride.is_some());
+        // The pass over buffer views takes the range of a slot it makes
+        // itself: noted, not marked changed for the next pass, which looked
+        // at every slot it made a second time (half of the 50,000 to
+        // 140,000 slots a frame in the open world).
+        // `VICTORY_PASS_REVISITS=1`: marked, as before.
+        if in_heap_pass() && !pass_revisits() {
+            self.buffers.noted(index, stride.is_some());
+        } else {
+            self.buffers.written(index, stride.is_some());
+        }
         stale
     }
 
@@ -2153,6 +2179,11 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // Whatever the slot showed, it is not known to be that view now
+        // (the caller notes it again if it is: [`HostHeap::note_shown`]).
+        if let Some(sig) = self.shown.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
+            *sig = 0;
+        }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -2451,6 +2482,18 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            // A new record that names the view the slot shows already (the
+            // title writes its per-frame records again, with the same
+            // contents, under new names): the slot stays as it is.
+            let sig = if self.sampler { None } else { same_view_signature(&view) };
+            if let Some(sig) = sig {
+                if self.shows_same(index, sig, &view) {
+                    made[index as usize] = key;
+                    SAME_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Some(view);
+                }
+                SAME_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2492,9 +2535,48 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            self.keep(index, kept.flatten());
+            let kept = kept.flatten();
+            let shows = kept.is_some();
+            self.keep(index, kept);
+            if let Some(sig) = sig
+                && shows
+            {
+                self.note_shown(index, sig);
+            }
+        } else if for_draw && in_heap_pass() {
+            SAME_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Some(view)
+    }
+
+    /// Whether title slot `index`'s host descriptor was made from a view
+    /// with fingerprint `sig` ([`same_view_signature`]) and still shows the
+    /// host copy `view` would be made on now: its descriptor would be the
+    /// same. A copy let go and made anew, or the memory now in another
+    /// copy, gives another copy, and the slot is made again.
+    fn shows_same(&self, index: u32, sig: u64, view: &View) -> bool {
+        if self.shown.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize) != Some(&sig) {
+            return false;
+        }
+        let Some((copy, _, _)) = buffer_copy(view) else {
+            return false;
+        };
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|shown| windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(&copy.buffer))
+    }
+
+    /// Title slot `index`'s host descriptor was just made from a view with
+    /// fingerprint `sig`.
+    fn note_shown(&self, index: u32, sig: u64) {
+        let mut shown = self.shown.lock().unwrap_or_else(|e| e.into_inner());
+        if shown.is_empty() {
+            shown.resize(self.count as usize, 0);
+        }
+        if let Some(slot) = shown.get_mut(index as usize) {
+            *slot = sig;
+        }
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -3394,6 +3476,84 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+thread_local! {
+    /// Whether this thread is in the pass over the heap's buffer views
+    /// (`crate::draw`, [`HeapPass`]).
+    static IN_HEAP_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, this thread is in the pass over the heap's buffer views.
+pub(crate) struct HeapPass(());
+
+impl HeapPass {
+    pub(crate) fn enter() -> Self {
+        IN_HEAP_PASS.set(true);
+        HeapPass(())
+    }
+}
+
+impl Drop for HeapPass {
+    fn drop(&mut self) {
+        IN_HEAP_PASS.set(false);
+    }
+}
+
+fn in_heap_pass() -> bool {
+    IN_HEAP_PASS.get()
+}
+
+/// Whether a slot the pass over buffer views makes is marked changed for
+/// the next pass too (`VICTORY_PASS_REVISITS=1`; off by default).
+fn pass_revisits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_REVISITS").is_some_and(|v| v == "1"))
+}
+
+/// Whether a record that names a buffer view the slot already shows leaves
+/// the slot as it is ([`HostHeap::mirror`]; `VICTORY_SAME_VIEWS=0`: every
+/// new record is made again, as before).
+///
+/// The title writes its per-frame view records again each frame, under new
+/// names but with the same contents, and copies them into the heap as
+/// bytes: the mirroring of copied records (`super::sync_heaps`) found
+/// 40,000 a frame in the open world, each made null, then made again by the
+/// pass over the heap's buffer views (75,000 to 140,000 slots a frame, 105
+/// to 150 ms of it making host views).
+fn same_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: records of buffer views that named the view
+/// their slot showed (left as they were), the other buffer view records
+/// (made again), and slots the pass over buffer views looked at that were
+/// made already.
+pub(crate) static SAME_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A fingerprint of a buffer view (constant buffer views, views of buffer
+/// resources and of buffer memory) and the title memory it reads, never 0;
+/// `None` for other views, and with [`same_views`] off.
+fn same_view_signature(view: &View) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    if !same_views() {
+        return None;
+    }
+    const BUFFER: u32 = 1;
+    let buffer = match view {
+        View::Constant(..) => true,
+        View::Placed(_, resource, _) => resource[0] == BUFFER,
+        View::Shader(r, _) | View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
+        View::Sampler(_) | View::ConsoleSampler(_) => false,
+    };
+    if !buffer {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    view.hash(&mut hasher);
+    buffer_range(view).hash(&mut hasher);
+    Some(hasher.finish() | 1)
+}
+
 /// Whether constant buffer views of the view heap (the ones a shader picks
 /// by an index it computes) are brought up to date for shaders, and made on
 /// a copy of their own range where the copy of the memory they are in does
@@ -4144,6 +4304,73 @@ mod tests {
         let (copy, ..) = buffer_copy(&placed(start + 24, &desc)).unwrap();
         assert_eq!(copy.span(), (start, title.len() as u64), "the buffer's own copy");
         assert_eq!(kept.as_ref(), Some(&copy.buffer));
+        crate::shadow::unregister(RESOURCE, start);
+    }
+
+    /// A record that names the buffer view its slot already shows leaves the
+    /// slot as it is; one whose slot was made null, or another view, is
+    /// made. The pass over buffer views does not mark the slots it makes
+    /// for the next pass.
+    #[test]
+    fn a_record_of_the_view_a_slot_shows_leaves_the_slot_as_it_is() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        const RESOURCE: usize = 0x62_0063;
+        let title = vec![0u8; 8192];
+        let start = title.as_ptr() as u64;
+        crate::shadow::register(RESOURCE, start, title.len() as u64);
+        let placed = |count: u32| {
+            let desc = typed_view(DXGI_FORMAT_R32_UINT, 0, count);
+            // SAFETY: 40 bytes in the host's layout, as `srv_desc` reads them.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 10]>().read_unaligned() };
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 8192; // its width
+            let mut view = [0u32; 16];
+            view[..10].copy_from_slice(&words);
+            view[10] = start as u32;
+            view[11] = (start >> 32) as u32;
+            View::Placed(false, resource, view)
+        };
+        let record = |view: View| {
+            let [entry, generation] = super::super::words_for(view);
+            ([super::super::VIEW_TAG, entry, generation], u64::from(generation) << 32 | u64::from(entry))
+        };
+        let slot = 2;
+        let view = placed(64);
+        let sig = same_view_signature(&view).expect("a buffer view");
+        let (words, key) = record(view.clone());
+        let handle = words.as_ptr() as u64;
+        let _in_pass = HeapPass::enter();
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
+        assert!(heap.kept.lock().unwrap()[slot as usize].is_some());
+        assert!(heap.shows_same(slot, sig, &view));
+        assert!(!heap.buffers.changed.lock().unwrap().contains(&slot), "not marked for the next pass");
+        assert!(heap.buffers.slots.lock().unwrap().contains(&slot));
+
+        // The same view again under another name: left as it was.
+        let before = SAME_VIEWS[0].load(Relaxed);
+        heap.made.lock().unwrap()[slot as usize] = 0;
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
+        assert!(SAME_VIEWS[0].load(Relaxed) > before);
+        assert_eq!(heap.made.lock().unwrap()[slot as usize], key);
+        assert!(heap.shows_same(slot, sig, &view));
+
+        // Made null: not the same any more, and made again.
+        heap.keep(slot, None);
+        assert!(!heap.shows_same(slot, sig, &view));
+        heap.made.lock().unwrap()[slot as usize] = 0;
+        assert_eq!(heap.mirror(slot, handle, true), Some(view.clone()));
+        assert!(heap.shows_same(slot, sig, &view));
+
+        // Another view of the same memory: another fingerprint.
+        let other = placed(32);
+        assert_ne!(same_view_signature(&other), Some(sig));
+        let (words, _) = record(other.clone());
+        assert_eq!(heap.mirror(slot, words.as_ptr() as u64, true), Some(other.clone()));
+        assert!(!heap.shows_same(slot, sig, &view));
         crate::shadow::unregister(RESOURCE, start);
     }
 
