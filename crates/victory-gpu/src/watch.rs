@@ -625,6 +625,9 @@ struct Guards {
     /// (`crate::marks`), from the moment they were found clean until the
     /// copy-back: what is known of their bytes from before ([`Armed`]).
     armed: BTreeMap<usize, Armed>,
+    /// Blocks an asynchronous kernel write may still land in
+    /// ([`writing_async`]): from, to, and until when. Treated as held.
+    pins: Vec<(usize, usize, std::time::Instant)>,
     /// Room for blocks' bytes, made before the submission: the fault
     /// handler that keeps a block's bytes takes it from here and allocates
     /// nothing.
@@ -752,8 +755,25 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     deferred: Vec::new(),
     exposed: BTreeSet::new(),
     armed: BTreeMap::new(),
+    pins: Vec::new(),
     spare: Vec::new(),
 });
+
+impl Guards {
+    /// Whether a kernel write is under way into `block` (held, or pinned
+    /// for an asynchronous one: [`writing_async`]); expired pins go.
+    fn writing_into(&mut self, block: usize) -> bool {
+        if self.held.iter().any(|&(from, to, _)| (from..to).contains(&block)) {
+            return true;
+        }
+        if self.pins.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.pins.retain(|&(_, _, until)| until > now);
+        self.pins.iter().any(|&(from, to, _)| (from..to).contains(&block))
+    }
+}
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
@@ -868,10 +888,7 @@ fn guard_settled(start: usize, end: usize) -> Option<(Vec<usize>, bool)> {
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.held
-                .iter()
-                .any(|&(from, to, _)| (from..to).contains(&block))
-            {
+            if g.writing_into(block) {
                 // A kernel write is under way here: guarding the block
                 // would fail it. Taken as written; the next copy after the
                 // write guards it.
@@ -981,6 +998,15 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
                         g.deferred.push((block, alias));
                     }
                     g.exposed.insert(block);
+                    continue;
+                }
+                if g.writing_into(alias) {
+                    // An asynchronous write may land there: left open, and
+                    // what the guarded block shows is taken as written (the
+                    // next check guards both once the pin is over).
+                    g.clean.remove(&block);
+                    g.exposed.insert(block);
+                    changed(block, block + 1);
                     continue;
                 }
                 if !protect_alias(g, alias) {
@@ -1189,14 +1215,14 @@ fn probe_take(start: usize, end: usize) -> Vec<usize> {
 pub(crate) fn probe_guard(ranges: &[(usize, usize)], bake: u64) -> usize {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     install();
-    let g = guards();
+    let mut g = guards();
     let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
     let mut made = 0;
     for &(start, end) in ranges {
         for block in start / BLOCK..end.div_ceil(BLOCK) {
             if probed.contains_key(&block)
                 || g.protected.contains(&block)
-                || g.held.iter().any(|&(from, to, _)| (from..to).contains(&block))
+                || g.writing_into(block)
             {
                 continue;
             }
@@ -1316,6 +1342,57 @@ pub fn writing_held(at: usize, len: usize) -> Writing {
     }
     crate::descriptor::host::remapped(at, len);
     Writing { id }
+}
+
+/// How long blocks stay open for an asynchronous kernel write
+/// ([`writing_async`]): `VICTORY_ASYNC_WRITE_MS` (2000; 0: only until the
+/// call returns, as before).
+fn async_pin() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_ASYNC_WRITE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000)
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// [`writing_held`] for a kernel write that may land after the call that
+/// asked for it returns (an overlapped read): the blocks of `[at, at +
+/// len)` and of the other views of their pages stay open, and count as
+/// written at every check, for a while ([`async_pin`]). Held only until
+/// the call returned, a block guarded again meanwhile failed the read
+/// when it landed.
+pub fn writing_async(at: usize, len: usize) {
+    let Some(pin) = async_pin() else {
+        drop(writing_held(at, len));
+        return;
+    };
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let until = std::time::Instant::now() + pin;
+    {
+        let mut g = guards();
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+        g.pins.push((first, last, until));
+        let others: Vec<usize> = if view_guard() && g.aliased.range(first..last).next().is_some() {
+            (first..last)
+                .filter(|block| g.aliased.contains(block))
+                .flat_map(|block| crate::inplace::pages_of(block * BLOCK))
+                .map(|alias| alias / BLOCK)
+                .filter(|alias| !(first..last).contains(alias))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        open(&mut g, at, end, true);
+        // The same pages at their other views: the write lands there too.
+        for block in others {
+            g.pins.push((block, block + 1, until));
+            open(&mut g, block * BLOCK, (block + 1) * BLOCK, true);
+        }
+    }
+    crate::descriptor::host::remapped(at, len);
 }
 
 impl Drop for Writing {
@@ -1598,6 +1675,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     // What it showed is gone: armed blocks there are unknown.
     touched_range(&mut g, range.start, range.end, false);
+    // A view mapped there now is another: no write pending into the old
+    // one keeps it open.
+    g.pins.retain(|&(from, to, _)| to <= range.start || from >= range.end);
     let exposed: Vec<usize> = g.exposed.range(range.clone()).copied().collect();
     for block in exposed {
         g.exposed.remove(&block);
@@ -1900,6 +1980,42 @@ mod tests {
     /// An asynchronous kernel write's blocks stay open while it may land:
     /// a check meanwhile reports them written and does not guard them
     /// again, so a kernel write into them still succeeds.
+    /// An asynchronous kernel write's blocks stay open while it may land:
+    /// a check meanwhile reports them written and does not guard them
+    /// again, so a kernel write into them still succeeds.
+    #[test]
+    fn blocks_of_an_asynchronous_write_stay_open() {
+        use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: a pagefile section of one block, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCK).is_some(), "guarded");
+        writing_async(view + 100, 13);
+        let pages: Vec<usize> = (view / PAGE..view / PAGE + 1).collect();
+        assert_eq!(guard(view, view + BLOCK), Some(pages), "reported written, left open");
+        let bytes = *b"from the disk";
+        let mut done = 0;
+        // SAFETY: 13 bytes of our view; the kernel checks the destination.
+        let wrote = unsafe {
+            WriteProcessMemory(GetCurrentProcess(), (view + 100) as _, bytes.as_ptr().cast(), 13, &mut done) != 0
+        };
+        assert!(wrote, "the kernel's late write lands");
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(view, BLOCK);
+    }
+
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
