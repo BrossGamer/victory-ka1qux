@@ -1722,7 +1722,45 @@ pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
         crate::framelog::add(crate::framelog::T::GuardFaults, 1);
         return true;
     }
-    writable(at)
+    if writable(at) {
+        return true;
+    }
+    // Read-only, in a view of the title's pages we were told of, and no
+    // guard of ours: only we make those views read-only (a protection
+    // left behind by a race between a mapping and its notice), so the
+    // block is given back rather than the title stopped.
+    if unknown_open() && !matches!(crate::inplace::cover(at, 1), crate::inplace::Cover::None) && read_only(at) {
+        let block = at / BLOCK;
+        if make_writable_span(block, block + 1) {
+            g.clean.remove(&block);
+            changed(block, block + 1);
+            touched(&mut g, block, false);
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block no guard knew of was opened on a write to it");
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a write fault in a read-only view block that no guard knows of
+/// opens the block (`VICTORY_GUARD_UNKNOWN=0`: no, the fault goes on to the
+/// crash handler, as before). After another fork's `1c7231d`.
+fn unknown_open() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_UNKNOWN").is_none_or(|v| v != "0"))
+}
+
+/// Whether `at` is committed and read-only now.
+fn read_only(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead
@@ -2014,6 +2052,42 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(view, BLOCK);
+    }
+
+    /// A read-only block of a view the runtime told of, which no guard
+    /// knows, is opened by a write to it instead of the write faulting on.
+    #[test]
+    fn a_read_only_view_block_no_guard_knows_opens_on_a_write() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
+            UnmapViewOfFile, VirtualProtect,
+        };
+        if !unknown_open() {
+            return;
+        }
+        install();
+        // SAFETY: a pagefile section of one block, mapped read-write, then
+        // made read-only behind the guards' back.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            let mut old = 0;
+            assert_ne!(VirtualProtect(view as *const _, BLOCK, PAGE_READONLY, &mut old), 0);
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        crate::inplace::title_memory_view(view, BLOCK, section as usize, 0);
+        // SAFETY: our view; the handler opens it.
+        unsafe { ((view + 8) as *mut u8).write_volatile(7) };
+        // SAFETY: our view.
+        assert_eq!(unsafe { ((view + 8) as *const u8).read_volatile() }, 7);
+        title_memory_remapped(view, BLOCK);
+        // SAFETY: our view and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
     }
 
     #[test]
