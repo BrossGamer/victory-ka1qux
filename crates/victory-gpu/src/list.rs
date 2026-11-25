@@ -865,6 +865,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
             #[cfg(feature = "diagnostics")]
+            crate::bake_probe::copied(src, dst, "copy_resource");
+            #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
@@ -928,6 +930,8 @@ extern "system" fn copy_texture_region(
             // before.
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            #[cfg(feature = "diagnostics")]
+            crate::bake_probe::copied(src.resource, dst.resource, "texture_to_buffer");
             let made = read_back(list, dst, x, y, z, src, source_box);
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -996,6 +1000,8 @@ extern "system" fn copy_texture_region(
         list.twin_use(dst.resource, false, true);
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::copied(src.resource, dst.resource, "copy_texture_region");
         let mut to_location = dst;
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
@@ -1150,6 +1156,8 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::copied(src, dst, "resolve");
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

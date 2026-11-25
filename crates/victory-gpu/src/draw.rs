@@ -988,6 +988,20 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::draw_begin();
+        let bound = self.bind_views(list, p, compute);
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::draw_end(
+            || p.stages.iter().map(|s| s.shader.hash.as_str()).collect::<Vec<_>>().join("+"),
+            compute,
+            &self.targets,
+        );
+        bound
+    }
+
+    /// [`State::bind`].
+    fn bind_views(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);

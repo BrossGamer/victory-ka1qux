@@ -60,6 +60,16 @@
 //!   made read-only for 30 s after the bake (`VICTORY_BAKE_PROBE_GUARD=0`:
 //!   not), so a store by the title's CPU faults once and is noted with the
 //!   address of the instruction.
+//! - **Where a bake's result goes** (`bake probe: a draw reads a bake's
+//!   result`, `... a copy reads a bake's result`): the bake's targets and
+//!   the texture its compute pass writes are scratch, used again by the
+//!   next bake; what keeps a character's result is a later step. Every
+//!   draw or dispatch that samples one of them through a table, and every
+//!   copy from one, is told (once per pipeline and texture, then at each
+//!   power of two) with what it writes (unordered access views, render
+//!   targets, a copy's destination). Those written textures are followed
+//!   one step further: the draws that sample them are told the same way,
+//!   which names the textures the characters' materials read.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -177,7 +187,8 @@ fn record(event: Event) {
 
 /// Status entries DirectStorage wrote: queue → (number of the entry, frame,
 /// time), the latest.
-static SIGNALS: Mutex<Option<HashMap<u64, VecDeque<(u64, u64, u64)>>>> = Mutex::new(None);
+type Signals = HashMap<u64, VecDeque<(u64, u64, u64)>>;
+static SIGNALS: Mutex<Option<Signals>> = Mutex::new(None);
 
 /// DirectStorage wrote the status entry numbered `seq` of queue `queue`:
 /// the title sees every request before it complete.
@@ -840,6 +851,7 @@ fn note_targets(n: u64, d: &BakeDraw) {
                 shapes.push(shape);
             }
         }
+        follow(t, 0);
         let new = map.insert(info.start, (info.start + info.bytes, t)).is_none_or(|(_, was)| was != t);
         if new || n <= 2 {
             tracing::info!(
@@ -875,9 +887,14 @@ fn note_targets(n: u64, d: &BakeDraw) {
 /// bake leaves (the compute pass that follows a bake draw reads a target and
 /// writes such a texture), and its description is logged once.
 pub(crate) fn written(resource: This) {
-    if !on() || BAKE_COUNT.load(Relaxed) == 0 || READ_FRAMES.load(Relaxed) >= 12 {
+    if !on() || BAKE_COUNT.load(Relaxed) == 0 {
         return;
     }
+    DRAW.with_borrow_mut(|d| {
+        if d.writes.len() < 16 && !d.writes.contains(&(resource as usize)) {
+            d.writes.push(resource as usize);
+        }
+    });
     let Some(t) = crate::resource::probe_texture(resource, false) else {
         return;
     };
@@ -891,6 +908,11 @@ pub(crate) fn written(resource: This) {
         .as_ref()
         .is_some_and(|m| m.values().any(|&(_, r)| r == resource as usize))
     {
+        return;
+    }
+    // The bake's compute pass writes it: a result of the bake.
+    follow(resource as usize, 0);
+    if READ_FRAMES.load(Relaxed) >= 12 {
         return;
     }
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -924,6 +946,13 @@ static SAMPLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(crate) fn sampled(resource: This, placed: bool) {
     if !on() {
         return;
+    }
+    if let Some(level) = followed(resource as usize) {
+        DRAW.with_borrow_mut(|d| {
+            if d.read.is_none_or(|(_, l)| level < l) {
+                d.read = Some((resource as usize, level));
+            }
+        });
     }
     let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = targets.as_ref().filter(|m| !m.is_empty()) else {
@@ -972,6 +1001,142 @@ pub(crate) fn sampled(resource: This, placed: bool) {
             "bake probe: a draw samples memory of a bake target through another title texture"
         );
     }
+}
+
+/// Textures followed from the bakes: a bake's target or the texture its
+/// compute pass writes (level 0), and a texture a draw, dispatch or copy
+/// writes while it reads a level 0 one (level 1).
+static FOLLOWED: Mutex<Option<HashMap<usize, u8>>> = Mutex::new(None);
+
+fn follow(resource: usize, level: u8) {
+    let mut followed = FOLLOWED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = followed.get_or_insert_with(HashMap::new);
+    if map.len() < 4096 {
+        let at = map.entry(resource).or_insert(level);
+        *at = (*at).min(level);
+    }
+}
+
+fn followed(resource: usize) -> Option<u8> {
+    FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&resource).copied()
+}
+
+/// What the draw or dispatch being bound reads of the followed textures
+/// (the lowest level) and the textures it writes through unordered access
+/// views.
+#[derive(Default)]
+struct DrawNote {
+    read: Option<(usize, u8)>,
+    writes: Vec<usize>,
+}
+
+thread_local! {
+    static DRAW: std::cell::RefCell<DrawNote> = std::cell::RefCell::new(DrawNote::default());
+}
+
+/// A draw or dispatch starts to be bound.
+pub(crate) fn draw_begin() {
+    if !on() {
+        return;
+    }
+    DRAW.with_borrow_mut(|d| {
+        d.read = None;
+        d.writes.clear();
+    });
+}
+
+/// A texture in words: address, size and format.
+fn texture_text(resource: usize) -> String {
+    match crate::resource::probe_texture(resource as This, false) {
+        Some(t) => format!("{resource:#x} at {:#x} {}x{} f{} mips {}", t.start, t.width, t.height, t.format, t.mips),
+        None => format!("{resource:#x} (no texture)"),
+    }
+}
+
+/// How often each (pipeline or copy, read texture, written textures) was
+/// seen: told the first time and at each power of two.
+type Step = (String, usize, Vec<usize>);
+static STEPS: Mutex<Option<HashMap<Step, u64>>> = Mutex::new(None);
+const STEPS_MAX: usize = 1024;
+
+/// Counts one step that reads a followed texture; whether to tell it.
+fn step_seen(what: &str, read: usize, writes: &[usize]) -> Option<u64> {
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = steps.get_or_insert_with(HashMap::new);
+    let key = (what.to_string(), read, writes.to_vec());
+    if !map.contains_key(&key) && map.len() >= STEPS_MAX {
+        return None;
+    }
+    let n = map.entry(key).or_insert(0);
+    *n += 1;
+    (n.is_power_of_two()).then_some(*n)
+}
+
+/// The draw or dispatch is bound: if it read a followed texture, it is
+/// told with what it writes (`targets`: its render targets), and what a
+/// level 0 reader writes is followed.
+pub(crate) fn draw_end(pipeline: impl FnOnce() -> String, compute: bool, targets: &[usize]) {
+    if !on() {
+        return;
+    }
+    let Some(((read, level), mut writes)) = DRAW.with_borrow_mut(|d| d.read.take().map(|r| (r, std::mem::take(&mut d.writes))))
+    else {
+        return;
+    };
+    if !compute {
+        writes.extend(targets.iter().copied().filter(|&t| t != 0));
+    }
+    writes.retain(|&w| w != read);
+    if level == 0 {
+        for &w in &writes {
+            if followed(w).is_none() {
+                follow(w, 1);
+            }
+        }
+    }
+    let pipeline = pipeline();
+    let Some(n) = step_seen(&pipeline, read, &writes) else {
+        return;
+    };
+    let written: Vec<String> = writes.iter().map(|&w| texture_text(w)).collect();
+    tracing::info!(
+        frame = crate::frame::current(),
+        bakes_so_far = BAKE_COUNT.load(Relaxed),
+        n,
+        level,
+        compute,
+        pipeline,
+        read = texture_text(read),
+        ?written,
+        "bake probe: a draw reads a bake's result (level 0: a bake's own texture; 1: one written from it)"
+    );
+}
+
+/// A copy or resolve from `src` into `dst` (a texture, or with `buffer`
+/// a buffer the texels go to, read back into title memory).
+pub(crate) fn copied(src: This, dst: This, what: &str) {
+    if !on() {
+        return;
+    }
+    let Some(level) = followed(src as usize) else {
+        return;
+    };
+    if level == 0 && followed(dst as usize).is_none() {
+        follow(dst as usize, 1);
+    }
+    let Some(n) = step_seen(what, src as usize, &[dst as usize]) else {
+        return;
+    };
+    tracing::info!(
+        frame = crate::frame::current(),
+        bakes_so_far = BAKE_COUNT.load(Relaxed),
+        n,
+        level,
+        what,
+        read = texture_text(src as usize),
+        written = texture_text(dst as usize),
+        "bake probe: a copy reads a bake's result"
+    );
 }
 
 /// Counts of the remaps `texture::remapped` took (calls, staged textures
