@@ -439,8 +439,20 @@ pub(crate) mod split {
     /// (microseconds; maxima, not sums).
     pub(crate) const LONGEST_PASS_US: usize = 18;
     pub(crate) const LONGEST_SLOT_US: usize = 19;
+    /// Of the buffer views' slots (diagnostics builds): microseconds making
+    /// their host views (`HostHeap::mirror`) and finding the copy each
+    /// shows (`descriptor::host::buffer_copy`), and of the slots, those of
+    /// constant buffer views and their microseconds in both.
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
-    pub(crate) const LEN: usize = 20;
+    pub(crate) const SLOT_MIRROR_US: usize = 20;
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) const SLOT_COPY_US: usize = 21;
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) const CONSTANT_SLOTS: usize = 22;
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) const CONSTANT_US: usize = 23;
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) const LEN: usize = 24;
 }
 
 /// Adds `v` to part `i` of [`HEAP_PASS_SPLIT`] (nothing without
@@ -1660,7 +1672,14 @@ impl State {
             let Some(handle) = heap.handle(index) else {
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
+            #[cfg(feature = "diagnostics")]
+            let mirroring = std::time::Instant::now();
+            let mirrored = host.mirror(index, handle, true);
+            #[cfg(feature = "diagnostics")]
+            let mirror_us = micros(mirroring);
+            #[cfg(feature = "diagnostics")]
+            split_add(split::SLOT_MIRROR_US, mirror_us);
+            let Some(view) = mirrored else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1680,7 +1699,19 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            #[cfg(feature = "diagnostics")]
+            let copying = std::time::Instant::now();
+            let copy = crate::descriptor::host::buffer_copy(&view);
+            #[cfg(feature = "diagnostics")]
+            {
+                let copy_us = micros(copying);
+                split_add(split::SLOT_COPY_US, copy_us);
+                if matches!(view, View::Constant(..)) {
+                    split_add(split::CONSTANT_SLOTS, 1);
+                    split_add(split::CONSTANT_US, mirror_us + copy_us);
+                }
+            }
+            let Some((shadow, address, len)) = copy else {
                 continue;
             };
             #[cfg(feature = "diagnostics")]

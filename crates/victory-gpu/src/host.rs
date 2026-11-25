@@ -496,7 +496,7 @@ fn heap_pass_line() {
     let ms = |i: usize| v[i] as f64 / 1000.0 / frames;
     let n = |i: usize| v[i] as f64 / frames;
     tracing::info!(
-        "the heap's pass per frame over {frames:.0} frames: buffer views {:.1} ms ({:.0} slots), host copies brought up \
+        "the heap's pass per frame over {frames:.0} frames: buffer views {:.1} ms ({:.0} slots; {:.1} ms making host views, {:.1} ms finding the copies they show; {:.0} constant buffer views, {:.1} ms), host copies brought up \
          to date {:.1} ms ({:.0} copies, {:.0} MB); textures picked by index: held slots released and memory mapped since {:.1} ms, sweep {:.1} ms, \
          looks {:.1} ms, due slots {:.1} ms; slots that uploaded {:.1} ms ({:.1} textures, {:.1} ms of it making host \
          views), other slots {:.1} ms ({:.1} passed over unmapped, {:.1} refused for no room); of the passes since the line, \
@@ -504,6 +504,10 @@ fn heap_pass_line() {
          the longest slot {:.1} ms",
         ms(s::SLOTS_US),
         n(s::SLOTS),
+        ms(s::SLOT_MIRROR_US),
+        ms(s::SLOT_COPY_US),
+        n(s::CONSTANT_SLOTS),
+        ms(s::CONSTANT_US),
         ms(s::REFRESH_US),
         n(s::SPANS),
         n(s::SPAN_BYTES) / 1e6,
