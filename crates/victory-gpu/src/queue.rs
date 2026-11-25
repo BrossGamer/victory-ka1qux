@@ -1479,6 +1479,19 @@ extern "system" fn copy_page_mappings(
     // fence (on the console they would run before the mapping).
     #[cfg(feature = "diagnostics")]
     let held = u64::from(!this.is_null() && !lock(&queue(this).held).is_empty());
+    // The console maps the pages behind the work sent before: what that
+    // work's shaders write must land in the pages mapped now, not in those
+    // mapped next (the relay lands flights after their submission returns).
+    #[cfg(windows)]
+    for b in batches.into_iter().flatten() {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let len: u64 = ranges.iter().map(|r| u64::from(r.count) * PAGE).sum();
+        crate::host::land_before_remap(b.destination, len);
+    }
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {

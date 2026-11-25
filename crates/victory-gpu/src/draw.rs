@@ -365,6 +365,10 @@ pub(crate) struct State {
     root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    /// With the structure builder asked for: per entry of the two above
+    /// (`true` for a UAV) the title's buffer changes it was last checked
+    /// against ([`crate::shadow::buffer_generation`], [`State::forget_moved_root`]).
+    root_generations: std::collections::HashMap<(bool, usize, u64), u64>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
     /// Raw thread counts `[x, y, z]` for a partial `DispatchX` call with
@@ -402,6 +406,7 @@ impl State {
         self.fresh_tables.clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
+        self.root_generations.clear();
         self.tables_gone = true;
     }
 }
@@ -1614,6 +1619,39 @@ impl State {
     /// shortcut: a root view has no size: the view, the refresh and the
     /// copy back cover all that is left of the title's buffer
     /// (`VICTORY_ROOT_UAV_MB` sets a limit for all three).
+    /// With the structure builder asked for (after DexNom/VIctory): a root
+    /// view's slot in this list is made again when the title has replaced
+    /// the buffer at its address since the slot was made (the builder's
+    /// stages run between the title's buffer changes within one list).
+    /// Before, the list's later dispatches kept the copy of the buffer
+    /// that was there first, and their stores went into a copy of memory
+    /// the title had given to another buffer. The old slot stays held
+    /// until the list is done: draws recorded with it keep it.
+    fn forget_moved_root(
+        &mut self,
+        uav: bool,
+        key: (usize, u64),
+        find: impl FnOnce() -> Option<std::sync::Arc<crate::shadow::Shadow>>,
+    ) {
+        if !crate::pipeline::builder_allowed() {
+            return;
+        }
+        let generation = crate::shadow::buffer_generation();
+        let seen = self.root_generations.entry((uav, key.0, key.1)).or_insert(generation);
+        if *seen == generation {
+            return;
+        }
+        *seen = generation;
+        let slots = if uav { &mut self.root_uav_slots } else { &mut self.root_srv_slots };
+        let Some((_, old)) = slots.get(&key) else {
+            return;
+        };
+        let now = find();
+        if old.as_ref().map(std::sync::Arc::as_ptr) != now.as_ref().map(std::sync::Arc::as_ptr) {
+            slots.remove(&key);
+        }
+    }
+
     fn root_uav(
         &mut self,
         list: &HostList,
@@ -1676,6 +1714,7 @@ impl State {
             return false;
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
+        self.forget_moved_root(true, key, || address.and_then(find));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
@@ -1747,6 +1786,7 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
+        self.forget_moved_root(false, key, || address.and_then(|a| crate::shadow::find(a, 1)));
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {

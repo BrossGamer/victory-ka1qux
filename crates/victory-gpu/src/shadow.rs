@@ -4073,6 +4073,16 @@ fn buffers_shared() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize)
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Bumped whenever the title registers or releases a buffer, or memory in
+/// place is let go: a copy found for an address before may not be the one
+/// found now.
+static BUFFER_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the title's buffers have changed ([`BUFFER_GENERATION`]).
+pub(crate) fn buffer_generation() -> u64 {
+    BUFFER_GENERATION.load(Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let old = buffers().insert(
@@ -4083,6 +4093,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
         },
     );
     crate::memory::ownership_changed(start, old.map_or(len, |e| len.max(e.end - start)));
+    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -4090,6 +4101,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     let old = buffers().remove(&(start, resource));
     if let Some(old) = old {
         crate::memory::ownership_changed(start, old.end - start);
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -4133,6 +4145,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let n = gone.len() as u64;
     if n != 0 {
         crate::memory::ownership_changed(at, len);
+        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
     for shadow in gone {
         crate::host::retire(shadow);
