@@ -1492,6 +1492,26 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                // A program that picks its textures by a material record
+                // (`crate::material_demand`): user dword 8 is its first
+                // root table (the record's buffer view is in it), dword 14
+                // the record's offset.
+                if !compute
+                    && crate::material_demand::enabled()
+                    && let Some(fields) = crate::material_demand::fields(&stage.shader.hash)
+                    && t.host.user_data.iter().any(|u| u.index == 8 && u.root == RootType::Table && u.slot == 0)
+                    && let Some(u) = t.host.user_data.iter().find(|u| u.index == 14 && u.root == RootType::Constants)
+                    && let Some(Root::Constants(words)) = self.roots_ref(false).get(usize::from(u.slot))
+                    && let Some(&record) = words.get(u.dword as usize)
+                    && let Some(Root::Table(table)) = self.roots_ref(false).first()
+                    && let Some(heap) = self.heap_of(*table)
+                    && !heap.samplers()
+                    && let Some(&bound) = values.get(8)
+                    && Some(u64::from(bound)) == table.checked_sub(heap.start)
+                    && crate::material_demand::wants(heap, record, fields)
+                {
+                    crate::material_demand::record(list, heap, *table, record, fields);
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -2559,7 +2579,12 @@ impl State {
         if room {
             host.texture_slots_waiting(frame);
         }
+        // What material records the card read name (`crate::material_demand`).
+        let wanted = crate::material_demand::enabled().then(|| host.material_demand.take(heap, host, frame));
         let (mut due, census) = host.texture_slots_due(frame, 4096);
+        if let Some(wanted) = &wanted {
+            crate::material_demand::promote(&mut due, wanted, frame);
+        }
         // Before a bake draw: its own sources first ([`bake_sources_first`]).
         let first = BAKE_SOURCES.with_borrow(|sources| {
             if sources.is_empty() { Vec::new() } else { host.texture_slots_due_of(frame, sources) }
@@ -2674,6 +2699,16 @@ impl State {
                 // another texture's.
                 let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                // Put into the queue for a material record: only while all
+                // of its memory is there and nothing the card writes lies
+                // over it.
+                if crate::material_demand::enabled()
+                    && host.texture_slot_recovered(index, write)
+                    && !host.material_upload_allowed(index, write, address, len, mapped)
+                {
+                    host.texture_slot_done(index, write, None);
+                    continue;
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     add(split::AWAY, 1);
@@ -2766,7 +2801,13 @@ impl State {
                 }
             }
             let mirroring = std::time::Instant::now();
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let view = heap.handle(index).and_then(|handle| {
+                if crate::material_demand::enabled() || crate::descriptor::host::displaced_recovery() {
+                    host.mirror_queued(index, handle, write)
+                } else {
+                    host.mirror(index, handle, true)
+                }
+            });
             let mirrored = micros(mirroring);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
