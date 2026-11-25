@@ -8466,15 +8466,40 @@ impl Meter {
         {
             let [same, again, made] =
                 [0, 1, 2].map(|i| crate::descriptor::host::SAME_VIEWS[i].swap(0, Ordering::Relaxed));
+            let at_sync = crate::descriptor::host::SYNC_MADE.swap(0, Ordering::Relaxed);
             if same + again + made > 0 {
                 tracing::info!(
                     "buffer view records per frame: {:.0} named the view their slot showed and left it as it was, \
-                     {:.0} were made (VICTORY_SAME_VIEWS=0: all made); the pass over buffer views looked at {:.0} \
-                     slots made already (VICTORY_PASS_REVISITS=1: it looks again at every slot it made)",
+                     {:.0} were made (VICTORY_SAME_VIEWS=0: all made), {:.0} of them at the mirroring of copied \
+                     records (VICTORY_SYNC_MAKES=0: made null there and left to the pass); the pass over buffer \
+                     views looked at {:.0} slots made already (VICTORY_PASS_REVISITS=1: it looks again at every \
+                     slot it made)",
                     same as f64 / frames,
                     again as f64 / frames,
+                    at_sync as f64 / frames,
                     made as f64 / frames
                 );
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                let v = crate::descriptor::host::MIRROR_SPLIT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+                if v.iter().any(|&n| n > 0) {
+                    let per = |n: u64, us: u64| if n == 0 { 0.0 } else { us as f64 / n as f64 };
+                    tracing::info!(
+                        "buffer views a record changed, per frame: made by the heap's pass {:.0} in {:.1} ms \
+                         ({:.2} us each), made at once elsewhere {:.0} in {:.1} ms ({:.2} us each), made null for \
+                         later {:.0} in {:.1} ms ({:.2} us each)",
+                        v[0] as f64 / frames,
+                        v[1] as f64 / 1e3 / frames,
+                        per(v[0], v[1]),
+                        v[2] as f64 / frames,
+                        v[3] as f64 / 1e3 / frames,
+                        per(v[2], v[3]),
+                        v[4] as f64 / frames,
+                        v[5] as f64 / 1e3 / frames,
+                        per(v[4], v[5])
+                    );
+                }
             }
         }
         crate::shadow::exact_line(frames);

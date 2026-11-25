@@ -2425,7 +2425,7 @@ impl HostHeap {
             }
             *last = print;
         }
-        self.mirror(index, handle, false);
+        self.mirror_as(index, handle, false, sync_makes());
         true
     }
 
@@ -2492,7 +2492,7 @@ impl HostHeap {
             }
         }
         for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+            self.mirror_as(index, handle, false, sync_makes());
         }
         (looked, due.len() as u64)
     }
@@ -2500,8 +2500,16 @@ impl HostHeap {
     /// Makes host slot `index` from the record the title has at `handle`
     /// if it changed since, and returns the view recorded there. Buffer
     /// views are made only for draws (`for_draw`), which also copy their
-    /// data: a host copy of a buffer is made on first use.
+    /// data: a host copy of a buffer is made on first use (and at the
+    /// mirroring of copied records, [`sync_makes`]).
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_as(index, handle, for_draw, false)
+    }
+
+    /// [`HostHeap::mirror`]; `make_buffers`: a buffer view (as
+    /// [`buffer_view_kind`] tells) is made now even when not `for_draw`,
+    /// as a draw would make it ([`sync_makes`]).
+    fn mirror_as(&self, index: u32, handle: u64, for_draw: bool, make_buffers: bool) -> Option<View> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -2548,6 +2556,8 @@ impl HostHeap {
                 }
                 SAME_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
@@ -2564,7 +2574,11 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
+            let make_now = make_buffers && buffer_view_kind(&view);
+            if make_now {
+                SYNC_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let later = !for_draw && !make_now && (view.is_buffer() || waiting.is_some());
             // Another view of the placed texture the slot shows already (a
             // title that streams a texture in writes its view again with
             // more mips each time some arrive): the slot goes on showing
@@ -2596,6 +2610,13 @@ impl HostHeap {
                 && shows
             {
                 self.note_shown(index, sig);
+            }
+            #[cfg(feature = "diagnostics")]
+            if buffer_view_kind(&view) {
+                let us = making.elapsed().as_micros() as u64;
+                let part = if in_heap_pass() { 0 } else if !later { 2 } else { 4 };
+                MIRROR_SPLIT[part].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                MIRROR_SPLIT[part + 1].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
             }
         } else if for_draw && in_heap_pass() {
             SAME_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3578,6 +3599,47 @@ fn pass_revisits() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PASS_REVISITS").is_some_and(|v| v == "1"))
 }
 
+/// Whether `view` views buffer memory: a constant buffer view, a view of a
+/// buffer resource, or a view of memory described as a buffer (not a
+/// texture placed in memory).
+fn buffer_view_kind(view: &View) -> bool {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Constant(..) => true,
+        View::Placed(_, resource, _) => resource[0] == BUFFER,
+        View::Shader(r, _) | View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
+        View::Sampler(_) | View::ConsoleSampler(_) => false,
+    }
+}
+
+/// Whether the mirroring of records the title copied into its heap as
+/// bytes (`super::sync_heaps`) makes the buffer views among them at once,
+/// as a draw would (`VICTORY_SYNC_MAKES=0`: made null and left to the pass
+/// over the heap's buffer views, as before).
+///
+/// Such a view was made twice: null when its record was mirrored (with the
+/// slot's books: the texture queue, the placed views, the stride table),
+/// then again by the next pass over buffer views, which a frame runs once
+/// (some 60,000 slots a frame in the open world: 110 ms of the pass). Lists
+/// recorded between the two read the null view. Made at once, the pass
+/// finds the slot made and only takes its range.
+fn sync_makes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_MAKES").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: buffer views made at the mirroring of copied
+/// records ([`sync_makes`]).
+pub(crate) static SYNC_MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line (diagnostics), of buffer views a record
+/// changed: made by the pass over buffer views, made at once elsewhere (at
+/// the mirroring of copied records, or for a draw), and made null for
+/// later; each a count and its microseconds (the slot's books, the view
+/// made or nulled, the resource kept).
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRROR_SPLIT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// Whether a record that names a buffer view the slot already shows leaves
 /// the slot as it is ([`HostHeap::mirror`]; `VICTORY_SAME_VIEWS=0`: every
 /// new record is made again, as before).
@@ -3604,17 +3666,7 @@ pub(crate) static SAME_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::
 /// `None` for other views, and with [`same_views`] off.
 fn same_view_signature(view: &View) -> Option<u64> {
     use std::hash::{Hash, Hasher};
-    if !same_views() {
-        return None;
-    }
-    const BUFFER: u32 = 1;
-    let buffer = match view {
-        View::Constant(..) => true,
-        View::Placed(_, resource, _) => resource[0] == BUFFER,
-        View::Shader(r, _) | View::Unordered(r, _, _) => crate::resource::buffer_bytes(*r as crate::object::This).is_some(),
-        View::Sampler(_) | View::ConsoleSampler(_) => false,
-    };
-    if !buffer {
+    if !same_views() || !buffer_view_kind(view) {
         return None;
     }
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -4442,6 +4494,16 @@ mod tests {
         let (words, _) = record(other.clone());
         assert_eq!(heap.mirror(slot, words.as_ptr() as u64, true), Some(other.clone()));
         assert!(!heap.shows_same(slot, sig, &view));
+        drop(_in_pass);
+
+        // A record copied in as bytes: the buffer view is made at once.
+        let (words, key) = record(view.clone());
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let copied = 3;
+        assert!(heap.mirror_copied(copied, words.as_ptr() as u64, &bytes));
+        assert_eq!(heap.made.lock().unwrap()[copied as usize], key);
+        assert!(heap.kept.lock().unwrap()[copied as usize].is_some(), "made, not left null");
+        assert!(heap.buffers.changed.lock().unwrap().contains(&copied), "the pass takes its range");
         crate::shadow::unregister(RESOURCE, start);
     }
 
