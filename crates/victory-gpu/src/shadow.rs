@@ -3328,9 +3328,13 @@ impl Shadow {
     /// again only by that refresh). Textures placed there are told.
     fn put_back(&self, at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) {
         let n = bytes.len();
-        let write = |runs: Option<&[(usize, usize)]>| match runs {
-            Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
-            None => crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), n),
+        let write = |runs: Option<&[(usize, usize)]>| {
+            if !self.write_quietly(at, bytes, runs) {
+                match runs {
+                    Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
+                    None => crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), n),
+                }
+            }
         };
         // Windows outside buffers may hold anything; view memory shows the
         // same pages elsewhere; in place there is nothing to put back.
@@ -3341,7 +3345,7 @@ impl Shadow {
         let start = self.start as usize;
         let deferred = crate::lazy::defer(at, bytes, runs, (start, start + self.len as usize));
         if deferred.kept > 0 {
-            self.kept_pending(at, n);
+            self.told_written(at, n, !crate::lazy::retake());
         }
         // The rest as before, a hold of its guards for each group of runs
         // with no kept page between them (a hold puts the pending pages
@@ -3360,15 +3364,20 @@ impl Shadow {
         }
     }
 
-    /// [`Shadow::put_back`] kept bytes of `[at, at + n)` pending: what a
-    /// write into title memory would have told, told.
-    fn kept_pending(&self, at: usize, n: usize) {
+    /// Bytes of `[at, at + n)` this copy made went into title memory with
+    /// no write the write watch sees (kept pending by `crate::lazy`, or
+    /// written with the watch's bits reset after, [`Shadow::write_quietly`]):
+    /// what such a write would have told, told. The journal takes the pages
+    /// as written (every other copy of them takes them again), and this
+    /// copy, which holds the same bytes, notes itself current there if it
+    /// was before and `current`. Textures placed there are told.
+    fn told_written(&self, at: usize, n: usize, current: bool) {
         // A placed texture there changed with no descriptor written.
         crate::descriptor::host::remapped(at, n);
         let base = self.start as usize / PAGE;
         for page in at / PAGE..(at + n).div_ceil(PAGE) {
             let (before, now) = crate::watch::wrote_own(page, &[]);
-            if crate::lazy::retake() {
+            if !current {
                 continue;
             }
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -3379,6 +3388,69 @@ impl Shadow {
                 *taken = (*taken).max(now);
             }
         }
+    }
+
+    /// With `VICTORY_BACK_QUIET=1` (off by default; after victory-fork pull
+    /// request #1188 by Yorivel, for the census of #1169): a copy-back
+    /// written into private, write-watched title memory as before, then
+    /// the kernel's write-watch bits of its pages reset, so the write does
+    /// not read as the title's at the next asking; the journal is told
+    /// instead ([`Shadow::told_written`]), so every other copy takes the
+    /// pages again and this one, which made the bytes, notes itself
+    /// current rather than taking its own output in again (most of what
+    /// the layer re-reads of copied-back pages, by the census). False with
+    /// nothing written if the switch is off, the copy is in place, the
+    /// memory is not write-watched (view memory: the asking fails), or the
+    /// title wrote one of the pages since the last asking (its bit would be
+    /// reset too): the caller writes as before.
+    ///
+    /// shortcut: a title write to one of the pages between our write and
+    /// the reset is lost to the write watch (the copies keep the bytes from
+    /// before it until the page is written again).
+    fn write_quietly(&self, at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) -> bool {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch};
+        /// Since the start: stretches written quietly, their bytes,
+        /// stretches written the old way.
+        static QUIET: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        if !quiet_back() || self.place.is_some() || bytes.is_empty() {
+            return false;
+        }
+        let (lo, hi) = match runs {
+            Some([]) => return false,
+            Some(runs) => (runs[0].0, runs.iter().map(|&(off, len)| off + len).max().unwrap_or(0)),
+            None => (0, bytes.len()),
+        };
+        let kernel = 4096;
+        let first = (at + lo) & !(kernel - 1);
+        let end = (at + hi).next_multiple_of(kernel);
+        let mut found = [std::ptr::null_mut::<std::ffi::c_void>(); 32];
+        let mut count = found.len();
+        let mut granularity = 0u32;
+        // SAFETY: a question about title memory, answered into arrays of
+        // ours; no bit is reset.
+        let failed = unsafe { GetWriteWatch(0, first as _, end - first, found.as_mut_ptr(), &mut count, &mut granularity) } != 0;
+        if failed || count != 0 {
+            QUIET[2].fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        match runs {
+            Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
+            None => crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), bytes.len()),
+        }
+        // SAFETY: the same write-watched pages.
+        unsafe { ResetWriteWatch(first as _, end - first) };
+        self.told_written(at + lo, hi - lo, true);
+        QUIET[1].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+        let n = QUIET[0].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(16384) {
+            tracing::info!(
+                "copy-backs written quietly (VICTORY_BACK_QUIET=1) since the start: {n} stretches, {} MB; written the old way \
+                 (not write-watched, or the title had written there): {}",
+                QUIET[1].load(Ordering::Relaxed) >> 20,
+                QUIET[2].load(Ordering::Relaxed)
+            );
+        }
+        true
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -4694,6 +4766,12 @@ fn grid(kb: Option<u64>) -> u64 {
 fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
     let start = address & !(grid - 1);
     (start, end.next_multiple_of(grid) - start)
+}
+
+/// `VICTORY_BACK_QUIET=1`: see [`Shadow::write_quietly`]. Off by default.
+fn quiet_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_QUIET").is_some_and(|v| v == "1"))
 }
 
 /// Whether the window of an ask without a length begins at the ask instead
