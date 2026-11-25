@@ -48,6 +48,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod lazy;
+#[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
 mod material_demand;
@@ -97,6 +99,8 @@ pub use bake_probe::{
 };
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use lazy::{kernel_will_read, lazy_back_on, title_memory_commit, title_memory_release, title_memory_reserved};
 #[cfg(windows)]
 pub use watch::{
     Writing, title_memory_reading, title_memory_reading_now, title_memory_reading_range,

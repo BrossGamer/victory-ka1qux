@@ -2884,7 +2884,7 @@ impl Shadow {
                 *h = merged;
             }
             if differs != 0 {
-                crate::host::write_mapped(from as *mut u8, title.as_ptr(), n);
+                self.put_back(from, &title[..n], None);
                 written += n;
             }
             // A snapshot of a declared range over the same bytes (one that
@@ -3214,7 +3214,7 @@ impl Shadow {
                 // there since stays.
                 // Under one hold of the stretch's guards
                 // (`VICTORY_BACK_RUNS_HELD`).
-                crate::host::write_mapped_runs(start + at, title.as_ptr(), &runs);
+                self.put_back(start + at, &title[..], Some(&runs));
                 written += runs.iter().map(|&(_, len)| len).sum::<usize>();
             }
             // Our write shows as a title write at the copy's next refresh,
@@ -3309,8 +3309,76 @@ impl Shadow {
             return n;
         }
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "pc relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.put_back(start + at, &title[..], None);
         n
+    }
+
+    /// What a copy-back made of title memory `[at, at + bytes.len())`
+    /// goes in: the `runs` of it (offsets, lengths; `None`: all of it), the
+    /// rest of the stretch being the title's as read.
+    ///
+    /// With `crate::lazy` on (`VICTORY_LAZY_BACK=1`), the whole pages of
+    /// private memory inside this copy's title buffer are kept there
+    /// instead (title memory made no-access until something needs them),
+    /// and only the rest is written. Kept pages are told as written to
+    /// every other copy of them (`crate::watch::wrote_own`); this copy,
+    /// which holds the same bytes, notes itself current there if it was
+    /// before, so that its next refresh does not take the page again (the
+    /// census of victory-fork #1169: nearly all a copy-back writes is read
+    /// again only by that refresh). Textures placed there are told.
+    fn put_back(&self, at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) {
+        let n = bytes.len();
+        let write = |runs: Option<&[(usize, usize)]>| match runs {
+            Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
+            None => crate::host::write_mapped(at as *mut u8, bytes.as_ptr(), n),
+        };
+        // Windows outside buffers may hold anything; view memory shows the
+        // same pages elsewhere; in place there is nothing to put back.
+        if !crate::lazy::on() || self.window || self.place.is_some() || self.own_view.is_some() || self.guarded() {
+            write(runs);
+            return;
+        }
+        let start = self.start as usize;
+        let deferred = crate::lazy::defer(at, bytes, runs, (start, start + self.len as usize));
+        if deferred.kept > 0 {
+            self.kept_pending(at, n);
+        }
+        // The rest as before, a hold of its guards for each group of runs
+        // with no kept page between them (a hold puts the pending pages
+        // under it back first).
+        let left = &deferred.left;
+        let mut from = 0;
+        for i in 1..=left.len() {
+            let split = i == left.len() || {
+                let (gap, end) = (left[i - 1].0 + left[i - 1].1, left[i].0);
+                crate::lazy::touches(at + gap, end - gap)
+            };
+            if split {
+                write(Some(&left[from..i]));
+                from = i;
+            }
+        }
+    }
+
+    /// [`Shadow::put_back`] kept bytes of `[at, at + n)` pending: what a
+    /// write into title memory would have told, told.
+    fn kept_pending(&self, at: usize, n: usize) {
+        // A placed texture there changed with no descriptor written.
+        crate::descriptor::host::remapped(at, n);
+        let base = self.start as usize / PAGE;
+        for page in at / PAGE..(at + n).div_ceil(PAGE) {
+            let (before, now) = crate::watch::wrote_own(page, &[]);
+            if crate::lazy::retake() {
+                continue;
+            }
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(taken) = page.checked_sub(base).and_then(|i| copied.get_mut(i))
+                && *taken != 0
+                && *taken >= before
+            {
+                *taken = (*taken).max(now);
+            }
+        }
     }
 
     /// With `crate::inplace::back_own` (`VICTORY_BACK_OWN_VIEW=1`): stores
@@ -4262,7 +4330,7 @@ impl Shadow {
             if differs != 0 {
                 crate::host::shaders_write(start + at, &title[..]);
                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.put_back(start + at, &title[..], None);
                 written = n;
             }
         } else {
@@ -4344,7 +4412,7 @@ impl Shadow {
             return n;
         }
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.put_back(start + at, &title[..], None);
         n
     }
 }

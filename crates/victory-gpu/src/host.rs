@@ -8776,7 +8776,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    // A copy-back page left pending in the source (`crate::lazy`) is
+    // read from what is kept, by `read`: the copy in place would fault.
+    let whole = (!title_dst && !crate::lazy::touches(src as usize, len) && crate::plaincopy::copy(dst, src, len))
+        || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8821,7 +8824,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             read_pieces(at, to, remaining);
             break;
         }
-        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+        if (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS) && !crate::lazy::touches(at as usize, n) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -8857,8 +8860,10 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     // In place first, if asked for (`crate::plaincopy`): the destination is
-    // memory of ours, as in `copy_mapped`.
-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
+    // memory of ours, as in `copy_mapped`. Not over a copy-back page left
+    // pending (`crate::lazy`): `read` takes it from what is kept.
+    (!crate::lazy::touches(src as usize, dst.len()) && crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()))
+        || read(src, dst.as_mut_ptr(), dst.len())
 }
 
 /// Whether reads and kernel-style write-backs copy in-process guarded by a
@@ -8937,9 +8942,17 @@ mod direct_copy {
         if rip < start || rip >= end {
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        const WRITE: usize = 1;
+        // A copy-back page left pending (`crate::lazy`) since the copy
+        // looked: its bytes go in and the copy goes on.
+        if code == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
+            && record.NumberParameters >= 2
+            && crate::lazy::fault(record.ExceptionInformation[1], record.ExceptionInformation[0] == WRITE)
+        {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // A write fault may race with `watch` re-protecting a block; let
         // `watch` open writable blocks before reporting failure.
-        const WRITE: usize = 1;
         if code == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && record.NumberParameters >= 2
             && record.ExceptionInformation[0] == WRITE
@@ -8980,8 +8993,17 @@ mod direct_copy {
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
-/// readable.
+/// readable. Copy-back pages left pending (`crate::lazy`) are read from
+/// what is kept.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    if crate::lazy::touches(src as usize, len) {
+        return crate::lazy::read_over(src as usize, dst, len, read_raw);
+    }
+    read_raw(src, dst, len)
+}
+
+/// [`read`] of title memory as it is.
+fn read_raw(src: *const u8, dst: *mut u8, len: usize) -> bool {
     #[cfg(target_arch = "x86_64")]
     if direct_copy_enabled() {
         // SAFETY: `dst` is caller-owned writable memory of `len` bytes; faults on
@@ -9439,6 +9461,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::lazy::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }

@@ -402,6 +402,13 @@ pub(crate) enum From {
 
 /// Opens a heap on memory the process has.
 pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<ID3D12Heap> {
+    // The card reads that memory itself from now on: copy-back pages left
+    // pending there (`crate::lazy`) go into it first, and no more are made.
+    match from {
+        From::Region(at) => crate::lazy::in_place_allocation(at),
+        From::Part(at, bytes) => crate::lazy::in_place(at, bytes),
+        From::Section(_) => {}
+    }
     // SAFETY: the calls take an address or a handle and check both
     // themselves; a refusal is an error code.
     unsafe {
