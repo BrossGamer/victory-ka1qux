@@ -2695,27 +2695,63 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
-        let (slot, offset) = crate::ambient::LIGHT;
-        let light = stage
-            .translated()
-            .used
-            .iter()
-            .find(|u| {
-                u.kind == ResourceType::Uav
+        // The view the program has in a table, at a user-data slot and a
+        // dword in it.
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            let u = stage.translated().used.iter().find(|u| {
+                u.kind == kind
                     && u.root == RootType::Table
                     && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })
-            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
-                Some(Root::Table(table)) => {
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+        };
+        // Once, what the program reads and writes through its tables: where
+        // to look if the light or the depth moved.
+        #[cfg(feature = "diagnostics")]
+        {
+            static LISTED: std::sync::Once = std::sync::Once::new();
+            LISTED.call_once(|| {
+                for u in stage.translated().used.iter().filter(|u| u.root == RootType::Table) {
+                    let r = match view(u.kind, (u.slot, u.table_offset_dwords)) {
+                        Some(crate::descriptor::View::Shader(r, _))
+                        | Some(crate::descriptor::View::Unordered(r, ..)) => r,
+                        _ => continue,
+                    };
+                    let Some(t) = crate::resource::host_resource(r as This) else {
+                        continue;
+                    };
+                    // SAFETY: a live resource.
+                    let d = unsafe { t.GetDesc() };
+                    tracing::info!(
+                        kind = ?u.kind,
+                        slot = u.slot,
+                        offset = u.table_offset_dwords,
+                        format = d.Format.0,
+                        width = d.Width,
+                        height = d.Height,
+                        depth = d.DepthOrArraySize,
+                        flags = d.Flags.0,
+                        "the light resolve uses"
+                    );
                 }
-                _ => None,
             });
-        let Some(crate::descriptor::View::Unordered(light, ..)) = light else {
+        }
+        let Some(crate::descriptor::View::Unordered(light, ..)) =
+            view(ResourceType::Uav, crate::ambient::LIGHT)
+        else {
             once!("no ambient light: the program's light is not where it was");
             return false;
         };
-        crate::ambient::raise(list, light as This)
+        // The scene's depth, as the program read it: the dispatch left it in
+        // a state shaders read.
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(crate::descriptor::View::Shader(depth, _)) => Some(depth as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
