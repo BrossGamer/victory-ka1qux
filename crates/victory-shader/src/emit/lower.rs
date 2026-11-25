@@ -4277,6 +4277,18 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad
+    /// reads: in a mesh shader (see `ds_swizzle_b32`) and in a pixel shader.
+    /// At a triangle's edge the quad's other pixels are helper lanes, which
+    /// only quad reads see: a wave read gives 0 from them on AMD, so a
+    /// derivative a shader takes by hand across its quad was the whole value
+    /// there, the texture read that used it took its smallest level, and the
+    /// edges of triangles showed as lines on paint, glass and skin.
+    /// (After Belobug/VIctory-Belobug-AMD 03629f3f.)
+    fn quad_reads(&self, quad: bool) -> bool {
+        quad && (self.s.mesh.is_some() || self.s.pixel)
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4421,7 +4433,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if self.quad_reads(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6869,7 +6881,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if self.quad_reads(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
