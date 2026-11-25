@@ -9466,6 +9466,16 @@ impl Meter {
                      {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
                 );
             }
+            let [paged, read, whole] =
+                [0, 1, 2].map(|i| crate::texture::PAGE_REFRESHES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if paged > 0.0 {
+                tracing::info!(
+                    "watched texture refreshes of the pages written alone, per frame (VICTORY_TEXTURE_PAGES=1): {paged:.1}, \
+                     reading {:.1} MB where refreshes of the whole textures would have read {:.1} MB",
+                    read / 1e6,
+                    whole / 1e6
+                );
+            }
         }
         {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);

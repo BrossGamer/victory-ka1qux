@@ -630,6 +630,59 @@ impl Layout {
         )
     }
 
+    /// [`Layout::detile`] of a window of the texture's memory: `tiled`
+    /// holds the bytes from byte `window` of the texture on, fewer than the
+    /// whole texture. Only the elements of the subresource that lie in the
+    /// window are written to `linear`; the rest of `linear` is left as it
+    /// was. A window over all of the texture detiles the subresource whole.
+    /// (After victory-fork's pull request #1130.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn detile_window(
+        &self,
+        tiled: &[u8],
+        window: u64,
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        if window.checked_add(tiled.len() as u64).is_none_or(|end| end > self.size) {
+            return Err(Error::TooSmall);
+        }
+        self.walk(
+            Buffers::Window {
+                tiled,
+                window: window as usize,
+                linear,
+            },
+            mip,
+            slice,
+            row_pitch,
+            depth_pitch,
+        )
+    }
+
+    /// The bytes of the texture's memory, `[start, end)` from its start,
+    /// that subresource (`mip`, `slice`) lies in: what a change of memory
+    /// outside them leaves the subresource as it was. `None` where depth
+    /// slices or samples share blocks (3D, thick, multisampled layouts).
+    pub fn subresource_span(&self, mip: u32, slice: u32) -> Option<(u64, u64)> {
+        if self.thick || self.desc.dimension == Dimension::Tex3d || self.desc.samples != 1 || slice >= self.slices {
+            return None;
+        }
+        let m = self.mips.get(mip as usize)?;
+        let (s, _) = self.split(slice);
+        let base = u64::from(s) * self.slice_size;
+        let bytes = match m.tail {
+            // The tail's mips share its first block.
+            Some(_) => self.alignment,
+            None => u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
+        };
+        let end = (m.offset + bytes).min(self.slice_size);
+        Some((base + m.offset, (base + end).min(self.size)))
+    }
+
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
     pub fn tile(
         &self,
@@ -682,9 +735,12 @@ impl Layout {
             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
+        // (A window of the memory is bounded by its caller, and each copy
+        // takes what of it lies in the window.)
         let (tiled_len, linear_len) = match &copy {
             Buffers::Tile { tiled, linear } => (tiled.len(), linear.len()),
             Buffers::Detile { tiled, linear } => (tiled.len(), linear.len()),
+            Buffers::Window { linear, .. } => (usize::MAX, linear.len()),
         };
         if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
@@ -777,6 +833,13 @@ enum Buffers<'a> {
         tiled: &'a mut [u8],
         linear: &'a [u8],
     },
+    /// Detiling from the bytes `tiled` of the texture's memory that start
+    /// at byte `window` of it: what lies outside them is not copied.
+    Window {
+        tiled: &'a [u8],
+        window: usize,
+        linear: &'a mut [u8],
+    },
 }
 
 impl Buffers<'_> {
@@ -787,6 +850,13 @@ impl Buffers<'_> {
                 linear[l..][..len].copy_from_slice(&tiled[t..][..len])
             }
             Self::Tile { tiled, linear } => tiled[t..][..len].copy_from_slice(&linear[l..][..len]),
+            Self::Window { tiled, window, linear } => {
+                let from = t.max(*window);
+                let to = (t + len).min(*window + tiled.len());
+                if from < to {
+                    linear[l + (from - t)..][..to - from].copy_from_slice(&tiled[from - *window..to - *window]);
+                }
+            }
         }
     }
 
@@ -802,7 +872,18 @@ impl Buffers<'_> {
         second: Option<usize>,
     ) {
         let len = columns.len() * N;
+        if matches!(self, Self::Window { .. }) {
+            // Run by run: a run can lie partly in the window.
+            for (i, &x) in columns.iter().enumerate() {
+                self.span(t + x * N, l + i * N, N);
+                if let Some(dy) = second {
+                    self.span(t + dy + x * N, l + pitch + i * N, N);
+                }
+            }
+            return;
+        }
         match self {
+            Self::Window { .. } => unreachable!("taken above"),
             Self::Detile { tiled, linear } => {
                 let (src, _) = tiled[t..].as_chunks::<N>();
                 let (top, rest) = linear[l..].split_at_mut(len);
@@ -1295,6 +1376,91 @@ mod tests {
                 }
                 assert_eq!(retiled, expected_tiled, "{swizzle:?} {n}");
             }
+        }
+    }
+
+    /// A window of the memory detiles the elements that lie in it and
+    /// nothing else: windows that cover a subresource's span
+    /// ([`Layout::subresource_span`]) piece by piece detile it as whole, a
+    /// window outside the span writes nothing, and the whole memory as one
+    /// window is `detile`.
+    #[test]
+    fn windows_detile_what_lies_in_them_and_spans_hold_their_subresource() {
+        let cases = [
+            desc(64, 64, 7, 16, Swizzle::SW_64KB_D),
+            desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
+            desc(250, 175, 8, 8, Swizzle::SW_4KB_S),
+            desc(33, 17, 6, 1, Swizzle::SW_4KB_D),
+            desc(40, 9, 3, 2, Swizzle::SW_64KB_S),
+            desc(30, 20, 5, 4, Swizzle::LINEAR),
+            desc(83, 31, 6, 1, Swizzle::SW_256B_S),
+            desc(300, 200, 9, 4, Swizzle::SW_64KB_D_X),
+            Desc {
+                block: 4,
+                ..desc(109, 71, 6, 16, Swizzle::SW_256B_D)
+            },
+            Desc {
+                depth: 3,
+                ..desc(70, 70, 4, 16, Swizzle::SW_4KB_S)
+            },
+            Desc {
+                depth: 4,
+                ..desc(517, 260, 10, 4, Swizzle::SW_64KB_S)
+            },
+        ];
+        for d in cases {
+            let Ok(l) = Layout::new(&d) else {
+                continue;
+            };
+            if !l.addressable() {
+                continue;
+            }
+            let n = d.element_bytes as usize;
+            let tiled: Vec<u8> = (0..l.size).map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8 | 1).collect();
+            for slice in 0..l.slices {
+                for (mip, m) in l.mips.iter().enumerate() {
+                    let mip = mip as u32;
+                    let pitch = m.width as usize * n + 5;
+                    let len = (m.height as usize - 1) * pitch + m.width as usize * n;
+                    let mut whole = vec![0u8; len];
+                    l.detile(&tiled, mip, slice, &mut whole, pitch, len).unwrap();
+                    let mut one = vec![0u8; len];
+                    l.detile_window(&tiled, 0, mip, slice, &mut one, pitch, len).unwrap();
+                    assert_eq!(one, whole, "{d:?} mip {mip} slice {slice}: one window");
+                    let (start, end) = l.subresource_span(mip, slice).unwrap();
+                    assert!(start < end && end <= l.size);
+                    // Pieces of an odd size that do not line up with blocks.
+                    for piece in [997u64, 4096, 65536] {
+                        let mut pieces = vec![0u8; len];
+                        let mut at = start;
+                        while at < end {
+                            let to = (at + piece).min(end);
+                            l.detile_window(
+                                &tiled[at as usize..to as usize],
+                                at,
+                                mip,
+                                slice,
+                                &mut pieces,
+                                pitch,
+                                len,
+                            )
+                            .unwrap();
+                            at = to;
+                        }
+                        assert_eq!(pieces, whole, "{d:?} mip {mip} slice {slice}: pieces of {piece}");
+                    }
+                    // The memory before and after the span: nothing written.
+                    let mut untouched = vec![0u8; len];
+                    l.detile_window(&tiled[..start as usize], 0, mip, slice, &mut untouched, pitch, len)
+                        .unwrap();
+                    l.detile_window(&tiled[end as usize..], end, mip, slice, &mut untouched, pitch, len)
+                        .unwrap();
+                    assert!(untouched.iter().all(|&b| b == 0), "{d:?} mip {mip} slice {slice}: outside");
+                }
+            }
+            // A window past the memory is refused.
+            let mut linear = vec![0u8; 1 << 20];
+            assert!(l.detile_window(&tiled[..2], l.size - 1, 0, 0, &mut linear, 1 << 12, 1 << 20).is_err());
         }
     }
 

@@ -48,6 +48,12 @@ pub(crate) struct Staging {
     /// (`crate::resource::dropped`): host mip `m` is the title's
     /// `m + dropped`, and `first` is never below it.
     dropped: u32,
+    /// The bytes of title memory, from the texture's start, each part of
+    /// the staging buffer is detiled from (`Layout::subresource_span`),
+    /// for a refresh of the pages written alone ([`texture_pages`]).
+    /// `None` where parts share memory (3D, thick, multisampled) or for
+    /// levels on demand: those are detiled whole.
+    spans: Option<Vec<(u64, u64)>>,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -521,6 +527,28 @@ thread_local! {
 
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
+/// Whether a texture the write watch answers for is detiled only where the
+/// title wrote since its last refresh: the 64 KiB pages written are read,
+/// and the parts of the staging buffer that lie in them detiled from them
+/// alone (`VICTORY_TEXTURE_PAGES=1`; off by default: the whole texture is
+/// read and detiled at any write, as before).
+///
+/// After victory-fork's pull request #1130 (by Lkxex), which turns it on
+/// by default; it was measured there only in the bytes read and detiled
+/// on the CPU, not on a card. Off here until a run shows it: a whole
+/// refresh also takes in what changed without a write the watch saw (a
+/// remapping), whenever anything in the texture was written; this does
+/// not.
+pub(crate) fn texture_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_PAGES").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: watched refreshes made of the pages written
+/// alone ([`texture_pages`]), the bytes they read, and the bytes refreshes
+/// of the whole textures would have read.
+pub(crate) static PAGE_REFRESHES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     READ.with(|read| {
         let mut read = read.borrow_mut();
@@ -1126,7 +1154,13 @@ impl Staging {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
+            let previous = last.asked;
             last.asked = now;
+            if previous != 0
+                && let Some(read) = self.refresh_pages(&written, previous)
+            {
+                return read;
+            }
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -1294,6 +1328,80 @@ impl Staging {
             last.asked = 0;
             0
         }
+    }
+
+    /// A watched refresh of the pages written since the asking `previous`
+    /// alone ([`texture_pages`]): each run of written pages is read once
+    /// (through the copy, which stands unmapped pages, as a whole refresh
+    /// reads), and the parts of the staging buffer that lie in it detiled
+    /// from it. Returns the bytes read; `None` where it cannot be done (the
+    /// caller refreshes the whole texture).
+    fn refresh_pages(&self, written: &[(usize, u64)], previous: u64) -> Option<usize> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !texture_pages() {
+            return None;
+        }
+        let spans = self.spans.as_ref()?;
+        let start = self.memory as usize;
+        let end = start + self.size;
+        let page = crate::watch::PAGE;
+        // Runs of pages written since, in address order (the journal's).
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for &(p, _) in written.iter().filter(|&&(_, w)| w > previous) {
+            let (lo, hi) = ((p * page).max(start), ((p + 1) * page).min(end));
+            if lo >= hi {
+                continue;
+            }
+            match runs.last_mut() {
+                Some(run) if run.1 == lo => run.1 = hi,
+                _ => runs.push((lo, hi)),
+            }
+        }
+        let mut read = 0;
+        for &(lo, hi) in &runs {
+            with_read(hi - lo, |bytes| {
+                crate::host::copy_mapped(bytes.as_mut_ptr(), lo as *const u8, hi - lo, false);
+                let (from, to) = ((lo - start) as u64, (hi - start) as u64);
+                for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+                    let Some(&(s, e)) = spans.get(i) else {
+                        continue;
+                    };
+                    let (a, b) = (s.max(from), e.min(to));
+                    if a >= b {
+                        continue;
+                    }
+                    let (mip, slice) = self.part(i);
+                    let f = footprint.Footprint;
+                    let pitch = f.RowPitch as usize;
+                    let len = pitch * rows as usize * f.Depth as usize;
+                    // SAFETY: the subresource's part of the mapped staging
+                    // buffer, written only here and by `detile`, under
+                    // `last`'s lock.
+                    let linear = unsafe { std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len) };
+                    if let Err(e) = self.layout.detile_window(
+                        &bytes[(a - from) as usize..(b - from) as usize],
+                        a,
+                        mip + self.dropped,
+                        slice,
+                        linear,
+                        pitch,
+                        pitch * rows as usize,
+                    ) {
+                        tracing::warn!(?e, mip, slice, "texture pages not detiled");
+                    }
+                }
+            });
+            read += hi - lo;
+        }
+        if read != 0 {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+        PAGE_REFRESHES[0].fetch_add(1, Relaxed);
+        PAGE_REFRESHES[1].fetch_add(read as u64, Relaxed);
+        PAGE_REFRESHES[2].fetch_add(self.size as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+        Some(read)
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
@@ -1665,6 +1773,16 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         );
     }
     let (buffer, data, pooled) = staging_buffer(host, total)?;
+    // Where each part lies in title memory (the order of `part`: mips of a
+    // slice, slice after slice), for refreshes of written pages alone.
+    let spans = (!on_demand && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        .then(|| {
+            let mips = u32::from(d.MipLevels) - (first - dropped);
+            (0..count)
+                .map(|i| layout.subresource_span(first + i % mips, i / mips))
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten();
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1684,6 +1802,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         first,
         size,
         dropped,
+        spans,
         bytes: total,
         memory,
         last: Mutex::default(),
