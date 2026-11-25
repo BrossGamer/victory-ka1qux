@@ -275,6 +275,62 @@ pub fn pick_adapter() -> Option<IDXGIAdapter1> {
     }
 }
 
+/// If the chosen D3D12 hardware adapter is an Intel GPU (`0x8086`), returns
+/// its dedicated video memory in MiB (`None` in unit tests, WARP mode, or on
+/// non-Intel adapters). Used to select stable defaults automatically even when
+/// `victory` is launched without sourcing `scripts\arc-*.ps1`.
+pub(crate) fn intel_host_vram_mb() -> Option<u64> {
+    static INTEL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *INTEL.get_or_init(|| {
+        if cfg!(test) || std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v != "0") {
+            return None;
+        }
+        let wanted = std::env::var("VICTORY_ADAPTER")
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty());
+        // SAFETY: plain DXGI enumeration without logging side effects.
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let mut hardware = Vec::new();
+            for i in 0.. {
+                let Ok(adapter) = factory
+                    .EnumAdapterByGpuPreference::<IDXGIAdapter1>(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+                else {
+                    break;
+                };
+                let Ok(desc) = adapter.GetDesc1() else {
+                    continue;
+                };
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                hardware.push((String::from_utf16_lossy(&desc.Description[..len]), desc));
+            }
+            let picked = match &wanted {
+                Some(w) => match w.parse::<usize>() {
+                    Ok(n) => hardware.into_iter().nth(n),
+                    Err(_) => {
+                        let w = w.to_ascii_lowercase();
+                        hardware
+                            .into_iter()
+                            .find(|(name, _)| name.to_ascii_lowercase().contains(&w))
+                    }
+                },
+                None => hardware.into_iter().next(),
+            };
+            picked
+                .filter(|(_, desc)| desc.VendorId == 0x8086)
+                .map(|(_, desc)| (desc.DedicatedVideoMemory as u64) >> 20)
+        }
+    })
+}
+
 /// Every adapter DXGI lists, in the high-performance order: for `gpu-info`.
 pub fn adapters() -> Vec<String> {
     let mut out = Vec::new();

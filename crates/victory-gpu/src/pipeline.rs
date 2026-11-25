@@ -436,7 +436,13 @@ pub(crate) fn builder_allowed() -> bool {
         if is("VICTORY_RAYS", "0") || is("VICTORY_BVH_BUILDER", "0") {
             return false;
         }
-        is("VICTORY_BVH_BUILDER", "1") || is("VICTORY_RAYS", "1") || !cfg!(test)
+        if is("VICTORY_BVH_BUILDER", "1") || is("VICTORY_RAYS", "1") {
+            return true;
+        }
+        // On Intel Arc, uncached JIT compilation of RT compute shaders stalls
+        // world entry past the title's ~28s watchdog unless pre-warmed; keep
+        // `ambient` light as default until `VICTORY_RAYS=1` is requested.
+        !cfg!(test) && crate::caps::intel_host_vram_mb().is_none()
     })
 }
 

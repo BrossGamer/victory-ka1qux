@@ -189,11 +189,13 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
+        let intel = crate::caps::intel_host_vram_mb().is_some();
+        let (default_min_mb, default_total_mb) = if intel { (16, 512) } else { (1, 1024) };
         let least = match std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
             Some(kb) => kb << 10,
-            None => mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20),
+            None => mb("VICTORY_CARD_BUFFERS_MIN_MB", default_min_mb).max(1 << 20),
         };
-        (least, mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        (least, mb("VICTORY_CARD_BUFFERS_MB", default_total_mb))
     })
 }
 
@@ -758,7 +760,8 @@ pub(crate) fn relay() -> bool {
     // relay's landing thread may still be writing.
     // `VICTORY_ONE_FLIGHT=1` turns it off (`crate::host::one_flight`).
     *ON.get_or_init(|| {
-        std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2")
+        let default_on = !cfg!(test) && crate::caps::intel_host_vram_mb().is_none();
+        std::env::var("VICTORY_RELAY").map_or(default_on, |v| v == "1" || v == "2")
             && !keeps()
             && !crate::host::one_flight_asked()
     })
@@ -1578,8 +1581,12 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// lists only afterwards).
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // On by default; `VICTORY_WIDE_BACK=0` turns it off.
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_BACK").is_none_or(|v| v != "0"))
+    // On by default (except on Intel Arc, where multi-flight relay is off by
+    // default); `VICTORY_WIDE_BACK=0` turns it off and `=1` forces it on.
+    *ON.get_or_init(|| {
+        let default_on = crate::caps::intel_host_vram_mb().is_none();
+        std::env::var_os("VICTORY_WIDE_BACK").map_or(default_on, |v| v != "0")
+    })
 }
 
 type Job = Box<dyn FnOnce() + Send>;

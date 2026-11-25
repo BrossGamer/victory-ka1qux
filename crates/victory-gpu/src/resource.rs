@@ -1922,10 +1922,15 @@ pub(crate) fn room_lately() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
+        let default_pct = match crate::caps::intel_host_vram_mb() {
+            Some(mb) if mb >= 14_000 => 95,
+            Some(mb) if mb >= 10_000 => 92,
+            _ => 90,
+        };
         std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+            .map_or(default_pct, |percent| percent.clamp(50, 97))
     })
 }
 

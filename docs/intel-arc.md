@@ -76,7 +76,7 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
    # Para Intel Arc B580 12 GB:
    . .\scripts\arc-b580.ps1
    ```
-   *(Por padrão os scripts ativam `VICTORY_INDIRECT_CLAMP=compute`, `VICTORY_RELAY=0`, `VICTORY_LATE_WAIT_LISTS=128` e `VICTORY_RAYS=0` — combinação validada na A770 sem `GEN12_DX12COMPUTE_BBHANG`/`PAGEFAULT`, sem corrupção de páginas por *write marks* e com tons corretos nos *bakes* de pele e cabelo. Use `-Rays` após pré-aquecer `XboxBvhBuilder.dll` para testar o Ray Tracing, ou `-Fast` para testar o modo experimental `VICTORY_RELAY=2`.)*
+   *(O próprio `victory.exe` agora detecta GPUs Intel (`0x8086`) e aplica automaticamente `VICTORY_INDIRECT_CLAMP=1`, `VICTORY_RELAY=0`, `VICTORY_WIDE_BACK=0`, `VICTORY_RAYS=0` e `VICTORY_TEXTURE_ROOM_PERCENT=95`/`92` mesmo que o script não seja carregado. Use `-Rays` após pré-aquecer `XboxBvhBuilder.dll` para testar o Ray Tracing, ou `-Fast` para testar o modo experimental `VICTORY_RELAY=2`.)*
 3. Pré-aqueça o cache de shaders e de pipelines **na mesma sessão** (para usar exatamente as mesmas capacidades `wave_min`, `wave_max`, `doubles` e `view_limit`):
    ```powershell
    $g = "<pasta do seu jogo>"
