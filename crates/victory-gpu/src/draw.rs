@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// Likewise: whether that stage's shader marks the pages it writes
+    /// through views (`crate::marks`).
+    static MARKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1256,8 +1259,10 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            MARKED.set(victory_shader::emit::marks_writes(&t.host));
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
+            MARKED.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1313,6 +1318,36 @@ impl State {
                                     l.SetComputeRootShaderResourceView(param, m.directory);
                                 } else {
                                     l.SetGraphicsRootShaderResourceView(param, m.directory);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_MARKS {
+                        // Ours: the bound view heap's mark table.
+                        let table = self
+                            .heaps
+                            .iter()
+                            .filter(|&&h| h != 0)
+                            .map(|&h| crate::descriptor::heap(h as This))
+                            .find(|h| !h.samplers())
+                            .and_then(|h| h.host())
+                            .and_then(|host| host.marks().map(|(buffer, gpu)| (buffer.clone(), gpu)));
+                        let gpu = match table {
+                            Some((buffer, gpu)) => {
+                                // The list may outlive the heap that owns it.
+                                list.keep(&buffer);
+                                Some(gpu)
+                            }
+                            None => crate::marks::empty_table_gpu(),
+                        };
+                        if let Some(gpu) = gpu {
+                            // SAFETY: an open list; the table lives while the list holds it.
+                            unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             }
                         }
@@ -1381,6 +1416,20 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_VIEW_WRITES {
+                    // Ours: the bitmap of pages shaders write through views.
+                    if let Some(gpu) = crate::marks::bitmap_gpu() {
+                        // SAFETY: an open list; the bitmap lives for good.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -4007,7 +4056,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
-                shadow.gpu_writes(list, address, len);
+                // Through a view of the heap: marked if the shader marks.
+                shadow.gpu_writes_marked(list, address, len, MARKED.get());
             } else {
                 #[cfg(feature = "diagnostics")]
                 {

@@ -2178,8 +2178,10 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy;
+    /// whether through views of the heap by shaders that mark the pages
+    /// they write (`crate::marks`).
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -3977,13 +3979,48 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
 }
 
+/// The host copies the shaders of `runs` write, each with whether every
+/// range declared of it is written through marked views (`crate::marks`).
+fn marked_writes(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, bool)> {
+    let mut out: Vec<(std::sync::Arc<crate::shadow::Shadow>, bool)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(shadow, _, _, marked) = step {
+                match out.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                    Some((_, all)) => *all &= *marked,
+                    None => out.push((shadow.clone(), *marked)),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `back` for the declared copy-back with the copies `marking` armed left
+/// to `crate::marks`: of those, only the ranges that kept a snapshot (all
+/// of them with `VICTORY_VIEW_MARKS=check`).
+fn unmarked(back: Vec<Declared>, marking: &crate::marks::Marking) -> Vec<Declared> {
+    if crate::marks::check() {
+        return back;
+    }
+    back.into_iter()
+        .filter_map(|(shadow, ranges)| {
+            if !marking.has(&shadow) {
+                return Some((shadow, ranges));
+            }
+            let kept: Vec<(usize, usize)> = shadow.marks_fallback().into_iter().filter(|r| ranges.contains(r)).collect();
+            (!kept.is_empty()).then_some((shadow, kept))
+        })
+        .collect()
+}
+
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, _) = step {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -4519,7 +4556,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -5982,6 +6019,8 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // Copies written through marked views only: armed, not kept.
+        let marking = crate::marks::begin(if late { Vec::new() } else { marked_writes(runs) });
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6161,8 +6200,11 @@ impl Host {
         if let Some(card) = &card {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
-        let back = declared_writes(runs);
+        // The pages shaders marked, then what was declared otherwise.
+        crate::marks::copy_back(&marking);
+        let back = unmarked(declared_writes(runs), &marking);
         hand_back(&back);
+        crate::marks::end(marking);
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -7079,10 +7121,11 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7440,7 +7483,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, _) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -7987,6 +8030,13 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     read_kernel(src, dst, len)
 }
 
+/// Reads title memory at `src` into `dst` through the kernel alone (no
+/// fault is taken, so it may run in our fault handler); false if a page of
+/// it is not readable.
+pub(crate) fn read_into_kernel(src: *const u8, dst: &mut [u8]) -> bool {
+    read_kernel(src, dst.as_mut_ptr(), dst.len())
+}
+
 fn read_kernel(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -8404,6 +8454,7 @@ impl Meter {
             }
         }
         crate::shadow::back_line(frames);
+        crate::marks::line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if passes + compares > 0.0 {

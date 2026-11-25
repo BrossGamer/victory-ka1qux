@@ -83,6 +83,16 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Its first bit in the bitmap of pages shaders write through views
+    /// (`crate::marks`), one per 64 KiB title page it touches.
+    marks: Option<u32>,
+    /// The submission being prepared writes it through marked views only
+    /// (`crate::marks::begin`): its declared ranges are armed, not kept.
+    marked_now: std::sync::atomic::AtomicBool,
+    /// Of that submission's declared ranges, those armed, and those that
+    /// kept a snapshot all the same (not all guarded and clean).
+    marked: Mutex<Vec<(usize, usize)>>,
+    fallback: Mutex<Vec<(usize, usize)>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2042,6 +2052,9 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        if let Some(base) = self.marks {
+            crate::marks::give_back(base, self.start, self.len);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2078,7 +2091,7 @@ impl Drop for Shadow {
 /// write is simply never put back, with a kept one it would be taken for a
 /// write of a later submission and put back then, over whatever the title
 /// wrote there since.
-fn keeps() -> bool {
+pub(crate) fn keeps() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_SNAPSHOTS").is_some_and(|v| v == "1"))
 }
@@ -2423,7 +2436,163 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            marks: None,
+            marked_now: std::sync::atomic::AtomicBool::new(false),
+            marked: Mutex::default(),
+            fallback: Mutex::default(),
         }
+    }
+
+    /// The copy, shared: with a run of bits for write marks if it is a
+    /// copy in the PC's memory (not in the card's, not in place) and marks
+    /// are on (`crate::marks`).
+    fn registered(mut self) -> Arc<Shadow> {
+        if self.card.is_none() && self.place.is_none() {
+            self.marks = crate::marks::take(self.start, self.len);
+        }
+        let shadow = Arc::new(self);
+        if let Some(base) = shadow.marks {
+            crate::marks::register(base, &shadow);
+        }
+        shadow
+    }
+
+    /// The mark table entry (`victory_shader::emit`, "Write marks") of an
+    /// unordered view of this copy whose first byte is title address
+    /// `start`, for a typed view with elements of `element` bytes (0
+    /// otherwise): the bit of that byte's page, and its offset in the page
+    /// with the element size above. None where writes through it are not
+    /// marked.
+    pub(crate) fn mark_entry(&self, start: u64, element: u64) -> Option<(u32, u32)> {
+        let base = self.marks?;
+        let page = (start >> 16).checked_sub(self.start >> 16)?;
+        let element = u32::try_from(element).ok().filter(|&e| e <= 0xFFFF)?;
+        Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32 | element << 16))
+    }
+
+    /// For the submission being prepared (`on`), or after it: whether its
+    /// declared ranges are armed instead of kept. True if set.
+    pub(crate) fn marks_now(&self, on: bool) -> bool {
+        let on = on && self.marks.is_some() && self.card.is_none() && self.place.is_none();
+        self.marked_now.store(on, Ordering::Relaxed);
+        on
+    }
+
+    /// The ranges of the submission that kept a snapshot although marked
+    /// (`crate::marks`): those the declared copy-back still compares.
+    pub(crate) fn marks_fallback(&self) -> Vec<(usize, usize)> {
+        self.fallback.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The armed ranges are done with; nothing is armed for this copy.
+    pub(crate) fn marks_done(&self) {
+        let marked = std::mem::take(&mut *self.marked.lock().unwrap_or_else(|e| e.into_inner()));
+        self.fallback.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if !marked.is_empty() {
+            self.copy_back_done(&marked);
+        }
+    }
+
+    /// Whether the submission armed some of title page `page` (its address).
+    pub(crate) fn marks_cover(&self, page: usize) -> bool {
+        self.marked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|&(a, e)| a < page + PAGE && page < e)
+    }
+
+    /// After a submission whose shaders marked title page `page` (its
+    /// address) as written through views of this copy: in the parts of the
+    /// page the submission armed, the bytes that differ from `before` (the
+    /// page's 64 KiB before the submission) are the shaders' and go into
+    /// title memory, and the copy takes the title's others. Returns the
+    /// bytes written.
+    pub(crate) fn copy_back_marked(&self, page: usize, before: &[u8]) -> usize {
+        let marked = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut written = 0;
+        let mut title = Vec::new();
+        for (a, e) in marked {
+            let (from, to) = (a.max(page).max(start), e.min(page + PAGE).min(end));
+            if from >= to {
+                continue;
+            }
+            let n = to - from;
+            // SAFETY: inside the mapping; only the submitting thread writes
+            // it, and the card is done with it.
+            let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
+            let old = &before[from - page..to - page];
+            let Some(first) = first_difference(host, old) else {
+                continue;
+            };
+            let last = last_difference(host, old).unwrap_or(first);
+            let (from, n) = (from + first, last + 1 - first);
+            let (host, old) = (&mut host[first..=last], &old[first..=last]);
+            title.clear();
+            title.resize(n, 0);
+            if !crate::host::read_into(from as *const u8, &mut title) {
+                continue;
+            }
+            // The card's byte where the copy changed, else the title's.
+            let mut differs = 0u8;
+            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                let gpu = if *h != *o { 0xffu8 } else { 0 };
+                let merged = (*t & !gpu) | (*h & gpu);
+                differs |= merged ^ *t;
+                *t = merged;
+                *h = merged;
+            }
+            if differs != 0 {
+                crate::host::write_mapped(from as *mut u8, title.as_ptr(), n);
+                written += n;
+            }
+        }
+        written
+    }
+
+    /// `VICTORY_VIEW_MARKS=check`: in the armed ranges, outside the pages
+    /// `marked` (addresses), the bytes that differ from the snapshot kept
+    /// beside the marks: writes no bit named. Logged (the first few) and
+    /// counted: pages, bytes.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn check_unmarked(&self, marked: &[usize]) -> (u64, u64) {
+        let ranges = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = &*snapshot else {
+            return (0, 0);
+        };
+        let start = self.start as usize;
+        let (mut pages, mut bytes) = (0u64, 0u64);
+        for (a, e) in ranges {
+            let (from, to) = self.inside(a, e - a);
+            let mut at = from;
+            while at < to {
+                let page = (start + at) & !(PAGE - 1);
+                let n = (page + PAGE - (start + at)).min(to - at);
+                if !marked.contains(&page) {
+                    // SAFETY: inside the mapping; the snapshot holds the
+                    // copy's length and these offsets (a declared range).
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
+                    let differ = host.iter().zip(&before[at..at + n]).filter(|(h, o)| h != o).count() as u64;
+                    if differ > 0 {
+                        pages += 1;
+                        bytes += differ;
+                        static LOGGED: AtomicU64 = AtomicU64::new(0);
+                        if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+                            tracing::warn!(
+                                copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+                                page = format_args!("{page:#x}"),
+                                differ,
+                                "write marks: a shader wrote a page no bit names (a write the marks missed)"
+                            );
+                        }
+                    }
+                }
+                at += n;
+            }
+        }
+        (pages, bytes)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2443,6 +2612,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_writes_marked(list, address, len, false);
+    }
+
+    /// [`Shadow::gpu_writes`]; `marked`: through views of the heap by a
+    /// shader that marks the pages it writes (`crate::marks`).
+    pub(crate) fn gpu_writes_marked(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -2452,7 +2627,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marks.is_some());
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2485,11 +2660,34 @@ impl Shadow {
             pending.push(range);
             return;
         }
+        // Written through marked views only (`crate::marks`): the range is
+        // armed instead of kept, if all of it is guarded and clean (with
+        // `VICTORY_VIEW_MARKS=check` kept as well).
+        let check = crate::marks::check();
+        if self.marked_now.load(Ordering::Relaxed) {
+            if crate::watch::arm(address, address + len) {
+                crate::marks::count(crate::marks::ARMED, 1);
+                self.marked.lock().unwrap_or_else(|e| e.into_inner()).push(range);
+                if !check {
+                    pending.push(range);
+                    return;
+                }
+            } else {
+                crate::marks::count(crate::marks::FELL_BACK, 1);
+                self.fallback.lock().unwrap_or_else(|e| e.into_inner()).push(range);
+            }
+        }
         // The parts no declared range holds yet: their bytes are taken now,
         // just after the range's refresh (a part declared earlier has not
-        // been refreshed since, and keeps the bytes taken then).
+        // been refreshed since, and keeps the bytes taken then). Armed
+        // ranges hold none.
+        let armed = if check {
+            Vec::new()
+        } else {
+            self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        };
         let mut parts = vec![self.inside(address, len)];
-        for &(a, e) in pending.iter() {
+        for &(a, e) in pending.iter().filter(|r| !armed.contains(r)) {
             let (a, e) = self.inside(a, e - a);
             let mut rest = Vec::with_capacity(parts.len() + 1);
             for (from, to) in parts {
@@ -3789,7 +3987,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
         shadow.card = card;
-        let shadow = Arc::new(shadow);
+        let shadow = shadow.registered();
         if shadow.card.is_some() {
             CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
         }
@@ -3998,7 +4196,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
     shadow.card = card;
-    let shadow = Arc::new(shadow);
+    let shadow = shadow.registered();
     if shadow.card.is_some() {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
     }
@@ -4158,7 +4356,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
     // A new copy: none of it counts as copied (`Shadow::new`), so a reused
     // buffer's old bytes are all replaced at its first refresh.
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
+    let shadow = Shadow::new(buffer, data, gpu, address, len).registered();
     exact.map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     EXACT_STATS[3].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -4190,6 +4388,54 @@ pub(crate) fn exact_line(frames: f64) {
         looking_us as f64 / 1e3 / frames,
         let_go as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod marked_tests {
+    use super::{PAGE, exact};
+
+    /// A marked page goes back by the bytes the card changed against the
+    /// page's bytes from before: the card's byte and the title's own write
+    /// meanwhile both stay in title memory; outside the armed range nothing
+    /// is written.
+    #[test]
+    fn a_marked_page_goes_back_by_the_bytes_the_card_changed() {
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        // Two title pages of our own, on a page boundary.
+        let memory = vec![0u8; 3 * PAGE];
+        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let title = |at: usize| (page + at) as *mut u8;
+        let copy = exact(page as u64, 2 * PAGE as u64).unwrap();
+        assert!(copy.update(page, 2 * PAGE) > 0);
+        let before: Vec<u8> = (0..PAGE).map(|k| {
+            // SAFETY: bytes of our memory.
+            unsafe { title(k).read() }
+        }).collect();
+        // Armed: the first 4 KiB of the first page.
+        copy.marked.lock().unwrap().push((page, page + 4096));
+        // The card writes bytes 10 and 5000 (the second outside the armed
+        // range); the title writes byte 20 meanwhile.
+        // SAFETY: the copy's mapping, 2 pages; our memory.
+        unsafe {
+            copy.data.add(10).write(0xaa);
+            copy.data.add(5000).write(0xbb);
+            title(20).write(0x55);
+        }
+        // Its bytes from before are what the title's first write kept.
+        let written = copy.copy_back_marked(page, &before);
+        assert!(written > 0);
+        // SAFETY: bytes of our memory.
+        let read = |at: usize| unsafe { title(at).read() };
+        assert_eq!((read(10), read(20), read(5000)), (0xaa, 0x55, 0), "the card's, the title's, nothing outside");
+        // The title's own write reaches the copy by its next refresh (the
+        // write tracking saw it), as after any copy-back.
+        copy.marked.lock().unwrap().clear();
+        drop(copy);
+        super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
+        drop(memory);
+    }
 }
 
 #[cfg(test)]

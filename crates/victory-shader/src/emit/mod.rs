@@ -146,13 +146,12 @@ pub use shader::{
 };
 
 /// Whether translations carry write marks (module notes, "Write marks"):
-/// off until the host binds what they need; `VICTORY_VIEW_MARKS=1` asks
-/// for them. Part of the translation: the shader cache keys on it. Off in
-/// this crate's own tests, whose rig binds no mark table or bitmap
-/// (`marks_tests` asks for them).
+/// on unless `VICTORY_VIEW_MARKS=0`. Part of the translation: the shader
+/// cache keys on it (`victory-gpu`'s does). Off in this crate's own tests,
+/// whose rig binds no mark table or bitmap (`marks_tests` asks for them).
 pub fn view_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v == "1"))
+    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"))
 }
 
 /// Whether `shader` marks the pages it writes through views: the host
