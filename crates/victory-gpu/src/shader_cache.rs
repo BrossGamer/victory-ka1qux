@@ -87,6 +87,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_STRICT_JOINS",
+            "VICTORY_HALF_SUM_NEAR",
         ] {
             match std::env::var_os(name) {
                 None => key.update(&[0]),

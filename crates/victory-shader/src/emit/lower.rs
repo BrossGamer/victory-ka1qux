@@ -1020,6 +1020,14 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a wave sum of 16-bit floats where not every lane runs, in one host wave of 64
+/// lanes, is taken near the console's ([`Lower::half_sum_near`]) instead of refused.
+/// On by default; `VICTORY_HALF_SUM_NEAR=0` refuses it as before.
+fn half_sum_near() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_SUM_NEAR").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -2100,6 +2108,8 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+            } else if half_sum_near() {
+                return Ok(self.half_sum_near(x));
             }
             return Err(WHERE);
         }
@@ -2127,6 +2137,31 @@ impl<'a> Lower<'a> {
         let total = self.s.m.bin(c, Bin::And, total, low);
         let first = self.s.m.bin(c, Bin::And, lo, high);
         Ok(self.s.m.bin(c, Bin::Or, first, total))
+    }
+
+    /// [`Self::half_sum`] in one host wave of 64 lanes where not every lane
+    /// runs, so that partners cannot be read: the terms are added in f32 by
+    /// the wave's own sum and rounded to 16 bits once. Near the console's
+    /// result, not bit for bit (the console rounds every addition of its
+    /// tree); the high half is the first running lane's. The program that
+    /// asked for it (a small network evaluated in a compute pass) was
+    /// dropped 30 to 56 times a frame.
+    /// (After Belobug/VIctory-Belobug-AMD d3a5f2d, whose 16-bit sums are all
+    /// of this kind.)
+    fn half_sum_near(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let (low, high) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_0000));
+        let h = self.s.m.bin(c, Bin::And, x, low);
+        let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
+        let total = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, sum, signed]);
+        let total = self.f16_nearest(total);
+        let c = self.cur;
+        let total = self.s.m.bin(c, Bin::And, total, low);
+        let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        let first = self.s.m.bin(c, Bin::And, first, high);
+        self.s.m.bin(c, Bin::Or, first, total)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
