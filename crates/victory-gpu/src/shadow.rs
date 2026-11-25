@@ -200,12 +200,16 @@ pub(crate) fn card_hash_bytes(size: u64) -> u64 {
 /// copy, if the copy is to be there: [`cards`] is on, the size is within
 /// [`card_limits`] and below 1 GiB (the compare counts in 32 bits), and the
 /// host has what it takes (`Host::card_ready`).
-fn card_for(size: u64) -> Option<ID3D12Resource> {
+fn card_for(start: u64, size: u64) -> Option<ID3D12Resource> {
     if !cards() {
         return None;
     }
     let (least, most) = card_limits();
-    if size < least || size >= 1 << 30 {
+    if size < least {
+        return None;
+    }
+    if size >= 1 << 30 {
+        card_refused(CardRefusal::Size, start, size);
         return None;
     }
     let host = host()?;
@@ -221,17 +225,53 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
+        card_refused(CardRefusal::Room, start, size);
         return None;
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        card_refused(CardRefusal::Limit, start, size);
         return None;
     }
     let buffer = host.uav_buffer(size);
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        card_refused(CardRefusal::Host, start, size);
     }
     buffer
+}
+
+/// Why a title buffer's copy of `card_limits`' size or more stayed in the
+/// PC's memory.
+#[derive(Clone, Copy)]
+enum CardRefusal {
+    /// 1 GiB or more (the compare counts in 32 bits).
+    Size,
+    /// The card had no room for it.
+    Room,
+    /// The copies in the card's memory would pass `VICTORY_CARD_BUFFERS_MB`.
+    Limit,
+    /// The host could not make the buffer.
+    Host,
+}
+
+/// Since the start, per [`CardRefusal`]: copies, then their bytes.
+static CARD_REFUSED: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+fn card_refused(why: CardRefusal, start: u64, size: u64) {
+    let i = why as usize;
+    let n = CARD_REFUSED[i].fetch_add(1, Ordering::Relaxed) + 1;
+    CARD_REFUSED[4 + i].fetch_add(size, Ordering::Relaxed);
+    if size >= 4 << 20 && (n <= 8 || n.is_power_of_two()) {
+        let why = ["1 GiB or more", "no room on the card", "the copies' limit", "the host made no buffer"][i];
+        tracing::info!(start = format_args!("{start:#x}"), size, why, n, "a buffer's host copy stays in the PC's memory: what shaders write to it is looked for on the CPU");
+    }
+}
+
+/// [`CARD_REFUSED`] as it stands: copies refused for their size, for room,
+/// for the limit, by the host, then the same in bytes.
+pub(crate) fn card_refusals() -> [u64; 8] {
+    CARD_REFUSED.each_ref().map(|c| c.load(Ordering::Relaxed))
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -1290,7 +1330,7 @@ pub(crate) fn back_line(frames: f64) {
     tracing::info!(
         "shader writes looked for on the CPU per frame: {:.1} MB compared in {:.0} ranges of windows outside buffers ({:.1} MB \
          snapshotted), {:.1} MB in {:.0} ranges of title buffers' copies ({:.1} MB snapshotted), of them {:.1} MB in copies \
-         of 1 MiB or more (VICTORY_CARD_BUFFERS_MIN_MB=1 would have the card look there)",
+         of 1 MiB or more (copies the card did not take: the card's line says why)",
         mb(c[2]),
         c[5],
         mb(c[0]),
@@ -3081,7 +3121,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match card_for(key.0, size) {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

@@ -246,15 +246,16 @@ pub(crate) fn barrier_test() -> u8 {
     })
 }
 
-/// Per range compared after a submission (start, length): times, and the
-/// bytes of it written back to the title.
-static COMPARED: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
+/// Per range compared after a submission (start, length, whether the card
+/// compared it): times, and the bytes of it written back to the title.
+static COMPARED: Mutex<Option<HashMap<(usize, usize, bool), (u64, u64)>>> = Mutex::new(None);
 
-/// `len` bytes at `src` were compared after a submission and `written` of
-/// them put back into title memory.
-pub(crate) fn compared(src: usize, len: usize, written: usize) {
+/// `len` bytes at `src` were compared after a submission, on the card
+/// (`card`: a copy in the card's memory, hashed there) or on the CPU
+/// (against a snapshot), and `written` of them put back into title memory.
+pub(crate) fn compared(src: usize, len: usize, written: usize, card: bool) {
     let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
+    let e = map.get_or_insert_with(HashMap::new).entry((src, len, card)).or_insert((0, 0));
     e.0 += 1;
     e.1 += written as u64;
 }
@@ -1262,11 +1263,15 @@ pub(crate) fn log(frames: f64) {
     // it shaders had written.
     let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut compared: Vec<_> = compared.into_iter().flatten().collect();
-    compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
+    compared.sort_by_key(|&((_, len, _), (n, _))| std::cmp::Reverse(len as u64 * n));
     tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
-    for ((src, len), (n, written)) in compared.into_iter().take(8) {
+    // Then the largest the CPU compares: what its snapshots and searches go
+    // to (those the card compares cost the CPU only the pieces that differ).
+    let on_cpu: Vec<_> = compared.iter().skip(8).filter(|((_, _, card), _)| !card).take(8).copied().collect();
+    for ((src, len, card), (n, written)) in compared.into_iter().take(8).chain(on_cpu) {
         tracing::info!(
-            "  compared {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
+            "  compared {src:#x}+{len:#x} on the {}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
+            if card { "card" } else { "CPU" },
             n as f64 / frames,
             (len as u64 * n) as f64 / 1e6 / frames,
             written as f64 / 1e6 / frames

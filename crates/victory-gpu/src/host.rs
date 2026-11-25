@@ -2862,7 +2862,7 @@ fn relay_hand_back(back: &[Declared]) {
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
-        crate::copystat::compared(*from, to - from, written);
+        crate::copystat::compared(*from, to - from, written, false);
         let _ = (from, to);
     }
 }
@@ -3140,7 +3140,7 @@ fn hand_back(back: &[Declared]) {
             let written = shadow.copy_back_with(*from, to - from, Some(found));
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(*from, to - from, written);
+            crate::copystat::compared(*from, to - from, written, false);
         }
         for (shadow, declared) in back {
             shadow.copy_back_done(declared);
@@ -3172,7 +3172,7 @@ fn hand_back(back: &[Declared]) {
             let written = shadow.copy_back(from, to - from);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            crate::copystat::compared(from, to - from, written, false);
         }
         shadow.copy_back_done(declared);
     }
@@ -4164,7 +4164,7 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             let (from, to) = r.declared;
             #[cfg(feature = "diagnostics")]
-            crate::copystat::compared(from, to - from, written);
+            crate::copystat::compared(from, to - from, written, true);
             let _ = (from, to);
         }
     }
@@ -6644,10 +6644,13 @@ impl Meter {
             );
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
+                let refused = crate::shadow::card_refusals();
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \
-                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms)",
+                     ({:.1} MB) with {:.1} more waits for the card ({:.1} ms); since the start, copies left in the PC's \
+                     memory: {} for no room ({} MB), {} for the copies' limit ({} MB), {} of 1 GiB or more ({} MB), {} the host \
+                     made no buffer for ({} MB)",
                     card[7],
                     card[8] >> 20,
                     card[9] >> 20,
@@ -6657,7 +6660,15 @@ impl Meter {
                     per_frame(3),
                     per_frame(4) / 1e6,
                     per_frame(5),
-                    per_frame(6) / 1e3
+                    per_frame(6) / 1e3,
+                    refused[1],
+                    refused[5] >> 20,
+                    refused[2],
+                    refused[6] >> 20,
+                    refused[0],
+                    refused[4] >> 20,
+                    refused[3],
+                    refused[7] >> 20
                 );
             }
             tracing::info!(
