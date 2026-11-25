@@ -2171,13 +2171,26 @@ impl State {
         let (early_ms, bake_ms) = early_budgets();
         let is_bake = !compute
             && p.stages.iter().any(|s| BAKE_PIXEL_SHADERS.contains(&s.shader.hash.as_str()));
+        // A bake: before anything of it reads title memory or the heap, the
+        // flights in the air may have to land (`crate::host::bake_recorded`),
+        // and the slots it names are watched for the host's changes.
+        let named = if is_bake {
+            crate::host::bake_recorded();
+            let named = self.bake_source_slots(p);
+            if let Some(host) = self.view_heap().and_then(|heap| heap.host()) {
+                crate::descriptor::host::bake_named(host, &named);
+            }
+            named
+        } else {
+            Vec::new()
+        };
         if !compute && (early_ms > 0 || bake_ms > 0) {
             let bake = bake_ms > 0 && is_bake;
             static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
             // The milliseconds this frame's bake draws have taken so far: a
             // frame has several, and together they get `bake_ms`.
             static BAKED_MS: AtomicU64 = AtomicU64::new(0);
-            let sources = if bake && bake_sources_first() { self.bake_source_slots(p) } else { Vec::new() };
+            let sources = if bake && bake_sources_first() { named } else { Vec::new() };
             BAKE_SOURCES.set(sources);
             let _ = self.early_textures_with(
                 list,
@@ -2558,6 +2571,9 @@ impl State {
         };
         add(split::WITH_ROOM, u64::from(room));
         let mut refused = 0;
+        // Stale slots left showing their view while submissions were in the
+        // air (`VICTORY_STALE_AFTER_FLIGHTS`) whose submissions are done.
+        host.stale_later();
         let part = std::time::Instant::now();
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).

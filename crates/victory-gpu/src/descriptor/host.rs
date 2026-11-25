@@ -682,6 +682,141 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// The slots of view heaps that bakes named lately (`crate::draw`'s bake
+/// draws, the texture views their data picks by index), by heap and slot,
+/// with the moment they were named ([`crate::host::now_ms`]).
+static BAKE_NAMED: Mutex<Option<std::collections::HashMap<(usize, u32), u64>>> = Mutex::new(None);
+
+/// Until when [`BAKE_NAMED`] is looked at by slot writes
+/// ([`crate::host::now_ms`] + 1; 0: never named).
+static BAKE_NAMED_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a slot a bake named is watched.
+const BAKE_NAMED_MS: u64 = 10_000;
+
+/// Since the last frame-rate line (`crate::host`'s bake line): slots a bake
+/// named whose host descriptor the host changed (another resource, or
+/// none) while a submission was in the air, and of them those made null;
+/// then, with [`stale_after_flights`], slots a newer view made stale while
+/// submissions were in the air, left as they were, and of those the ones
+/// made null since, once those submissions had finished.
+static BAKE_SLOTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`BAKE_SLOTS`], taken for the line.
+pub(crate) fn bake_slot_changes() -> [u64; 4] {
+    BAKE_SLOTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// A bake draw names `slots` of `heap` (texture views its data picks by
+/// index): watched for a while ([`BAKE_NAMED_MS`]).
+pub(crate) fn bake_named(heap: &HostHeap, slots: &[u32]) {
+    if slots.is_empty() {
+        return;
+    }
+    let now = crate::host::now_ms();
+    let key = std::ptr::from_ref(heap) as usize;
+    let mut named = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    let named = named.get_or_insert_with(Default::default);
+    named.retain(|_, at| *at + BAKE_NAMED_MS > now);
+    for &slot in slots {
+        named.insert((key, slot), now);
+    }
+    BAKE_NAMED_UNTIL.store(now + BAKE_NAMED_MS + 1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether slot writes look at [`BAKE_NAMED`] now.
+fn bake_watch_on() -> bool {
+    let until = BAKE_NAMED_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    until != 0 && crate::host::now_ms() < until
+}
+
+/// The host changed what slot `index` of `heap` shows ([`HostHeap::keep`]):
+/// counted if a bake named it lately and a submission is in the air, which
+/// may be that bake, not yet run by the card. A descriptor in a
+/// shader-visible heap is read by the card when it runs the draw, not when
+/// the draw is recorded: such a bake reads what the slot shows now.
+fn bake_slot_changed(heap: &HostHeap, index: u32, nulled: bool) {
+    if !crate::host::in_air() {
+        return;
+    }
+    let key = (std::ptr::from_ref(heap) as usize, index);
+    let named = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner());
+    if named.as_ref().is_some_and(|named| named.contains_key(&key)) {
+        BAKE_SLOTS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if nulled {
+            BAKE_SLOTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Slots a newer view of other memory makes stale ([`HostHeap::note_buffer`])
+/// are made null only once the submissions in the air when that was found
+/// have finished (`VICTORY_STALE_AFTER_FLIGHTS=1`; off by default: at once,
+/// as before).
+///
+/// Why: on the console a view the title writes changes its own slot and
+/// no other; the host makes the other slots that describe the same memory
+/// null at once, and a slot of a shader-visible heap is read by the card
+/// when it runs a draw. A draw recorded and sent before the newer view was
+/// written, and not yet run, then reads nothing where its texture was: a
+/// texture streaming in gets a newer view (more mips at the same address)
+/// while frames that sampled the older one are still on the card. Without
+/// flights sent ahead that is at most the one submission the card runs;
+/// with the relay it is every submission in the air, hundreds of lists. A
+/// frame drawn so is drawn again; a bake, which runs once, keeps what it
+/// read.
+fn stale_after_flights() -> bool {
+    #[cfg(test)]
+    if STALE_TEST.get().is_some() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_AFTER_FLIGHTS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`stale_after_flights`] on for the test's own thread, with
+    /// the submissions started and finished given here in place of the
+    /// host's.
+    static STALE_TEST: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// The submissions started and finished (`crate::host::started`,
+/// `crate::host::finished`), for [`stale_after_flights`].
+fn stale_clock() -> (u64, u64) {
+    #[cfg(test)]
+    if let Some(clock) = STALE_TEST.get() {
+        return clock;
+    }
+    (crate::host::started(), crate::host::finished())
+}
+
+/// Stale slots left showing their view until submissions finish
+/// ([`stale_after_flights`]): heap, slot, the key the slot was made from
+/// (made null later only if it still holds it), and the submissions
+/// started when it was found stale.
+static STALE_LATER: Mutex<Vec<(usize, u32, u64, u64)>> = Mutex::new(Vec::new());
+
+/// Whether [`STALE_LATER`] holds anything (looked at without its lock).
+static STALE_LATER_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Of `later` (heap, slot, key, started), the entries of heap `heap` whose
+/// submissions have finished by `finished`: taken out and returned as
+/// (slot, key); the rest stay.
+fn stale_due(later: &mut Vec<(usize, u32, u64, u64)>, heap: usize, finished: u64) -> Vec<(u32, u64)> {
+    let mut due = Vec::new();
+    later.retain(|&(h, slot, key, started)| {
+        if h == heap && started <= finished {
+            due.push((slot, key));
+            false
+        } else {
+            true
+        }
+    });
+    due
+}
+
 /// Since the start: slots a pass found unmapped whose host slot it left as
 /// it was, because another write had replaced the view it looked at
 /// ([`HostHeap::texture_slot_gone`]): each was a good view that would have
@@ -1359,6 +1494,20 @@ pub(crate) fn probe_view_limit() {
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
+
+impl Drop for HostHeap {
+    /// What [`stale_after_flights`] and the bake watch keep of this heap
+    /// goes with it: another heap made at the same place is not this one.
+    fn drop(&mut self) {
+        let key = std::ptr::from_ref(self) as usize;
+        if STALE_LATER_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            STALE_LATER.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 != key);
+        }
+        if let Some(named) = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            named.retain(|&(heap, _), _| heap != key);
+        }
+    }
+}
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -2460,6 +2609,37 @@ impl HostHeap {
         true
     }
 
+    /// The stale slots of this heap left showing their view
+    /// ([`stale_after_flights`]) whose submissions have finished: made null
+    /// now, if they still hold the view they held. `made` is this heap's,
+    /// locked by the caller.
+    fn stale_later_due(&self, made: &mut [u64]) {
+        let due = {
+            let mut later = STALE_LATER.lock().unwrap_or_else(|e| e.into_inner());
+            let due = stale_due(&mut later, std::ptr::from_ref(self) as usize, stale_clock().1);
+            if later.is_empty() {
+                STALE_LATER_ANY.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            due
+        };
+        for (slot, key) in due {
+            if made.get(slot as usize) == Some(&key) {
+                self.unmake(made, slot);
+                BAKE_SLOTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// [`HostHeap::stale_later_due`] from outside a mirror (the texture
+    /// pass): nothing if nothing waits.
+    pub(crate) fn stale_later(&self) {
+        if !STALE_LATER_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.stale_later_due(&mut made);
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
@@ -2707,10 +2887,23 @@ impl HostHeap {
         }
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
+            // A bake named it lately: counted if what it shows changes
+            // ([`bake_slot_changed`]).
+            let changed = bake_watch_on()
+                && slot.as_ref().is_some_and(|old| {
+                    resource.as_ref().is_none_or(|new| {
+                        windows::core::Interface::as_raw(new) != windows::core::Interface::as_raw(old)
+                    })
+                });
+            let nulled = resource.is_none();
             // A running submission may still read the old resource through
             // this slot.
             if let Some(old) = std::mem::replace(slot, resource) {
                 crate::host::retire(old);
+            }
+            drop(kept);
+            if changed {
+                bake_slot_changed(self, index, nulled);
             }
         }
     }
@@ -2996,6 +3189,22 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let heap_key = std::ptr::from_ref(self) as usize;
+        if STALE_LATER_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            // The slot written now is the title's again: whatever stale
+            // view it was left showing is made anew from its record, as
+            // if it had been made null when found stale.
+            let mut later = STALE_LATER.lock().unwrap_or_else(|e| e.into_inner());
+            let before = later.len();
+            later.retain(|e| !(e.0 == heap_key && e.1 == index));
+            if later.len() != before
+                && let Some(shown) = made.get_mut(index as usize)
+            {
+                *shown = 0;
+            }
+            drop(later);
+            self.stale_later_due(&mut made);
+        }
         // A write of the title's (`crate::material_demand`): numbered, while
         // material records are read.
         if !for_draw && let Some(epochs) = self.material_epochs.get() {
@@ -3060,9 +3269,23 @@ impl HostHeap {
                     }
                 }
             }
+            // With submissions in the air, left showing their view until
+            // those have finished ([`stale_after_flights`]).
+            let (started, finished) = stale_clock();
+            let defer = stale_after_flights() && started > finished;
             for stale in stale_slots {
-                if stale != index {
-                    self.unmake(&mut made, stale);
+                if stale == index {
+                    continue;
+                }
+                match made.get(stale as usize) {
+                    Some(&key) if defer && key != 0 => {
+                        let mut later = STALE_LATER.lock().unwrap_or_else(|e| e.into_inner());
+                        later.retain(|e| !(e.0 == heap_key && e.1 == stale));
+                        later.push((heap_key, stale, key, started));
+                        STALE_LATER_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+                        BAKE_SLOTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => self.unmake(&mut made, stale),
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -6288,6 +6511,71 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(heap.placed.lock().unwrap().displaced.is_empty());
         assert!(heap.kept.lock().unwrap()[1..=2].iter().all(Option::is_some));
         assert!(device_removed().is_none());
+    }
+
+    /// With [`stale_after_flights`]: slots a newer view makes stale while
+    /// submissions are in the air go on showing their view until those
+    /// have finished, and are made null then; one the title writes again
+    /// meanwhile is its own again and stays.
+    #[test]
+    fn a_stale_slot_waits_for_the_submissions_in_the_air() {
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        static PIXELS: [u8; 1 << 20] = [0; 1 << 20];
+        let address = PIXELS.as_ptr() as u64;
+        let resource = [3, 0, 0, 0, 256, 0, 256, 0x9_0001, 28, 1, 0, 0x105, 0, 0];
+        let record = |address: u64, width: u32, first: u32| {
+            let mut shape = resource;
+            shape[4] = width;
+            let mut view = [0; 16];
+            view[..6].copy_from_slice(&[28, 4, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, first, 1]);
+            (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+            let [i, generation] = super::super::words_for(View::Placed(false, shape, view));
+            [VIEW_TAG, i, generation]
+        };
+        let words = [const { std::cell::Cell::new([0u32; 3]) }; 8];
+        let handle = |i: u32| words[i as usize].as_ptr() as u64;
+        let kept = |i: usize| heap.kept.lock().unwrap()[i].is_some();
+        // Submissions 9 and 10 are in the air.
+        STALE_TEST.set(Some((10, 8)));
+        let old = record(address, 256, 2);
+        for i in 1..=2 {
+            words[i].set(old);
+            heap.mirror(i as u32, handle(i as u32), true).unwrap();
+        }
+        assert!(kept(1) && kept(2));
+        // A newer view of other memory there: 1 and 2 are stale, and stay.
+        words[4].set(record(address, 512, 0));
+        heap.mirror(4, handle(4), false).unwrap();
+        assert!(kept(1) && kept(2));
+        // Submission 9 has finished, 10 not yet.
+        STALE_TEST.set(Some((11, 9)));
+        heap.stale_later();
+        assert!(kept(1) && kept(2));
+        // The title writes slot 2 again (a draw reads it): its own.
+        heap.mirror(2, handle(2), true).unwrap();
+        STALE_TEST.set(Some((11, 10)));
+        heap.stale_later();
+        assert!(!kept(1));
+        assert!(kept(2));
+        // Nothing in the air: made null at once, as without the switch.
+        words[5].set(record(address, 1024, 0));
+        STALE_TEST.set(Some((11, 11)));
+        heap.mirror(5, handle(5), false).unwrap();
+        STALE_TEST.set(None);
+        assert!(!kept(4));
+        assert!(!STALE_LATER.lock().unwrap().iter().any(|e| e.0 == std::ptr::from_ref(&heap) as usize));
+    }
+
+    /// The deferred stale slots of a heap whose submissions are done, and
+    /// no other heap's.
+    #[test]
+    fn stale_slots_fall_due_by_heap_and_submission() {
+        let mut later = vec![(1, 3, 30, 5), (1, 4, 40, 7), (2, 3, 31, 5)];
+        assert_eq!(stale_due(&mut later, 1, 6), [(3, 30)]);
+        assert_eq!(later, [(1, 4, 40, 7), (2, 3, 31, 5)]);
+        assert!(stale_due(&mut later, 1, 6).is_empty());
+        assert_eq!(stale_due(&mut later, 1, 7), [(4, 40)]);
+        assert_eq!(later, [(2, 3, 31, 5)]);
     }
 
     #[test]

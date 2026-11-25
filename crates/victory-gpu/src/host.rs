@@ -2466,6 +2466,197 @@ static ONE_FLIGHT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomi
 /// [`now_us`] + 1; 0: not since the last send).
 static CARD_IDLE_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Whether a submission is in the air: prepared and not yet finished (with
+/// [`late`]: not yet landed). Lock-free, for callers that may hold locks
+/// the line's users take.
+pub(crate) fn in_air() -> bool {
+    STARTED.load(Ordering::Acquire) > FINISHED.load(Ordering::Acquire)
+}
+
+/// The submissions prepared so far, and the last one finished: a decision
+/// taken now may be undone safely once [`finished`] reaches what
+/// [`started`] says now.
+pub(crate) fn started() -> u64 {
+    STARTED.load(Ordering::Acquire)
+}
+
+/// See [`started`].
+pub(crate) fn finished() -> u64 {
+    FINISHED.load(Ordering::Acquire)
+}
+
+/// Bakes of the title's (a pixel program that draws a character's look
+/// into textures once, `crate::draw`'s bake programs, and the passes that
+/// follow it) run as with every submission waited for, while flights are
+/// sent ahead otherwise (`VICTORY_BAKE_SETTLE`; off by default; `1`: a
+/// window of 2000 ms after each bake draw recorded, a larger number: that
+/// many milliseconds).
+///
+/// Why: with [`late`] and the [`relay`] a submission is prepared while
+/// flights run, and only what they declared is waited for. A bake reads
+/// title memory (its constants, its source textures, the views of the heap
+/// that name them) that a flight's shaders, its copy-back or the host's own
+/// slot changes may still be about to change, and it runs once: what it
+/// read wrong stays in the character's textures for the run (skin and hair
+/// too light, or black, with the relay; right without it). In the window:
+///
+/// - a bake draw recorded while flights are in the air waits on its
+///   recording thread until they have landed (with the relay, at most
+///   [`BAKE_RECORD_WAIT_MS`]), so that what the texture pass and the
+///   recording read of title memory and of the heap is what every flight
+///   before it left;
+/// - every submission settles the flights before it is prepared, as one
+///   waited for does ([`Host::submit`]);
+/// - every submission sent ahead is waited for right after it is sent
+///   ([`Host::execute_late`]): nothing the host or the title changes after
+///   it returns (slots of the heap, title memory) reaches a bake still to
+///   run on the card.
+///
+/// Frames outside the windows keep the speed of the relay: the title bakes
+/// while a scene loads and when characters stream in.
+pub(crate) fn bake_settle_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        let ms = bake_window_ms(std::env::var("VICTORY_BAKE_SETTLE").ok().as_deref());
+        if ms > 0 {
+            tracing::info!(
+                window_ms = ms,
+                late = late(),
+                relay = relay(),
+                "bakes run as with every submission waited for: flights are settled around them (VICTORY_BAKE_SETTLE)"
+            );
+        }
+        ms
+    })
+}
+
+/// [`bake_settle_ms`] of the switch's value: unset, `0` or not a number:
+/// off; `1`: 2000 ms; another number: that many milliseconds.
+fn bake_window_ms(value: Option<&str>) -> u64 {
+    match value.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(1) => 2000,
+        Some(ms) => ms,
+        None => 0,
+    }
+}
+
+/// How long a bake draw's recording thread waits at most for the flights
+/// in the air to land ([`bake_settle_ms`]): a bound, in case landing ever
+/// needs something that thread holds.
+const BAKE_RECORD_WAIT_MS: u64 = 5000;
+
+/// The window of [`bake_settle_ms`] (or, with it off, the window the bake
+/// counters use, [`BAKE_WATCH_MS`]): until when it lasts ([`now_ms`] + 1;
+/// 0: none yet).
+static BAKE_UNTIL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// With [`bake_settle_ms`] off: how long after a bake draw the counters
+/// count submissions as a bake's.
+const BAKE_WATCH_MS: u64 = 2000;
+
+/// Since the last frame-rate line, for bakes ([`bake_line`]):
+/// 0 bake draws recorded; 1 of them with a submission in the air;
+/// 2 recording waits for flights ([`bake_settle_ms`]); 3 their
+/// microseconds; 4 of them that gave up at [`BAKE_RECORD_WAIT_MS`];
+/// 5 submissions in a bake window prepared with flights in the air;
+/// 6 of those whose preparing reads title memory the flights may write
+/// (strictly: fills and copies that read ahead count too); 7 submissions
+/// settled before preparing for a bake window; 8 submissions sent ahead
+/// and waited for at once for one; 9 the microseconds of 7 and 8.
+pub(crate) static BAKE_STATS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+
+/// Whether a bake window is open now.
+fn bake_window() -> bool {
+    let until = BAKE_UNTIL.load(Ordering::Relaxed);
+    until != 0 && now_ms() < until
+}
+
+/// Whether bakes are settled now ([`bake_settle_ms`] and a window open).
+fn bake_settling() -> bool {
+    late() && bake_settle_ms() > 0 && bake_window()
+}
+
+/// A draw of the title's bake programs is being recorded (`crate::draw`,
+/// before its texture pass): opens the window and, with
+/// [`bake_settle_ms`] and the relay, waits for the flights in the air.
+pub(crate) fn bake_recorded() {
+    BAKE_STATS[0].fetch_add(1, Ordering::Relaxed);
+    let window = match bake_settle_ms() {
+        0 => BAKE_WATCH_MS,
+        ms => ms,
+    };
+    BAKE_UNTIL.fetch_max(now_ms() + window + 1, Ordering::Relaxed);
+    if !in_air() {
+        return;
+    }
+    BAKE_STATS[1].fetch_add(1, Ordering::Relaxed);
+    // Without the relay the flights are landed by the thread that holds
+    // the submission lock, at the bake's own submission at the latest.
+    if !late() || !relay() || bake_settle_ms() == 0 {
+        return;
+    }
+    let waiting = std::time::Instant::now();
+    let until = waiting + std::time::Duration::from_millis(BAKE_RECORD_WAIT_MS);
+    let mut line = line();
+    let mut gave_up = false;
+    while !(line.line.is_empty() && !line.settling) {
+        let now = std::time::Instant::now();
+        if now >= until {
+            gave_up = true;
+            break;
+        }
+        line = LINE_LANDED.wait_timeout(line, until - now).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    drop(line);
+    BAKE_STATS[2].fetch_add(1, Ordering::Relaxed);
+    BAKE_STATS[3].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if gave_up {
+        BAKE_STATS[4].fetch_add(1, Ordering::Relaxed);
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                ms = BAKE_RECORD_WAIT_MS,
+                "a bake draw's recording waited for the flights in the air and gave up (VICTORY_BAKE_SETTLE); its \
+                 submission still settles them"
+            )
+        });
+    }
+}
+
+/// With the frame-rate line: what bakes met ([`BAKE_STATS`]), and the
+/// host's slot changes of slots bakes named (`crate::descriptor::host`).
+fn bake_line(frames: f64) {
+    let b: Vec<u64> = BAKE_STATS.iter().map(|b| b.swap(0, Ordering::Relaxed)).collect();
+    let slots = crate::descriptor::host::bake_slot_changes();
+    if b.iter().all(|&n| n == 0) && slots.iter().all(|&n| n == 0) {
+        return;
+    }
+    tracing::info!(
+        "bakes since the last line: {} bake draws recorded, {} of them with a submission in the air; {} recordings waited for \
+         flights ({:.1} ms in all, {} gave up); in bake windows: {} submissions prepared with flights in the air, {} of them \
+         reading title memory those flights may write; {} settled before preparing and {} waited for right after sending \
+         (VICTORY_BAKE_SETTLE={}), {:.1} ms; slots a bake named that the host changed while a submission was in the air: {} \
+         (made null {}), stale slots left as they were until the submissions in the air had finished: {} deferred, {} made \
+         null since ({:.1} frames)",
+        b[0],
+        b[1],
+        b[2],
+        b[3] as f64 / 1000.0,
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        bake_settle_ms(),
+        b[9] as f64 / 1000.0,
+        slots[0],
+        slots[1],
+        slots[2],
+        slots[3],
+        frames,
+    );
+}
+
 /// Stage 2 of [`late`] (`VICTORY_LATE_WAIT=2`): point 3 of its list is no
 /// longer a point. Where the title wrote a page that lies in a range a
 /// flight's shaders may write, the bytes the title changed are found (the
@@ -2749,6 +2940,28 @@ fn note_beside(noted: &mut std::collections::HashMap<(usize, u32), u64>, fetched
 #[cfg(test)]
 mod relay_tests {
     use super::{fetched_beside, flagged_pieces, join_copy_ranges, join_ranges, landable, note_beside, touches_other};
+
+    /// `VICTORY_BAKE_SETTLE`: off unless a number of milliseconds is given,
+    /// `1` the default window.
+    #[test]
+    fn the_bake_window_is_read_from_the_switch() {
+        use super::bake_window_ms;
+        assert_eq!(bake_window_ms(None), 0);
+        assert_eq!(bake_window_ms(Some("0")), 0);
+        assert_eq!(bake_window_ms(Some("yes")), 0);
+        assert_eq!(bake_window_ms(Some("1")), 2000);
+        assert_eq!(bake_window_ms(Some(" 5000 ")), 5000);
+    }
+
+    /// A bake draw recorded opens the window the counters (and with the
+    /// switch, the settles) go by; without flights sent ahead nothing
+    /// waits.
+    #[test]
+    fn a_bake_draw_opens_its_window() {
+        super::bake_recorded();
+        assert!(super::bake_window());
+        assert!(!super::bake_settling() || super::late());
+    }
 
     /// A piece fetched on the copy queue while a later flight was in the
     /// air is fetched again by that flight, and by no flight sent after
@@ -3050,6 +3263,8 @@ const WHY_WRITES: usize = 9;
 const WHY_FENCE: usize = 10;
 /// [`one_flight`]: the next submission of the title's.
 const WHY_NEXT: usize = 19;
+/// [`bake_settle_ms`]: a bake window.
+const WHY_BAKE: usize = 20;
 
 /// Since the last frame-rate line: submissions sent without a wait;
 /// settles; settles by reason ([`WHY_SYNC`]..); flights settled;
@@ -3057,11 +3272,11 @@ const WHY_NEXT: usize = 19;
 /// bottom-of-pipe write; fence signals set behind flights.
 /// Then: the settles for title memory read, by what read it (a buffer
 /// copy, a fill of upload memory, a texture, another host copy).
-static LATE_STATS: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static LATE_STATS: [std::sync::atomic::AtomicU64; 21] = [const { std::sync::atomic::AtomicU64::new(0) }; 21];
 
 /// Since the last frame-rate line: the microseconds settles waited for the
 /// card, by why they settled (the `WHY_` places).
-static LATE_WAITED: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+static LATE_WAITED: [std::sync::atomic::AtomicU64; 21] = [const { std::sync::atomic::AtomicU64::new(0) }; 21];
 
 /// Whether `[from, to)` touches one of `ranges` (in order, joined).
 fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
@@ -3984,7 +4199,7 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
-    LATE_WAITED[why.min(19)].fetch_add(us, Ordering::Relaxed);
+    LATE_WAITED[why.min(WHY_BAKE)].fetch_add(us, Ordering::Relaxed);
     submission_us(1, us);
 }
 
@@ -6045,7 +6260,15 @@ impl Host {
         };
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
         RELAY_MOVED.notify_one();
-        if told && !late_writes() {
+        if bake_settling() {
+            // Waited for at once, as every submission is without flights
+            // ([`bake_settle_ms`]): nothing changed after the title's call
+            // returns reaches a bake still on the card.
+            BAKE_STATS[8].fetch_add(1, Ordering::Relaxed);
+            let settling = std::time::Instant::now();
+            self.settle(&mut submitted, WHY_BAKE);
+            BAKE_STATS[9].fetch_add(settling.elapsed().as_micros() as u64, Ordering::Relaxed);
+        } else if told && !late_writes() {
             self.settle(&mut submitted, WHY_WRITES);
         } else if most && relay_exact() {
             // Until there are fewer, not until there are none.
@@ -6177,7 +6400,7 @@ impl Host {
                 }
                 let gpu = waiting.elapsed();
                 LATE_STATS[12].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
-                LATE_WAITED[why.min(19)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+                LATE_WAITED[why.min(WHY_BAKE)].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
                 submission_us(1, gpu.as_micros() as u64);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::card_waited(gpu.as_micros() as u64, || {
@@ -6291,8 +6514,28 @@ impl Host {
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
+        // A bake's (`bake_settle_ms`): what flights in the air it might read
+        // stale is looked at, whether the window settles them or not.
+        let bake_window = late && bake_window() && flying();
+        if bake_window {
+            BAKE_STATS[5].fetch_add(1, Ordering::Relaxed);
+            let (written, by_copy, immed) = {
+                let line = line();
+                (line.written.clone(), line.by_copy.clone(), line.immed_writes())
+            };
+            if blocked_by(&written, &by_copy, &immed, runs, false, true).is_some() {
+                BAKE_STATS[6].fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if !late {
             self.settle(&mut submitted, WHY_SYNC);
+        } else if bake_window && bake_settling() {
+            // Prepared as a submission waited for is: after everything in
+            // the air has landed ([`bake_settle_ms`]).
+            BAKE_STATS[7].fetch_add(1, Ordering::Relaxed);
+            let settling = std::time::Instant::now();
+            self.settle(&mut submitted, WHY_BAKE);
+            BAKE_STATS[9].fetch_add(settling.elapsed().as_micros() as u64, Ordering::Relaxed);
         } else if one_flight()
             && flying()
             && two_flights()
@@ -9136,6 +9379,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        bake_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
