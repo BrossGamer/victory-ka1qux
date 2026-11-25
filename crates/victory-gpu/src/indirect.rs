@@ -364,29 +364,67 @@ fn min_stride(kind: u32) -> Option<u32> {
     }
 }
 
-/// Parses `VICTORY_INDIRECT_CLAMP`: enabled by default; explicit `"0"`,
-/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) bypasses the
-/// argument-clamp compute pass so `ExecuteIndirect` reads the title's
-/// argument buffer directly.
-pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
-    let Some(value) = value else {
-        return true;
-    };
-    let Some(text) = value.to_str() else {
-        return true;
-    };
-    let trimmed = text.trim();
-    !(trimmed == "0"
-        || trimmed.eq_ignore_ascii_case("false")
-        || trimmed.eq_ignore_ascii_case("no")
-        || trimmed.eq_ignore_ascii_case("off"))
+/// Indirect argument clamp policy (`VICTORY_INDIRECT_CLAMP`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClampMode {
+    /// Clamp both draws/mesh dispatches and compute dispatches (default).
+    All,
+    /// Clamp only compute `DispatchIndirect` records (`"compute"` / `"dispatch"`):
+    /// guards against garbage threadgroup counts (`GEN12_DX12COMPUTE_BBHANG` /
+    /// `PAGEFAULT` when Wave64 compute passes are dropped on Wave32 hosts)
+    /// without charging or clamping mesh/vertex draw records.
+    ComputeOnly,
+    /// Pass all indirect arguments directly without clamping (`"0"` / `"off"`).
+    Off,
 }
 
-/// Whether indirect arguments are copied and clamped by our compute shader
-/// before `ExecuteIndirect` (`VICTORY_INDIRECT_CLAMP=0` disables it).
-pub(crate) fn clamp_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| parse_clamp_enabled(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+/// Parses `VICTORY_INDIRECT_CLAMP`: [`ClampMode::All`] by default; `"compute"`
+/// or `"dispatch"` selects [`ClampMode::ComputeOnly`]; explicit `"0"`,
+/// `"false"`, `"no"`, or `"off"` (ASCII case-insensitive) selects
+/// [`ClampMode::Off`].
+pub(crate) fn parse_clamp_mode(value: Option<&std::ffi::OsStr>) -> ClampMode {
+    let Some(value) = value else {
+        return ClampMode::All;
+    };
+    let Some(text) = value.to_str() else {
+        return ClampMode::All;
+    };
+    let trimmed = text.trim();
+    if trimmed == "0"
+        || trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+    {
+        ClampMode::Off
+    } else if trimmed.eq_ignore_ascii_case("compute")
+        || trimmed.eq_ignore_ascii_case("dispatch")
+    {
+        ClampMode::ComputeOnly
+    } else {
+        ClampMode::All
+    }
+}
+
+/// Backwards-compatible boolean check (`true` only when [`ClampMode::All`]).
+#[cfg(test)]
+pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    parse_clamp_mode(value) == ClampMode::All
+}
+
+/// Configured [`ClampMode`] from `VICTORY_INDIRECT_CLAMP`.
+pub(crate) fn clamp_mode() -> ClampMode {
+    static MODE: std::sync::OnceLock<ClampMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| parse_clamp_mode(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+}
+
+/// Whether indirect arguments of this kind (`is_compute` = `DISPATCH`) are
+/// copied and clamped by our compute shader before `ExecuteIndirect`.
+pub(crate) fn clamp_for(is_compute: bool) -> bool {
+    match clamp_mode() {
+        ClampMode::All => true,
+        ClampMode::ComputeOnly => is_compute,
+        ClampMode::Off => false,
+    }
 }
 
 /// Validates record alignment and returns the scratch byte size `stride * records`.
@@ -2418,6 +2456,14 @@ void main(uint3 group : SV_GroupID) {
             assert!(
                 !parse_clamp_enabled(Some(OsStr::new(off))),
                 "{off:?} must disable indirect clamp"
+            );
+            assert_eq!(parse_clamp_mode(Some(OsStr::new(off))), ClampMode::Off);
+        }
+        for comp in ["compute", " COMPUTE ", "dispatch", "Dispatch"] {
+            assert_eq!(
+                parse_clamp_mode(Some(OsStr::new(comp))),
+                ClampMode::ComputeOnly,
+                "{comp:?} must select compute-only clamp"
             );
         }
     }

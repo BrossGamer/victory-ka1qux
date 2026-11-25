@@ -76,7 +76,7 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
    # Para Intel Arc B580 12 GB:
    . .\scripts\arc-b580.ps1
    ```
-   *(Por padrão os scripts usam o modo assíncrono `VICTORY_RELAY=2` / `VICTORY_WIDE_BACK=1` e `VICTORY_RAYS=0`, validado na A770 sem TDR de 2s do Windows. Use `-Rays` após pré-aquecer `XboxBvhBuilder.dll` para testar o Ray Tracing, ou `-Conservative` para o modo síncrono `RELAY=0`.)*
+   *(Por padrão os scripts ativam `VICTORY_INDIRECT_CLAMP=compute`, `VICTORY_RELAY=0`, `VICTORY_LATE_WAIT_LISTS=128` e `VICTORY_RAYS=0` — combinação validada na A770 sem `GEN12_DX12COMPUTE_BBHANG`/`PAGEFAULT`, sem corrupção de páginas por *write marks* e com tons corretos nos *bakes* de pele e cabelo. Use `-Rays` após pré-aquecer `XboxBvhBuilder.dll` para testar o Ray Tracing, ou `-Fast` para testar o modo experimental `VICTORY_RELAY=2`.)*
 3. Pré-aqueça o cache de shaders e de pipelines **na mesma sessão** (para usar exatamente as mesmas capacidades `wave_min`, `wave_max`, `doubles` e `view_limit`):
    ```powershell
    $g = "<pasta do seu jogo>"
@@ -95,6 +95,7 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
 | Variável | Quando testar na Arc |
 |---|---|
 | `VICTORY_ADAPTER=A770` (ou `B580`, `0`, `1`) | Escolhe explicitamente o adaptador DXGI |
+| `VICTORY_INDIRECT_CLAMP=compute` (`1` / `0`) | Clampa todos os `DispatchIndirect` de compute (evita `GEN12_DX12COMPUTE_BBHANG` / `PAGEFAULT` por passes Wave64 dropados) sem limitar draws de geometria |
 | `VICTORY_SOFT_F64=1` | Força a soma `f64` em inteiros mesmo em GPUs que declaram `doubles = true` |
 | `VICTORY_SOFT_TYPED_ATOMIC64=1` (`=0` desliga) | Controla o fallback de atomics 64-bit em texturas tipadas (`RWTexture*<uint2>`) |
 | `VICTORY_WAVE_WIDE=1` | Reduz recusas de compute shaders `wave64` com branches por lane |

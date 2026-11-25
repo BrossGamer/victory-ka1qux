@@ -4108,7 +4108,7 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let clamped = crate::indirect::clamp_enabled();
+        let clamped = crate::indirect::clamp_for(kind == DISPATCH);
         // A dispatch by a program that takes the number of its first group
         // may ask for more groups in x than the host runs in one dimension.
         // Its records are made into parts by the clamp's pass (with the

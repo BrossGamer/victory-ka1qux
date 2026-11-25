@@ -75,7 +75,7 @@ pub(crate) fn start() {
         // "display driver stopped responding" source.
         let query = wide(
             "*[System[Provider[@Name='nvlddmkm' or @Name='amdkmdag' or @Name='amdwddmg' or @Name='igfx' or @Name='igfxn' \
-             or @Name='Display']]]",
+             or @Name='igfxnd' or @Name='Display']]]",
         );
         // SAFETY: valid strings for the call's length; the callback is a
         // plain function that touches only statics; the subscription is

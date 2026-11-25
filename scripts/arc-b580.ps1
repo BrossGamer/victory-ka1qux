@@ -1,14 +1,13 @@
 # Environment profile for Intel Arc B580 (Battlemage / Xe2-HPG, 12 GB).
 # Dot-source in PowerShell before running `victory`:
 #
-#   . .\scripts\arc-b580.ps1                 # B580 12 GB (async relay, VICTORY_RAYS=0; avoids 2s Windows TDR)
+#   . .\scripts\arc-b580.ps1                 # B580 12 GB, stable defaults (write marks on, compute clamp, RAYS=0)
 #   . .\scripts\arc-b580.ps1 -Rays           # enable title ray tracing (pre-warm XboxBvhBuilder.dll pipelines first)
-#   . .\scripts\arc-b580.ps1 -Conservative   # synchronous relay=0 / late-waits=128 (may need Windows TdrDelay >= 10)
+#   . .\scripts\arc-b580.ps1 -Fast           # experimental async relay=2
 
 param(
     [string]$Adapter = "B580",
     [switch]$Fast,
-    [switch]$Conservative,
     [switch]$Rays
 )
 
@@ -23,20 +22,17 @@ $env:VICTORY_ADAPTER = $Adapter
 # Arc B580 (Xe2-HPG, 12 GB VRAM):
 # - wave lanes 16..32 (compute wave ops pinned to WaveSize(32) automatically)
 # - 64-bit typed + heap atomics natively supported on Xe2
-# - Leave VICTORY_TEXTURE_BUDGET_MB unset so `resource::room()` tracks live DXGI
-#   `QueryVideoMemoryInfo` up to 92% of the card's budget instead of starving
-#   character bakes and bindless world textures under a static byte cap.
+# - VICTORY_INDIRECT_CLAMP=compute bounds DispatchIndirect records without
+#   clamping or charging mesh/vertex draws.
 Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
-$env:VICTORY_INDIRECT_CLAMP       = "0"
+$env:VICTORY_INDIRECT_CLAMP       = "compute"
 $env:VICTORY_SKIP_MOVIES          = "1"
 $env:VICTORY_RAYS                 = if ($Rays) { "1" } else { "0" }
 $env:VICTORY_TEXTURE_ROOM_PERCENT = "92"
+$env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "2" } else { "16" }
+$env:VICTORY_CARD_BUFFERS_MB      = if ($Fast) { "768" } else { "512" }
 
-$useAsync = -not $Conservative
-$env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($useAsync) { "2" } else { "16" }
-$env:VICTORY_CARD_BUFFERS_MB      = if ($useAsync) { "768" } else { "512" }
-
-if ($useAsync) {
+if ($Fast) {
     $env:VICTORY_RELAY     = "2"
     $env:VICTORY_WIDE_BACK = "1"
     Remove-Item Env:VICTORY_LATE_WAIT_LISTS -ErrorAction SilentlyContinue
@@ -46,7 +42,7 @@ if ($useAsync) {
     $env:VICTORY_LATE_WAIT_LISTS = "128"
 }
 
-$mode = if ($useAsync) { "Async" } else { "Conservative" }
+$mode = if ($Fast) { "Fast-Experimental" } else { "Stable" }
 Write-Host "Intel Arc B580 (12 GB) profile active (Mode=$mode, Rays=$($Rays.IsPresent)):"
 Write-Host "  VICTORY_ADAPTER              = $env:VICTORY_ADAPTER"
 Write-Host "  VICTORY_TEXTURE_ROOM_PERCENT = $env:VICTORY_TEXTURE_ROOM_PERCENT% (live DXGI budget)"
