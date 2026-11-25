@@ -30,7 +30,7 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Frame rate | 🟡 | with the switches below, in the open world on a street with about 6,100 draws a frame: a median of 0.42 s a frame (about 2.4 frames a second), 0.33 s at best; the same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main and 0.53 s before the write marks (below). An earlier build, in a lighter view of about 2,000 draws, took 0.32 s. With victory-fork's speed defaults a frame took 144 to 150 ms in steady open-world views on an earlier build, but the picture is not right with them yet (below) |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
-| Tests | ✅ | `cargo test --workspace` runs 739 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| Tests | ✅ | `cargo test --workspace` runs 777 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
@@ -266,7 +266,10 @@ out because its tests fail on this card.
 Venglovsky), #191 (gdawid94), #196 (JaumeMarRib), #237 (fffluffy-dev), #282
 (t4l03), #362 (renzowit35), #438 (sennecools), #452 (MalfoyDraco99), #571
 (arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev),
-#987 (several authors), #1023 and #1031 (Lkxex / NetherySiloX).
+#927 (tippythetaidum), #987 (several authors), #1023 and #1031 (Lkxex /
+NetherySiloX), #1069 (alexis27yt). From upstream VIctory's open pull
+requests: the BCPack fixes #2648 and #2649 (chaseb64) and the mesh dispatch
+of #2624 (andrewpozdnakov7-jpg).
 
 ## Running it
 
@@ -333,7 +336,8 @@ repository.
   a fork of upstream VIctory on another AMD card; the quad reads of pixel
   shaders and the stand-in for indirect light are ported from it.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)** and victory-fork's
-  pull request #994 by PiloteCode: the ray-tracing work ported here.
+  pull request #994 by PiloteCode: the ray-tracing work ported here, and the
+  material-record texture order (off by default).
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.
