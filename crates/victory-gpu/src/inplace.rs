@@ -450,12 +450,13 @@ struct Views {
     /// page is a write of the bytes every other view shows
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
-    /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    /// Sections by handle: bytes, and whether made committed. Thousands
+    /// with the runtime's `VICTORY_SECTION_MB` (sections of a few MiB).
+    sections: BTreeMap<usize, (u64, bool)>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -466,8 +467,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     {
         let mut v = views();
-        v.sections.retain(|s| s.0 != section);
-        v.sections.push((section, bytes, committed));
+        v.sections.insert(section, (bytes, committed));
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -695,7 +695,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
         }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
+        let section_bytes = v.sections.get(&section)?.0;
         (section, offset, shown, section_bytes)
     };
     if offset + bytes.len() as u64 > section_bytes {
@@ -717,11 +717,18 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
                 );
                 return None;
             }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
+            // Sections may be small and many (the runtime's
+            // `VICTORY_SECTION_MB`): the first few are said, then fewer.
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+            if said <= 4 || said.is_power_of_two() {
+                tracing::info!(
+                    section,
+                    mb = section_bytes >> 20,
+                    so_far = said,
+                    "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
+                );
+            }
             Some(Own {
                 base: at.Value as usize,
                 bytes: section_bytes,
@@ -1339,11 +1346,18 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    // Sections of one size and kind on one line: with the runtime's
+    // `VICTORY_SECTION_MB` there are thousands.
+    let mut kinds: BTreeMap<(u64, bool), u64> = BTreeMap::new();
+    for &(bytes, committed) in v.sections.values() {
+        *kinds.entry((bytes, committed)).or_default() += 1;
+    }
+    for (&(bytes, committed), &n) in kinds.iter().rev() {
         lines.push(format!(
-            "census, a section of {} MB, {}",
-            bytes >> 20,
-            if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
+            "census, {n} section{} of {} KB, {}",
+            if n == 1 { "" } else { "s" },
+            bytes >> 10,
+            if committed { "committed: each can be opened as one heap" } else { "reserved: refused as a heap until made with SEC_COMMIT" }
         ));
     }
     lines
@@ -1483,6 +1497,15 @@ mod tests {
         assert_eq!(cover_in(&views, at + 6 * K64, 3 * K64), Cover::Holes);
         assert_eq!(cover_in(&views, at + 7 * K64, K64), Cover::None);
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
+        // The runtime's `VICTORY_SECTION_MB`: pages that follow on in
+        // number but lie in the next section are a view of that section
+        // from its start. Over both views is scattered, so no stretch (one
+        // view of ours on one section) ever spans two sections.
+        let mut views = BTreeMap::new();
+        views.insert(at, (2 * K64, 10, 30 * K64 as u64));
+        views.insert(at + 2 * K64, (2 * K64, 11, 0));
+        assert_eq!(cover_in(&views, at + K64, 2 * K64), Cover::Scattered);
+        assert_eq!(cover_in(&views, at + 2 * K64, 2 * K64), Cover::Run(11, 0));
     }
 
     /// What the runtime forgets when memory is mapped anew.
