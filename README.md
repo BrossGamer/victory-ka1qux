@@ -26,8 +26,8 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Getting into the world | ✅ | about 3 minutes from launch, with the caches warm and the movies skipped |
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
 | Light in shadow | 🟡 | the ray-traced indirect light does not run; a constant stands in for it, so shaded places are lit but flat |
-| Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch |
-| Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3 in the open world (median 0.32 s, best 0.27 s, same switches); about 3.5 with victory-fork's speed defaults (median 0.29 s, one run, on an earlier build) |
+| Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
+| Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3 in the open world (median 0.32 s, best 0.27 s, same switches); with victory-fork's speed defaults, 6.6 to 6.9 in steady open-world views (144 to 150 ms a frame: 63 preparing, 51 on the card, 36 copying back, against 135, 94 and 78 without them), a median of 0.27 s and a best of 0.11 s over the whole 17-minute session, which includes loading and heavy views; the picture is not right with them yet (below) |
 | Stability | ✅ | no crash and no device removal in the last twenty-four runs (4 to 25 minutes each) |
 | Memory | ✅ | about 11 GB of the card's 16 and 6 GB of the PC's memory shared with it (13.7 and 14.9 GB before the texture fix below) |
 | Tests | ✅ | `cargo test --workspace` runs 646 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
@@ -51,6 +51,14 @@ Known problems:
   and its pull requests #606 and #632 went in (below). That is still a small
   count; `VICTORY_BAKE_PROBE=1` reads the bake's result back, and its
   sequence of hashes was the same in the launches it was on.
+- In the open world the card fills up (13.3 to 14.0 GB of a 14.7 GB budget)
+  and textures that have no copy on it yet are not made: thousands wait, and
+  walls, cupboards and some objects show black with light speckles. A change
+  that makes such textures at a lower resolution instead is being tested.
+- With victory-fork's speed defaults the frame rate doubles, but baked hair
+  and skin come out too light (they came out black on an earlier build): the
+  bake reads data the card has not received yet while submissions run ahead.
+  They stay off in the recommended settings.
 - Two of the title's compute programs do not translate, and the programs that
   only shade ray-tracing hits are left out on purpose.
 - About 2 frames a second. Roughly a third of a frame is the card; the rest is
@@ -239,9 +247,10 @@ target\diag\victory.exe run "$g\<the title's exe>" --execute
 The last three lines of switches turn off victory-fork's newer speed defaults
 (sending submissions ahead of the card). Measured on this card with this build,
 they bring a frame from a median of 0.50 s down to 0.29 s (0.17 s at best),
-with no failure in the one run made with them. An earlier version of them cost
-characters their skin here, so they are off in the recommended settings until
-more runs say they are safe.
+and in the open world from 0.33 s to 0.144 to 0.150 s in steady views (about
+7 frames a second), with no failure in a 17-minute session. Baked hair and skin
+still come out wrong with them (too light now, black on an earlier build), so
+they are off in the recommended settings until that is fixed.
 
 Input: XInput pads; with none connected the keyboard is a pad while the
 title's window has focus. Commands, the full list of switches and debugging
