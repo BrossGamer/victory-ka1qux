@@ -63,45 +63,58 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// Identifies the translator independently of the surrounding executable.
-fn build() -> &'static [u8; 32] {
-    static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
-    BUILD.get_or_init(|| {
-        let mut key = blake3::Hasher::new();
-        key.update(victory_shader::SOURCE_HASH.as_bytes());
-        let limit = victory_shader::emit::loop_limit();
-        if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-            tracing::warn!(
-                limit,
-                "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
-            );
+/// Identifies the translator independently of the surrounding executable:
+/// the shader crate's fingerprint (`victory_shader::emit::translation_fingerprint`:
+/// its sources and build inputs, every `VICTORY_*` switch it reads, the host
+/// facts the device gave it, the loop limit, barrier waits and clean-up
+/// passes) and this file's encoding of the result. Worked out per lookup, so
+/// a translation made before the device said its wave size is never filed
+/// under the later key. `VICTORY_SHADER_CACHE_KEY=exe` adds our executable's
+/// hash (every rebuild translates again).
+fn build() -> [u8; 32] {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let limit = victory_shader::emit::loop_limit();
+    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+        WARNED.call_once(|| {
+            tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner")
+        });
+    }
+    static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+    let exe = EXE.get_or_init(|| {
+        if !std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
+            return None;
         }
-        key.update(&limit.to_le_bytes());
-        key.update(&[victory_shader::emit::group_sync()]);
-        key.update(&victory_shader::emit::shader_opt().to_le_bytes());
-        for name in [
-            "VICTORY_WAVE_WIDE",
-            "VICTORY_WAVE_DEEP_SKIPS",
-            "VICTORY_WAVE_OWN_BITS",
-            "VICTORY_F16_NEAREST",
-            "VICTORY_WAVE_LOCAL",
-            "VICTORY_MESH_OUTPUT_STRICT",
-            "VICTORY_STRICT_JOINS",
-            "VICTORY_HALF_SUM_NEAR",
-            "VICTORY_COMPUTE_GRADIENTS",
-        ] {
-            match std::env::var_os(name) {
-                None => key.update(&[0]),
-                Some(value) => {
-                    let bytes = value.as_encoded_bytes();
-                    key.update(&[1]);
-                    key.update(&(bytes.len() as u64).to_le_bytes());
-                    key.update(bytes)
-                }
-            };
+        match std::env::current_exe().and_then(std::fs::read) {
+            Ok(bytes) => Some(*blake3::hash(&bytes).as_bytes()),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read our executable; keying on the translator");
+                None
+            }
         }
-        *key.finalize().as_bytes()
-    })
+    });
+    let mut key = blake3::Hasher::new();
+    key.update(b"victory shader cache key 3\0");
+    if let Some(exe) = exe {
+        key.update(exe);
+    }
+    key.update(&victory_shader::emit::translation_fingerprint());
+    key.update(include_bytes!("shader_cache.rs"));
+    *key.finalize().as_bytes()
+}
+
+/// `victory translate --warm <file>`: `container` is translated into the
+/// cache unless it is there already. `Ok(true)`: it was translated now;
+/// `Err`: it does not translate. Needs [`use_shader_cache`] and the host
+/// facts the run will have ([`prepare_host`], or `VICTORY_HOST_WAVE` and
+/// `VICTORY_VIEW_LIMIT`).
+pub fn warm(container: &[u8]) -> Result<bool, String> {
+    match precompile_shader(container)? {
+        PrecompileOutcome::Translated => Ok(true),
+        PrecompileOutcome::Cached => Ok(false),
+        PrecompileOutcome::CachedRefusal | PrecompileOutcome::Refused => {
+            Err("does not translate".into())
+        }
+    }
 }
 
 /// Uses an in-memory translation when the disk cache cannot be written.
@@ -172,7 +185,7 @@ fn lookup(cache: &Cache, container: &[u8]) -> (Translation, CacheStatus) {
         let expected = target();
         let translated = cached(
             cache,
-            build(),
+            &build(),
             expected,
             container,
             victory_shader::emit::translate,
