@@ -931,6 +931,20 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// As [`view`], for a slot a material record names indirectly: it may lie
+/// in the reserved, not committed part of a heap, so it is read only if
+/// its memory can be (`crate::material_demand`; after DexNom/VIctory
+/// b8ff22e).
+#[cfg(windows)]
+pub(crate) fn checked_view(handle: u64) -> Option<View> {
+    let mut bytes = [0u8; 12];
+    if handle == 0 || !crate::host::read_into(handle as *const u8, &mut bytes) {
+        return None;
+    }
+    let word = |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+    (word(0) == VIEW_TAG).then(|| view_at(word(4), word(8))).flatten()
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.
@@ -1312,6 +1326,234 @@ mod tests {
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// What a material record names (`crate::material_demand`): a slot
+    /// waiting for its upload as it was when the record was read; a null
+    /// slot out of the queue whose memory is all there and no other view
+    /// claims, put into the queue; never one the title wrote since the
+    /// read, nor one under a texture the card writes (after DexNom/VIctory
+    /// b8ff22e).
+    #[cfg(windows)]
+    #[test]
+    fn material_records_ask_only_for_current_free_textures() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        let null = std::ptr::null();
+        let mut object = null;
+        let desc = HeapDesc { kind: 0, count: 8, flags: 1, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let heap = heap(object);
+        let host = heap.host().unwrap();
+        // SAFETY: new memory, left to the process.
+        let addr = unsafe { VirtualAlloc(std::ptr::null(), 2 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(addr, 0);
+        // A 1024x512 BC1 texture of 8 levels.
+        let color = [3, 0, 0, 0, 1024, 0, 512, 0x8_0001, 72, 1, 0, 0x105, 0, 0];
+        let put = |slot, at: u64, first: u32| {
+            let mut srv = [0u32; 16];
+            srv[0] = 72;
+            srv[1] = 4;
+            srv[2] = 5768;
+            srv[4] = first;
+            srv[5] = 8 - first;
+            srv[10] = at as u32;
+            srv[11] = (at >> 32) as u32;
+            create_placed_srv(null, &color, &srv, heap.handle(slot).unwrap());
+        };
+        let frame = crate::frame::current();
+        put(1, addr, 4);
+        let stamp = host.material_write_stamp();
+        // In the queue as written before the read: handed back.
+        let queued = host.demand_material_texture(heap, 1, stamp, frame).unwrap();
+        assert_eq!(queued.0, 1);
+        assert!(!host.texture_slot_recovered(queued.0, queued.1));
+        // Out of the queue and null: put back into it, to be looked at again.
+        host.textures_remove(1);
+        let revived = host.demand_material_texture(heap, 1, stamp, frame).unwrap();
+        assert!(host.texture_slots_due(frame, 8).0.contains(&revived));
+        assert!(host.texture_slot_recovered(revived.0, revived.1));
+        let small = crate::resource::placed_bytes_from(&color, 4).unwrap();
+        assert!(host.material_upload_allowed(1, revived.1, addr, small, small));
+        assert!(!host.material_upload_allowed(1, revived.1, addr, small, small - 1));
+        assert!(!host.material_upload_allowed(1, revived.1 + 1, addr, small, small));
+        // Written by the title after the read: not this record's to ask for.
+        host.textures_remove(1);
+        put(1, addr, 4);
+        host.textures_remove(1);
+        assert!(host.demand_material_texture(heap, 1, stamp, frame).is_none());
+        let stamp = host.material_write_stamp();
+        assert!(host.demand_material_texture(heap, 1, stamp, frame).is_some());
+        // A texture the card writes over the same memory: never.
+        host.textures_remove(1);
+        let mut writer = color;
+        writer[8] = 28;
+        writer[12] = 1;
+        let writer = crate::resource::texture_at(addr, &writer);
+        if writer.is_some() && crate::resource::writable_texture_overlaps(addr, addr + small) {
+            assert!(host.demand_material_texture(heap, 1, stamp, frame).is_none());
+        }
+        assert_eq!(release(object), 0);
+    }
+
+    /// Every texture the host writes at an address counts for the memory
+    /// it lies over until it is released, not only the newest, and so does
+    /// one the host copied into (`crate::material_demand`).
+    #[cfg(windows)]
+    #[test]
+    fn overlapping_textures_the_card_writes_count_until_each_is_released() {
+        use windows::core::{IUnknown, Interface};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if crate::host::host().is_none() {
+            return;
+        }
+        // SAFETY: new memory, the test's until both textures are released.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), 2 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let base = memory as u64;
+        crate::resource::TARGET_OWNERS_ON.set(true);
+        let owner = |side: u32| {
+            let words: [u32; 14] = [3, 0, 0, 0, side, 0, side, 0x1_0001, 28, 1, 0, 0x105, 1, 0];
+            // SAFETY: the 14 words have the layout of the title's resource
+            // description.
+            let desc = unsafe { std::mem::transmute::<[u32; 14], crate::resource::ResourceDesc>(words) };
+            let mut raw = std::ptr::null();
+            assert_eq!(
+                crate::resource::create_at_address(
+                    std::ptr::null(),
+                    base,
+                    &desc,
+                    0,
+                    std::ptr::null(),
+                    &crate::resource::PAGEABLE_IIDS[0],
+                    &mut raw
+                ),
+                S_OK
+            );
+            crate::texture::host_written(raw);
+            // SAFETY: takes over the title resource's first reference.
+            unsafe { IUnknown::from_raw(raw.cast_mut().cast()) }
+        };
+        let large = owner(512);
+        let small = owner(32);
+        let range = (base + 512 * 1024, base + 516 * 1024);
+        let check = |expected| {
+            assert_eq!(crate::resource::writable_texture_overlaps(range.0, range.1), expected);
+            assert_eq!(crate::texture::host_written_overlaps(range.0, range.1), expected);
+        };
+        check(true);
+        drop(small);
+        check(true);
+        drop(large);
+        check(false);
+        crate::resource::TARGET_OWNERS_ON.set(false);
+        // SAFETY: both textures are released.
+        assert_ne!(unsafe { VirtualFree(memory, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A material record the card holds is read back in command order and
+    /// names the slots to go first: the one waiting for its upload, and
+    /// two null ones a newer view had made stale (after DexNom/VIctory
+    /// b8ff22e).
+    #[cfg(windows)]
+    #[test]
+    fn material_records_are_read_from_the_card_in_command_order() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(device) = crate::host::host() else { return };
+        let null = std::ptr::null();
+        let mut object = null;
+        let desc = HeapDesc { kind: 0, count: 128, flags: 1, nodes: 0 };
+        assert_eq!(create(desc, Placement { address: 0, size: 0 }, &mut object), S_OK);
+        let heap = heap(object);
+        let host = heap.host().unwrap();
+        // The record's buffer view, 688 dwords into the table.
+        let source_slot = 688 * 4 / 32;
+        let record_bytes = [0u64; 8];
+        let base = record_bytes.as_ptr() as u64;
+        let mut resource = [0; 14];
+        resource[0] = 1;
+        resource[4] = 64;
+        let mut view = [0; 16];
+        view[0] = 41;
+        view[1] = 1;
+        view[6] = 16;
+        view[10] = base as u32;
+        view[11] = (base >> 32) as u32;
+        let handle = heap.handle(source_slot).unwrap();
+        create_placed_srv(null, &resource, &view, handle);
+        let material = host.mirror(source_slot, handle, true).unwrap();
+        let (shadow, address, _) = host::buffer_copy(&material).unwrap();
+        let backing = vec![0u8; 1 << 20];
+        let addr = backing.as_ptr() as u64;
+        let tex = [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0];
+        let mut tex_view = [0; 16];
+        tex_view[10] = addr as u32;
+        tex_view[11] = (addr >> 32) as u32;
+        create_placed_srv(null, &tex, &tex_view, heap.handle(3).unwrap());
+        let _frame = crate::frame::TEST_FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = crate::frame::current();
+        let stamp = host.material_write_stamp();
+        let write = host.demand_material_texture(heap, 3, stamp, frame).unwrap();
+        let list = device.new_list().unwrap();
+        // Two typed BC1 maps; a wider view of each at the same address in
+        // slot 8 makes them stale, and clearing slot 8 leaves their memory
+        // free and their slots null.
+        for (slot, at, width, height, levels, first) in
+            [(5, addr + 0x40000, 512, 256, 7, 1), (6, addr + 0x60000, 1024, 512, 8, 3)]
+        {
+            let mut shape = [3, 0, 0, 0, width, 0, height, (levels << 16) | 1, 71, 1, 0, 0x105, 0, 0];
+            let mut srv = [0u32; 16];
+            srv[0] = 71;
+            srv[1] = 4;
+            srv[2] = 5768;
+            srv[4] = first;
+            srv[5] = levels - first;
+            srv[10] = at as u32;
+            srv[11] = (at >> 32) as u32;
+            create_placed_srv(null, &shape, &srv, heap.handle(slot).unwrap());
+            shape[4] *= 2;
+            create_placed_srv(null, &shape, &srv, heap.handle(8).unwrap());
+            create_cbv(null, &[0x400, 6, 256, 0], heap.handle(8).unwrap());
+        }
+        // The record exists only on the card: title memory holds zeros.
+        let words = [0xf800_0003u32, 0, 7, 0, 5, 6];
+        let bytes = std::mem::size_of_val(&words) as u64;
+        let (upload, mapped) = device.upload_buffer(bytes).unwrap();
+        // SAFETY: the upload buffer holds `bytes` bytes; the copy goes into
+        // the host copy's range of the record.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), mapped, bytes as usize);
+            list.list.CopyBufferRegion(&shadow.buffer, shadow.offset(address), &upload, 0, bytes);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+        }
+        crate::material_demand::record(&list, heap, heap.start, 0, &[0, 16, 20]);
+        list.close();
+        device.execute(&[&list]);
+        let wanted = host.material_demand.take(heap, host, frame);
+        assert_eq!(
+            wanted.iter().map(|&(slot, write)| (slot, host.texture_slot_recovered(slot, write))).collect::<Vec<_>>(),
+            [(3, false), (5, true), (6, true)]
+        );
+        assert_eq!(record_bytes, [0; 8]);
+        let mut due: Vec<_> = (32..48).map(|n| (n, 1)).collect();
+        due.push(write);
+        crate::material_demand::promote(&mut due, &wanted, frame);
+        assert_eq!(due[(frame % 4) as usize], write);
+        // A newer view of slot 3's memory, written after the read.
+        let mut newer = tex;
+        newer[4] = 128;
+        create_placed_srv(null, &newer, &tex_view, heap.handle(4).unwrap());
+        assert!(host.demand_material_texture(heap, 3, stamp, frame).is_none());
+        assert!(host.demand_material_texture(heap, 4, stamp, frame).is_none());
+        assert!(host.demand_material_texture(heap, 4, host.material_write_stamp(), frame).is_some());
+        drop(backing);
+        assert_eq!(release(object), 0);
     }
 
     #[test]

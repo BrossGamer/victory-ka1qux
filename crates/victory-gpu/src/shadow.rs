@@ -1254,6 +1254,10 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    if snapshot_pool() {
+        let reused = SIZED.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+        return reused.unwrap_or_else(|| Vec::with_capacity(n));
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1273,6 +1277,10 @@ fn pooled(n: usize) -> Vec<u8> {
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
+    if snapshot_pool() {
+        SIZED.lock().unwrap_or_else(|e| e.into_inner()).put(v);
+        return;
+    }
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
@@ -1284,6 +1292,116 @@ fn give_back(v: Vec<u8>) {
         total = total.saturating_add(v.capacity());
         seen == 1 || total <= KEPT
     });
+}
+
+/// `VICTORY_SNAPSHOT_POOL=1` (off by default): snapshot buffers are kept
+/// by size, up to 512 of them and 512 MiB, instead of the eight largest
+/// (after DexNom/VIctory b8ff22e: a submission that lets go of hundreds of
+/// 4 MiB windows at once lost all but eight of their already-touched
+/// buffers, and the next one paged them in again).
+fn snapshot_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The buffers of [`snapshot_pool`], by capacity. A buffer is reused, never
+/// what it holds.
+#[derive(Default)]
+struct SnapshotPool {
+    by_capacity: BTreeMap<usize, Vec<Vec<u8>>>,
+    bytes: usize,
+    count: usize,
+}
+
+impl SnapshotPool {
+    /// The smallest kept buffer with room for `n` bytes and not more than
+    /// four times that (a tiny snapshot must not take the one large
+    /// buffer a heap-wide one needs next).
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let (&capacity, bucket) = self.by_capacity.range_mut(n..=most).next()?;
+        let mut buffer = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_capacity.remove(&capacity);
+        }
+        self.count -= 1;
+        self.bytes -= capacity;
+        buffer.clear();
+        Some(buffer)
+    }
+
+    /// Keeps `buffer`, letting smaller ones go when the pool is full; the
+    /// larger buffers are the dearer ones to make again.
+    fn put(&mut self, buffer: Vec<u8>) {
+        const MAX_BYTES: usize = 512 << 20;
+        const MAX_COUNT: usize = 512;
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_BYTES {
+            return;
+        }
+        while self.count >= MAX_COUNT || self.bytes > MAX_BYTES - capacity {
+            let Some(mut smallest) = self.by_capacity.first_entry() else {
+                return;
+            };
+            let size = *smallest.key();
+            if size >= capacity {
+                return;
+            }
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+        self.by_capacity.entry(capacity).or_default().push(buffer);
+        self.bytes += capacity;
+        self.count += 1;
+    }
+}
+
+static SIZED: Mutex<SnapshotPool> =
+    Mutex::new(SnapshotPool { by_capacity: BTreeMap::new(), bytes: 0, count: 0 });
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    use super::SnapshotPool;
+
+    #[test]
+    fn a_batch_of_windows_reuses_each_buffer_without_its_contents() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..64 {
+            pool.put(vec![0x6b; 4096]);
+        }
+        let medium = vec![0; 8192];
+        let medium_capacity = medium.capacity();
+        pool.put(medium);
+        let count = pool.count;
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            let buffer = pool.take(4096).unwrap();
+            assert_eq!(buffer.capacity(), 4096);
+            assert!(buffer.is_empty());
+            active.push(buffer);
+        }
+        assert_eq!(pool.count, count - 64);
+        assert_eq!(pool.bytes, medium_capacity);
+        assert!(pool.take(8193).is_none());
+        assert_eq!(pool.take(4097).unwrap().capacity(), medium_capacity);
+        assert_eq!((pool.count, pool.bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_full_pool_lets_small_buffers_go_for_larger_ones() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..1024 {
+            pool.put(Vec::with_capacity(8));
+        }
+        assert_eq!((pool.count, pool.bytes), (512, 4096));
+        pool.put(Vec::with_capacity(16));
+        assert_eq!((pool.count, pool.bytes), (512, 4104));
+        assert_eq!(pool.take(16).unwrap().capacity(), 16);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2538,7 +2656,10 @@ pub(crate) fn memory() -> [u64; 6] {
             .sum();
         (seen.len() as u64, bytes)
     };
-    let (kept, kept_bytes) = {
+    let (kept, kept_bytes) = if snapshot_pool() {
+        let pool = SIZED.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.count as u64, pool.bytes as u64)
+    } else {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
     };

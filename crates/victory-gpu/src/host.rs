@@ -2253,6 +2253,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Work once the card has run the list and its read-backs are
+    /// visible ([`HostList::defer_after`]).
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Deferred {
@@ -2289,6 +2292,7 @@ impl Deferred {
             backs,
             budget_zeroed,
             indirect_readable,
+            after,
         } = self;
         ALIVE[6].fetch_sub(uploads.len() as u64, Ordering::Relaxed);
         ALIVE[7].fetch_sub(*upload_bytes, Ordering::Relaxed);
@@ -2304,6 +2308,7 @@ impl Deferred {
         *budget_zeroed = false;
         // The list's close moved the scratch buffer back to the common state.
         *indirect_readable = 0;
+        after.clear();
     }
 }
 
@@ -2869,7 +2874,61 @@ fn late_writes() -> bool {
 
 /// Per host copy, the ranges a submission's shaders may write, as declared
 /// (address, end).
-type Declared = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+type Declared<T = crate::shadow::Shadow> = (std::sync::Arc<T>, Vec<(usize, usize)>);
+
+/// Declared ranges gathered per host copy, in the order the copies were
+/// first named and each copy's ranges in the order first given, as the
+/// linear searches before did; a table finds a copy's entry (after
+/// DexNom/VIctory b8ff22e: a submission names thousands of copies, and
+/// each was looked for among all those before it).
+struct WriteGroups<T> {
+    groups: Vec<Declared<T>>,
+    positions: std::collections::HashMap<usize, usize>,
+}
+
+impl<T> WriteGroups<T> {
+    fn new() -> Self {
+        Self { groups: Vec::new(), positions: std::collections::HashMap::new() }
+    }
+
+    /// `ranges` declared of `shadow`; one it has already is not added twice.
+    fn add(&mut self, shadow: &std::sync::Arc<T>, ranges: &[(usize, usize)]) {
+        use std::collections::hash_map::Entry;
+        match self.positions.entry(std::sync::Arc::as_ptr(shadow) as *const () as usize) {
+            Entry::Vacant(entry) => {
+                entry.insert(self.groups.len());
+                self.groups.push((shadow.clone(), ranges.to_vec()));
+            }
+            Entry::Occupied(entry) => {
+                let existing = &mut self.groups[*entry.get()].1;
+                for range in ranges {
+                    if !existing.contains(range) {
+                        existing.push(*range);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn write_groups_keep_each_copy_and_the_order_ranges_came_in() {
+    use std::sync::Arc;
+    let first = Arc::new(0);
+    // Another copy of the same title memory: its own entry.
+    let second = Arc::new(0);
+    let mut writes = WriteGroups::new();
+    writes.add(&first, &[(20, 30), (0, 10)]);
+    writes.add(&second, &[(0, 10)]);
+    writes.add(&first.clone(), &[(0, 10), (9, 22), (20, 30)]);
+    writes.add(&second, &[(0, 10), (20, 30)]);
+    assert_eq!(writes.groups.len(), 2);
+    assert!(Arc::ptr_eq(&writes.groups[0].0, &first));
+    assert!(Arc::ptr_eq(&writes.groups[1].0, &second));
+    assert_eq!(writes.groups[0].1, [(20, 30), (0, 10), (9, 22)]);
+    assert_eq!(writes.groups[1].1, [(0, 10), (20, 30)]);
+}
 
 /// What [`Host::submit`] hands back for a submission it sent and did not
 /// wait for.
@@ -4279,12 +4338,17 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// range declared of it is written through marked views (`crate::marks`).
 fn marked_writes(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, bool)> {
     let mut out: Vec<(std::sync::Arc<crate::shadow::Shadow>, bool)> = Vec::new();
+    // Where each copy's entry is ([`WriteGroups`]).
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, _, _, marked) = step {
-                match out.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, all)) => *all &= *marked,
-                    None => out.push((shadow.clone(), *marked)),
+                match at.entry(std::sync::Arc::as_ptr(shadow) as usize) {
+                    std::collections::hash_map::Entry::Occupied(entry) => out[*entry.get()].1 &= *marked,
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(out.len());
+                        out.push((shadow.clone(), *marked));
+                    }
                 }
             }
         }
@@ -4313,23 +4377,15 @@ fn unmarked(back: Vec<Declared>, marking: &crate::marks::Marking) -> Vec<Declare
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
-    let mut back: Vec<Declared> = Vec::new();
+    let mut back = WriteGroups::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::GpuWrite(shadow, address, len, _) = step {
-                let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
-                    }
-                    None => back.push((shadow.clone(), vec![range])),
-                }
+                back.add(shadow, &[(*address, *address + *len)]);
             }
         }
     }
-    back
+    back.groups
 }
 
 /// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
@@ -4354,6 +4410,17 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    read_backs_landed(list);
+    // The work that waits for them (`HostList::defer_after`). Taken out
+    // first: it may record into other lists.
+    let after = std::mem::take(&mut list.deferred().after);
+    for work in &after {
+        work();
+    }
+}
+
+/// [`read_backs`]: the texels of the list's read-backs.
+fn read_backs_landed(list: &HostList) {
     for (buffer, at, [row, rows, pitch]) in &list.deferred().backs {
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
@@ -4851,24 +4918,17 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        let mut groups = WriteGroups::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
+                    groups.add(shadow, &[(*address, *address + *len)]);
                 }
             }
         }
+        let declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = groups.groups;
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5674,21 +5734,13 @@ impl Host {
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
                 self.relay_card_back(&plans, fetch, behind, landed);
-                let mut back: Vec<Declared> = Vec::new();
+                let mut back = WriteGroups::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        back.add(shadow, ranges);
                     }
                 }
+                let back: Vec<Declared> = back.groups;
                 relay_hand_back(&back);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
@@ -6151,7 +6203,7 @@ impl Host {
                 submitting(3, flights);
                 let copying = std::time::Instant::now();
                 let mut seen = std::collections::HashSet::new();
-                let mut back: Vec<Declared> = Vec::new();
+                let mut groups = WriteGroups::new();
                 // With [`one_flight`]: what the flights' shaders marked.
                 let mut marking: Option<crate::marks::Marking> = None;
                 for item in &items {
@@ -6165,18 +6217,10 @@ impl Host {
                         marking.get_or_insert_with(crate::marks::Marking::none).absorb(m);
                     }
                     for (shadow, ranges) in &flight.back {
-                        match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => back.push((shadow.clone(), ranges.clone())),
-                        }
+                        groups.add(shadow, ranges);
                     }
                 }
+                let back: Vec<Declared> = groups.groups;
                 match marking {
                     Some(marking) => {
                         // The pages shaders marked, then what was declared
@@ -7678,6 +7722,14 @@ impl HostList {
     /// the list is reset.
     pub(crate) fn defer_read_back(&self, buffer: ID3D12Resource, dst: *mut u8, [row, rows, pitch]: [usize; 3]) {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
+    }
+
+    /// Runs `work` once the card has run the list and its read-backs are
+    /// visible (after DexNom/VIctory b8ff22e: what a read-back buffer of
+    /// ours holds is looked at there). Dropped unrun if the list is reset
+    /// first.
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
