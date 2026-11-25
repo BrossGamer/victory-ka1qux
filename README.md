@@ -30,7 +30,7 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Frame rate | 🟡 | with the switches below, in the open world on a street with about 6,100 draws a frame: a median of 0.42 s a frame (about 2.4 frames a second), 0.33 s at best; the same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main and 0.53 s before the write marks (below). An earlier build, in a lighter view of about 2,000 draws, took 0.32 s. With victory-fork's speed defaults a frame took 144 to 150 ms in steady open-world views on an earlier build, but the picture is not right with them yet (below) |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
-| Tests | ✅ | `cargo test --workspace` runs 739 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| Tests | ✅ | `cargo test --workspace` runs 785 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
@@ -266,13 +266,26 @@ out because its tests fail on this card.
 Venglovsky), #191 (gdawid94), #196 (JaumeMarRib), #237 (fffluffy-dev), #282
 (t4l03), #362 (renzowit35), #438 (sennecools), #452 (MalfoyDraco99), #571
 (arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev),
-#987 (several authors), #1023 and #1031 (Lkxex / NetherySiloX).
+#927 (tippythetaidum), #987 (several authors), #1023 and #1031 (Lkxex /
+NetherySiloX), #1069 (alexis27yt). From upstream VIctory's open pull
+requests: the BCPack fixes #2648 and #2649 (chaseb64), the mesh dispatch
+of #2624 (andrewpozdnakov7-jpg), and the BCPack, tiling and write-mark speed-ups
+#2735, #2736 and #2755 (brainbudt). Through victory-fork #1112 (KyleS98), two
+translator fixes of DexNom/VIctory.
 
 ## Running it
 
 Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (pinned in `rust-toolchain.toml`) with the
 MSVC build tools, and several GB of free Windows commit.
+
+Windows charges the PC's commit for every byte of the card's own memory that
+the driver hands out (measured here: +1.02 to 1.04 GB of commit per GB of
+textures or buffers on the card, even made not resident). The texture queue
+fills the card to 90 % of its budget, so a run takes 29 to 32 GB of commit;
+with 32 GB of RAM, leave a page file large enough, or set
+`VICTORY_COMMIT_RESERVE_MB` (one run with 6144: the PC kept 5.4 GB free
+where it had kept 1.7 GB, at the same frame time).
 
 ```powershell
 cargo build --profile diag -p victory --features diagnostics
@@ -295,6 +308,8 @@ $env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "16"; $env:VICTORY_CARD_BUFFERS_MB = "512"
 $env:VICTORY_LATE_WAIT_LISTS = "128"
 # $env:VICTORY_RAYS = "0"            # without the title's ray-traced light (on by default)
+# $env:VICTORY_COMMIT_RESERVE_MB = "6144"  # stop filling the card with texture copies when the
+#                                         # PC has less than this left to commit (see below)
 
 target\diag\victory.exe run "$g\<the title's exe>" --execute
 ```
@@ -350,7 +365,8 @@ cargo build --profile diag -p victory --features diagnostics
   a fork of upstream VIctory on another AMD card; the quad reads of pixel
   shaders and the stand-in for indirect light are ported from it.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)** and victory-fork's
-  pull request #994 by PiloteCode: the ray-tracing work ported here.
+  pull request #994 by PiloteCode: the ray-tracing work ported here, and the
+  material-record texture order (off by default).
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.

@@ -134,6 +134,7 @@ fn lowered_on(
         written_root_uavs: lowered.written_root_uavs,
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: lowered.half_views,
     })
 }
 
@@ -713,6 +714,7 @@ fn spilled_compute_masks_partial_dispatch_threads_on_wave64_and_wave32() {
             written_root_uavs: lowered.written_root_uavs,
             writes_guest_memory: lowered.writes_guest_memory,
             root_indexed_views: res.root_indexed_views.clone(),
+            half_views: Vec::new(),
         };
         if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
             let mut copy = shader.dxil.clone();

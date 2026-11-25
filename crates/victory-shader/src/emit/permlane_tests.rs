@@ -108,6 +108,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
         written_root_uavs: result.written_root_uavs,
         writes_guest_memory: result.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
     match validator::Validator::load(validator::Validator::default_path().as_deref()) {
         Ok(mut v) => {

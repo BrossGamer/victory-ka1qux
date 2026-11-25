@@ -37,15 +37,37 @@ const BUFFER_STORE_DWORD: u32 = 0x1C;
 const BUFFER_STORE_DWORDX4: u32 = 0x1E;
 const BUFFER_ATOMIC_ADD: u32 = 0x32;
 
+/// MUBUF `op` of `vdata` through `s[srsrc:srsrc+3]` at the byte in `vaddr`.
+const fn mubuf_offen(op: u32, vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+    [
+        0x38 << 26 | op << 18 | 1 << 12,
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// VOP2 `v_lshlrev_b32 vdst, s<shift>, v<src>`.
+const fn v_lshlrev_b32(vdst: u8, shift: u8, src: u8) -> u32 {
+    0x1A << 25 | (vdst as u32) << 17 | (src as u32) << 9 | shift as u32
+}
+
+const S_NOP: u32 = 0xBF80_0000;
+
 /// A one-thread compute program with 4 dwords of root constants in
 /// `s0..s3` and a table of `views` raw UAVs at user data 4; `body` runs
 /// after the descriptors are in `s8..` (four SGPRs each).
 fn program(views: u32, body: &[[u32; 2]], marks: bool) -> HostShader {
+    program_of(views, body, marks, 1)
+}
+
+/// [`program`] with `threads` threads in x; with more than one, v0 keeps
+/// the thread's index.
+fn program_of(views: u32, body: &[[u32; 2]], marks: bool, threads: u32) -> HostShader {
     let mut w = vec![s_mov_b32(5, ZERO)];
     for k in 0..views {
         w.extend(s_load_dwordx4(8 + 4 * k as u8, 4, 32 * k));
     }
-    w.extend((0..4).map(|v| v_mov_b32(v, 0)));
+    let first = u8::from(threads > 1);
+    w.extend((first..4).map(|v| v_mov_b32(v, 0)));
     for words in body {
         w.extend(words);
     }
@@ -76,7 +98,7 @@ fn program(views: u32, body: &[[u32; 2]], marks: bool) -> HostShader {
         used: (0..views).map(uav).collect(),
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
-            threads: [1, 1, 1],
+            threads: [threads, 1, 1],
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
@@ -114,6 +136,7 @@ fn program(views: u32, body: &[[u32; 2]], marks: bool) -> HostShader {
         written_root_uavs: l.written_root_uavs,
         writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -187,4 +210,68 @@ fn programs_without_view_writes_are_unchanged() {
     assert!(!super::marks_writes(&with));
     assert_eq!(with.dxil, without.dxil);
     assert_eq!((with.root_srvs, with.root_uavs), (without.root_srvs, without.root_uavs));
+}
+
+/// 64 threads store their index at byte `index << s0` of view 0 (first
+/// bit 100, from its page's start): a shift of 2 writes one page, 11 two
+/// pages of one bitmap dword, 16 a page each over two dwords, 21 a dword
+/// each. Lanes of one dword set their bits with one atomic between them
+/// (wave operations, whatever the wave's size); every lane's page is
+/// marked and no other, and the stores that fit the view land.
+#[test]
+fn lanes_of_a_wave_mark_every_page_they_write() {
+    let body = [[v_lshlrev_b32(1, 0, 0), S_NOP], mubuf_offen(BUFFER_STORE_DWORD, 0, 1, 8)];
+    let shader = program_of(1, &body, true, 64);
+    assert!(super::marks_writes(&shader), "the bitmap is bound");
+    let container = crate::dxbc::Container::parse(&shader.dxil).expect("container");
+    let sfi = container.part(crate::dxbc::FourCC::SFI0).expect("SFI0").data;
+    let features = u64::from_le_bytes(sfi.try_into().expect("8 bytes"));
+    assert_ne!(features & 0x4000, 0, "wave operations declared");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let marks = vec![100, 0];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        for shift in [2u32, 11, 16, 21] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = if u.root == RootType::Constants { shift } else { 0 };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: marks.clone() }),
+                            (2, Root::Uav(4096 / 32)),
+                        ],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut data = vec![0u32; 64];
+            let mut pages = Vec::new();
+            for lane in 0..64u32 {
+                let byte = lane << shift;
+                if byte < 256 {
+                    data[(byte / 4) as usize] = lane;
+                }
+                pages.push(100 + (byte >> 16) as usize);
+            }
+            pages.dedup();
+            assert_eq!(out[0], data, "{label}: view 0, shift {shift}");
+            let marked: Vec<usize> = (0..out[1].len() * 32).filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0).collect();
+            assert_eq!(marked, pages, "{label}: pages, shift {shift}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }

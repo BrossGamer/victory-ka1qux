@@ -89,7 +89,9 @@
 //!   first byte's offset in its title page (bits 16-31: a typed view's
 //!   element size). A write at byte `x` of the view sets bit `first +
 //!   ((offset + x) >> 16)` for its first and its last byte, at most
-//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. Both
+//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. The
+//!   lanes of a wave that set bits of one bitmap dword do it with one
+//!   atomic, skipped where the bits are already set. Both
 //!   root views exist only in programs that write through such views:
 //!   others are as without marks. Root UAVs and title memory by address
 //!   are not marked (the host declares what they write). Every such
@@ -338,6 +340,21 @@ pub struct HostShader {
     pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -798,6 +815,7 @@ fn emit_program(
         written_root_uavs: l.written_root_uavs,
         writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1201,6 +1219,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1215,6 +1234,7 @@ mod tests {
                 written_root_uavs: Vec::new(),
                 writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1684,6 +1704,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -1846,6 +1867,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             };
             // 32 dwords = 128 bytes = 8 elements of stride 16.
             let data: Vec<u32> = (0..32).map(|i| 1000 + i).collect();
@@ -2294,6 +2316,7 @@ mod barycentric_tests {
             written_root_uavs: Vec::new(),
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         validate(&vs);
         // One triangle covers an 8x8 target, with attribute values 2, 6, 10.
@@ -2647,6 +2670,7 @@ fn raw_buffer_get_dimensions_compiles_on_host() {
         written_root_uavs: Vec::new(),
         writes_guest_memory: false,
         root_indexed_views: vec![],
+        half_views: Vec::new(),
     };
     host.compute_pipeline(&shader)
         .expect("raw buffer getDimensions compute pipeline should compile");
