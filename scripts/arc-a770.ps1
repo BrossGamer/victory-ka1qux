@@ -1,15 +1,18 @@
 # Environment profile for Intel Arc A770 (Alchemist / Xe-HPG: 16 GB or 8 GB).
 # Dot-source in PowerShell before running `victory`:
 #
-#   . .\scripts\arc-a770.ps1                 # A770 16 GB, conservative stability defaults
+#   . .\scripts\arc-a770.ps1                 # A770 16 GB (async relay, VICTORY_RAYS=0; avoids 2s Windows TDR)
 #   . .\scripts\arc-a770.ps1 -VramGB 8       # A770 8 GB
-#   . .\scripts\arc-a770.ps1 -Fast           # async relay + wider card buffers
+#   . .\scripts\arc-a770.ps1 -Rays           # enable title ray tracing (pre-warm XboxBvhBuilder.dll pipelines first)
+#   . .\scripts\arc-a770.ps1 -Conservative   # synchronous relay=0 / late-waits=128 (may need Windows TdrDelay >= 10)
 
 param(
     [ValidateSet(8, 16)]
     [int]$VramGB = 16,
     [string]$Adapter = "A770",
-    [switch]$Fast
+    [switch]$Fast,
+    [switch]$Conservative,
+    [switch]$Rays
 )
 
 $fetch = Join-Path $PSScriptRoot "fetch-agility.ps1"
@@ -34,20 +37,23 @@ $env:VICTORY_ADAPTER = $Adapter
 Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
 $env:VICTORY_INDIRECT_CLAMP = "0"
 $env:VICTORY_SKIP_MOVIES    = "1"
+$env:VICTORY_RAYS           = if ($Rays) { "1" } else { "0" }
+
+$useAsync = -not $Conservative
 
 if ($VramGB -eq 8) {
     $env:VICTORY_TEXTURE_ROOM_PERCENT = "90"
-    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "4" } else { "16" }
+    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($useAsync) { "4" } else { "16" }
     $env:VICTORY_CARD_BUFFERS_MB      = "256"
 } else {
     $env:VICTORY_TEXTURE_ROOM_PERCENT = "96"
-    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "1" } else { "16" }
-    $env:VICTORY_CARD_BUFFERS_MB      = if ($Fast) { "1024" } else { "512" }
+    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($useAsync) { "1" } else { "16" }
+    $env:VICTORY_CARD_BUFFERS_MB      = if ($useAsync) { "1024" } else { "512" }
 }
 
-if ($Fast) {
-    $env:VICTORY_RELAY      = "2"
-    $env:VICTORY_WIDE_BACK  = "1"
+if ($useAsync) {
+    $env:VICTORY_RELAY     = "2"
+    $env:VICTORY_WIDE_BACK = "1"
     Remove-Item Env:VICTORY_LATE_WAIT_LISTS -ErrorAction SilentlyContinue
 } else {
     $env:VICTORY_RELAY           = "0"
@@ -55,10 +61,12 @@ if ($Fast) {
     $env:VICTORY_LATE_WAIT_LISTS = "128"
 }
 
-Write-Host "Intel Arc A770 (${VramGB} GB) profile active (Fast=$($Fast.IsPresent)):"
+$mode = if ($useAsync) { "Async" } else { "Conservative" }
+Write-Host "Intel Arc A770 (${VramGB} GB) profile active (Mode=$mode, Rays=$($Rays.IsPresent)):"
 Write-Host "  VICTORY_ADAPTER              = $env:VICTORY_ADAPTER"
 Write-Host "  VICTORY_TEXTURE_ROOM_PERCENT = $env:VICTORY_TEXTURE_ROOM_PERCENT% (live DXGI budget)"
 Write-Host "  VICTORY_CARD_BUFFERS_MIN_MB  = $env:VICTORY_CARD_BUFFERS_MIN_MB"
 Write-Host "  VICTORY_CARD_BUFFERS_MB      = $env:VICTORY_CARD_BUFFERS_MB"
 Write-Host "  VICTORY_RELAY / WIDE_BACK    = $env:VICTORY_RELAY / $env:VICTORY_WIDE_BACK"
+Write-Host "  VICTORY_RAYS                 = $env:VICTORY_RAYS"
 Write-Host "  VICTORY_INDIRECT_CLAMP       = $env:VICTORY_INDIRECT_CLAMP"
