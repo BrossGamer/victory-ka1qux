@@ -2547,6 +2547,23 @@ impl Shadow {
                 crate::host::write_mapped(from as *mut u8, title.as_ptr(), n);
                 written += n;
             }
+            // A snapshot of a declared range over the same bytes (one that
+            // kept its snapshot, or with `VICTORY_VIEW_MARKS=check`) takes
+            // them too: its copy-back, which runs next, must not take the
+            // copy's bytes for the card's and put them back over a title
+            // write made since (after upstream VIctory #2437).
+            let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(before) = snapshot.as_mut() {
+                let at = from - start;
+                // Written and read through its pointer at the copy's
+                // offsets, as `writing` does (`pooled`: the copy's length is
+                // in its capacity).
+                if at + n <= before.capacity() {
+                    // SAFETY: inside the snapshot's memory; `title` holds n
+                    // bytes and is another allocation.
+                    unsafe { std::ptr::copy_nonoverlapping(title.as_ptr(), before.as_mut_ptr().add(at), n) };
+                }
+            }
         }
         written
     }
@@ -2574,7 +2591,14 @@ impl Shadow {
                     // SAFETY: inside the mapping; the snapshot holds the
                     // copy's length and these offsets (a declared range).
                     let host = unsafe { std::slice::from_raw_parts(self.data.add(at), n) };
-                    let differ = host.iter().zip(&before[at..at + n]).filter(|(h, o)| h != o).count() as u64;
+                    if at + n > before.capacity() {
+                        break;
+                    }
+                    // SAFETY: the snapshot's memory at the copy's offsets
+                    // (`pooled`: read through its pointer, as `copy_back`
+                    // does).
+                    let old = unsafe { std::slice::from_raw_parts(before.as_ptr().add(at), n) };
+                    let differ = host.iter().zip(old).filter(|(h, o)| h != o).count() as u64;
                     if differ > 0 {
                         pages += 1;
                         bytes += differ;
@@ -4434,6 +4458,56 @@ mod marked_tests {
         copy.marked.lock().unwrap().clear();
         drop(copy);
         super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
+        drop(memory);
+    }
+
+    /// A marked copy-back takes the title's bytes into the copy; the
+    /// snapshot of a declared range over the same page takes them too, so
+    /// that range's copy-back, which runs next, finds nothing new there and
+    /// leaves a title write made since alone (after upstream VIctory #2437).
+    #[test]
+    fn a_declared_copy_back_after_a_marked_one_keeps_newer_title_writes() {
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        let memory = vec![0u8; 2 * PAGE];
+        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let title = |at: usize| (page + at) as *mut u8;
+        let copy = exact(page as u64, PAGE as u64).unwrap();
+        assert!(copy.update(page, PAGE) > 0);
+        // Declared (with a snapshot) and armed over the same page.
+        copy.writing(page, PAGE);
+        // With the wide copy-back the snapshot is taken with the
+        // submission's others, after its refreshes.
+        super::take_snapshots();
+        assert!(
+            copy.before.lock().unwrap().as_ref().is_some_and(|b| b.capacity() >= PAGE),
+            "a snapshot of the page"
+        );
+        copy.marked.lock().unwrap().push((page, page + PAGE));
+        let before = vec![0u8; PAGE];
+        // A shader writes byte 10; the title writes byte 40 meanwhile.
+        // SAFETY: the copy's mapping, one page; our memory.
+        unsafe {
+            copy.data.add(10).write(0xaa);
+            title(40).write(0x11);
+        }
+        assert!(copy.copy_back_marked(page, &before) > 0);
+        // The title puts both bytes back as they were before the
+        // submission (as the snapshot holds them: the declared copy-back
+        // keeps a title byte that differs from the snapshot anyway).
+        // SAFETY: bytes of our memory.
+        unsafe {
+            title(10).write(0);
+            title(40).write(0);
+        }
+        assert_eq!(copy.copy_back(page, PAGE), 0, "nothing new for the declared copy-back");
+        // SAFETY: bytes of our memory.
+        let read = |at: usize| unsafe { title(at).read() };
+        assert_eq!((read(10), read(40)), (0, 0));
+        copy.marked.lock().unwrap().clear();
+        drop(copy);
+        super::EXACT.lock().unwrap().map.remove(&(page as u64, PAGE as u64));
         drop(memory);
     }
 }
