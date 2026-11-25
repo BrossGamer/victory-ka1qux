@@ -1,4 +1,4 @@
-# victory-ka1qux
+# BRVIctory-ka1qux
 
 Runs an Xbox Series title natively on Windows, from files the user supplies.
 A fork of [victory-fork](https://github.com/fxceless/victory-fork) by fxceless,
@@ -25,7 +25,7 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Boot, menus, saves | ✅ | work (as upstream) |
 | Getting into the world | ✅ | about 3 minutes from launch, with the caches warm and the movies skipped |
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts |
-| Light in shadow | ❌ | whatever the sun or a lamp does not reach directly is dark: the ray-traced light does not run |
+| Light in shadow | 🟡 | the ray-traced indirect light does not run; a constant stands in for it, so shaded places are lit but flat |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch |
 | Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3.5 with victory-fork's speed defaults (median 0.29 s, one run, on an earlier build) |
 | Stability | ✅ | no crash and no device removal in the last twenty-four runs (4 to 25 minutes each) |
@@ -34,9 +34,13 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 
 Known problems:
 
-- Whatever the sun or a lamp does not reach directly is dark. The title fills
-  shadow with ray-traced light, and its ray-tracing structures are not built
-  here (the builder is off).
+- The title fills shadow with ray-traced light, and its ray-tracing
+  structures are not built here (the builder is off). A constant stands in for
+  that light (below), so interiors and shaded places are lit, but flat.
+- In a cutscene at the start of the save used for testing, the main
+  character's torso shows the clothes of an earlier scene while the sleeves
+  are right: the title bakes the outfit before the new outfit's textures have
+  reached its memory. Under investigation.
 - Loading is slower than the title's clock. A scene starts before all of it
   has streamed in: the shell of the first room (walls and ceiling) arrives 10
   to 25 seconds into the opening shot, in every launch looked at. An earlier
@@ -138,8 +142,20 @@ missing in some launches and not in others):
 - `VICTORY_SKIP_MOVIES=1` ends the title's non-looping movies on their first
   playback tick (`all`: looping ones too).
 
+**Light**
+
+- While the ray-traced light does not run, the output of the program that
+  resolves the indirect diffuse light is replaced by a constant
+  (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the program's
+  output, which here is magenta on leaves and cloth and blocks of colour
+  indoors). After [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD).
+
 **Translator**
 
+- A pixel shader reads the other pixels of its 2x2 quad through quad reads,
+  helper pixels included: wave reads give 0 from helper pixels on AMD, so a
+  derivative a shader took by hand was wrong along every triangle's edge
+  (lines on paint, glass and skin). After Belobug/VIctory-Belobug-AMD.
 - Mesh primitive exports take 9-bit vertex indices (ported from upstream).
 - The valid-mask bit of a pixel export decides which pixels survive.
 - A heap buffer asked only for its size gets a non-uniform handle
@@ -232,6 +248,9 @@ repository.
   and most of what is merged here.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: fixes found
   on the same graphics card, some ported here.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+  a fork of upstream VIctory on another AMD card; the quad reads of pixel
+  shaders and the stand-in for indirect light are ported from it.
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.
