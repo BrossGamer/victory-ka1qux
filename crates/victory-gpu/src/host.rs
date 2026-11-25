@@ -7584,6 +7584,34 @@ fn refresh_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_ONCE").is_some_and(|v| v == "1"))
 }
 
+/// Whether two ranges of a copy brought up to date may count as one
+/// ([`Batch::brought`]): they meet across a page boundary, so that every
+/// page their union holds whole was held whole by one of them. Two parts
+/// of one page that touch do not.
+fn meet_across_pages(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0.max(b.0).div_ceil(crate::watch::PAGE) <= a.1.min(b.1) / crate::watch::PAGE
+}
+
+#[cfg(test)]
+mod brought_tests {
+    use super::meet_across_pages;
+    use crate::watch::PAGE;
+
+    /// Two parts of one page that touch are not one range brought up to
+    /// date (neither took the page); whole pages that meet, or ranges that
+    /// overlap across a boundary, are.
+    #[test]
+    fn only_ranges_meeting_across_a_page_boundary_join() {
+        let p = 16 * PAGE;
+        assert!(!meet_across_pages((p, p + 0x1000), (p + 0x1000, p + PAGE)), "two halves of a page");
+        assert!(!meet_across_pages((p, p + 0x1000), (p + 0x800, p + 0x2000)), "overlapping in a page");
+        assert!(meet_across_pages((p, p + PAGE), (p + PAGE, p + 2 * PAGE)), "whole pages meeting");
+        assert!(meet_across_pages((p + 0x1000, p + PAGE + 0x10), (p + PAGE - 0x10, p + 3 * PAGE)), "across a boundary");
+        assert!(!meet_across_pages((p, p + PAGE), (p + 2 * PAGE, p + 3 * PAGE)), "apart");
+        assert!(meet_across_pages((p, p + 4 * PAGE), (p + PAGE, p + 2 * PAGE)), "one inside the other");
+    }
+}
+
 /// A submission's refreshes not done yet, merged per buffer copy into the
 /// range that covers them: done before a step that writes title memory or
 /// gives a range to shaders, and before the lists run.
@@ -7654,8 +7682,13 @@ impl Batch {
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
-    /// up to date. Kept: its union with what was up to date if they touch,
-    /// else the larger of the two.
+    /// up to date. Kept: its union with what was up to date if they meet
+    /// across a page boundary, else the larger of the two. Two refreshes
+    /// that each took part of one page took neither whole (the page stays
+    /// written and unguarded, `watch::Tracked::take`): their union counted
+    /// as current would skip a later refresh of the whole page, so the page
+    /// would never be guarded again and never armed for marked writes
+    /// (after upstream VIctory #2474).
     fn brought(
         current: &mut std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -7668,7 +7701,7 @@ impl Batch {
         let entry = current
             .entry(std::sync::Arc::as_ptr(shadow) as usize)
             .or_insert_with(|| (shadow.clone(), from, to));
-        if from <= entry.2 && entry.1 <= to {
+        if meet_across_pages((entry.1, entry.2), (from, to)) {
             (entry.1, entry.2) = (entry.1.min(from), entry.2.max(to));
         } else if to - from > entry.2 - entry.1 {
             (entry.1, entry.2) = (from, to);
