@@ -740,6 +740,12 @@ impl TextureQueue {
         self.slots.insert(index, Waiting::new(due, frame, write));
     }
 
+    /// Slots that wait for an upload (not those uploaded whole that only
+    /// wait for a look at their memory).
+    fn uploads_waiting(&self) -> usize {
+        self.slots.values().filter(|w| w.relook.is_none()).count()
+    }
+
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
@@ -1400,12 +1406,21 @@ impl HostHeap {
         counts: &mut [u64; 10],
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        /// Put back per part, and only while the queue is shorter than
-        /// this: a view the title forgot to clear may be among them, and
-        /// the queue serves the newest first.
+        /// Put back per part, and only while fewer slots than this wait for
+        /// an upload: a view the title forgot to clear may be among them,
+        /// and the queue serves the newest first.
         const MOST: u32 = 128;
         const SHORT: usize = 4_000;
         let mut back = 0;
+        // What waits for an upload, not the slots uploaded whole that only
+        // wait for looks at their memory: counted with those, the queue
+        // held some 17,000 slots and nothing was put back (10,378 views
+        // with memory that nothing would bring up to date at the end of a
+        // run, 899 put back in all). `VICTORY_SWEEP_GATE=all` counts them
+        // as before.
+        static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let all = *ALL.get_or_init(|| std::env::var("VICTORY_SWEEP_GATE").as_deref() == Ok("all"));
+        let mut waiting: Option<usize> = None;
         // The slots whose host slot does not show what the title's says.
         let mut unmade = Vec::new();
         {
@@ -1485,9 +1500,15 @@ impl HostHeap {
             }
             if put_back && back < MOST && matches!(claim, Claim::Own | Claim::Free) {
                 let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-                if textures.slots.len() < SHORT {
+                let queued = if all {
+                    textures.slots.len()
+                } else {
+                    *waiting.get_or_insert_with(|| textures.uploads_waiting())
+                };
+                if queued < SHORT {
                     textures.written(index, frame, frame + 1, false);
                     back += 1;
+                    waiting = waiting.map(|n| n + 1);
                     SWEPT[10].fetch_add(1, Relaxed);
                 }
             }
@@ -3466,6 +3487,19 @@ mod tests {
         let write = q.writes;
         assert!(!q.uploaded_whole(index, write, frame, (0x1000 * u64::from(index), 4096), print));
         write
+    }
+
+    /// Slots uploaded whole that only wait for looks at their memory do not
+    /// count as waiting for an upload (the sweep's gate).
+    #[test]
+    fn slots_waiting_for_looks_are_not_uploads_waiting() {
+        let mut q = TextureQueue::default();
+        for index in 0..5 {
+            uploaded(&mut q, index, 10, 7);
+        }
+        q.written(9, 10, 11, false);
+        assert_eq!(q.slots.len(), 6);
+        assert_eq!(q.uploads_waiting(), 1);
     }
 
     /// The looks at a texture the title filled after its upload come at
