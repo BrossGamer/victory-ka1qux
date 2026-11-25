@@ -503,6 +503,16 @@ fn walls_request(request: &Request, result: &Result<(), HRESULT>, started: std::
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    // `VICTORY_DISK_CORES=slow`: the workers leave the fast cores to the
+    // title's threads (`victory_gpu::framelog::keep_on_slow_cores`; off by
+    // default until it is measured).
+    #[cfg(windows)]
+    {
+        static SLOW: OnceLock<bool> = OnceLock::new();
+        if *SLOW.get_or_init(|| std::env::var_os("VICTORY_DISK_CORES").is_some_and(|v| v == "slow")) {
+            victory_gpu::framelog::keep_on_slow_cores("dstorage worker");
+        }
+    }
     let mut lanes = scheduler.lock();
     loop {
         let Some(job) = lanes.start() else {
@@ -532,6 +542,13 @@ impl Lanes {
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
         *busy += started.elapsed();
+        #[cfg(windows)]
+        {
+            use victory_gpu::framelog::{T, add};
+            add(T::DiskReads, 1);
+            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskUs, started.elapsed().as_micros() as u64);
+        }
         if job.request.options & BCPACK != 0 {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
@@ -883,8 +900,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
+        // at the failed request (runs amd-C and amd-C2, seconds after the
+        // world's first frame). It is read beside and copied in: our copy
+        // faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data)?;
+            out.copy_from_slice(&data);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1054,22 +1088,30 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
-        let _writing = victory_gpu::kernel_will_write(request.destination as usize, len);
+        // Opens the guarded blocks, holds them open until the bytes are in,
+        // and tells the GPU side a placed texture there changes.
+        let writing = victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let n = fill(out)?;
+        let filled = fill(out);
+        drop(writing);
         #[cfg(feature = "diagnostics")]
-        victory_gpu::bake_probe_note(
-            victory_gpu::BakeProbeWriter::DstorageToAddress,
-            request.destination as usize,
-            n,
-            PROBE_TAG.get(),
-        );
-        let _ = n;
-        return Ok(());
+        if let Ok(n) = filled {
+            victory_gpu::bake_probe_note(
+                victory_gpu::BakeProbeWriter::DstorageToAddress,
+                request.destination as usize,
+                n,
+                PROBE_TAG.get(),
+            );
+        }
+        // Said again now that the bytes are there (upstream's c75fdba holds
+        // the blocks open over the read and marks them once more at its
+        // end): a copy or a texture pass that took the memory while the
+        // read was under way took what was there before. Counted; acted on
+        // only with `VICTORY_PAGE_WRITES=all`.
+        victory_gpu::title_memory_written(request.destination as usize, len, false);
+        return filled.map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let list = request.destination.cast::<usize>();
@@ -1078,10 +1120,11 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
-        let n = fill(window.bytes())?;
+        let filled = fill(window.bytes());
         drop(window);
-        pages_written(&pages, offset, n);
-        return Ok(());
+        // After a decode that failed part way too: what it wrote is there.
+        pages_written(&pages, offset, *filled.as_ref().unwrap_or(&len));
+        return filled.map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1128,20 +1171,39 @@ fn into_destination(
     // A page the title has just made, or a view the host refuses for a moment (commit
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
-    // about 1.5 s in all), each time with the list as it is then.
+    // about 1.5 s in all; 0: not tried again), each time with the list as it is then.
     static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
+        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12)
     });
+    // Since the start: writes that succeeded on a later try, and writes
+    // given up.
+    static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
     for tries in 0..retries {
         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
         let again = page_list(list, count);
         if !again.contains(&0) && super::xmem::write_physical(&again, offset, &data[..n]) {
             pages_written(&again, offset, n);
-            tracing::info!(offset, len, tries = tries + 1, "dstorage: a destination's physical pages written after a retry");
+            let on_a_retry = RETRIED[0].fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::info!(
+                offset,
+                len,
+                tries = tries + 1,
+                on_a_retry,
+                given_up = RETRIED[1].load(Ordering::Relaxed),
+                "dstorage: a destination's physical pages written after a retry"
+            );
             return Ok(());
         }
     }
+    let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(
+        tries = retries,
+        given_up,
+        on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+        last_error = std::io::Error::last_os_error().raw_os_error(),
+        "dstorage: retries used up (VICTORY_DSTORAGE_RETRIES)"
+    );
     // Said aloud: the title never reads a request's result
     // (it only polls for completion), so a destination left unwritten
     // is a model or texture that silently holds whatever its pages
@@ -1205,16 +1267,10 @@ fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_SHOWN").is_none_or(|v| v != "0")) {
         return;
     }
-    let runs = super::xmem::shown_at(pages, offset, len);
-    if runs.is_empty() {
-        return;
-    }
-    SHOWN[0].fetch_add(1, Ordering::Relaxed);
-    for (at, bytes) in runs {
-        SHOWN[1].fetch_add(bytes as u64, Ordering::Relaxed);
-        // The write is done: what is returned (a hold on the guards while a
-        // write is under way) is let go at once.
-        drop(victory_gpu::kernel_will_write(at, bytes));
+    let shown = super::xmem::pages_written(pages, offset, len);
+    if shown > 0 {
+        SHOWN[0].fetch_add(1, Ordering::Relaxed);
+        SHOWN[1].fetch_add(shown as u64, Ordering::Relaxed);
     }
 }
 
