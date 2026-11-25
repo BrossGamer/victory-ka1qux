@@ -347,6 +347,15 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let (Some(level), Some(host)) = (level(), host()) else {
         return false;
     };
+    // While the ray-tracing structure builder runs whole the resolve's
+    // light is the traced one: left as it is, unless
+    // `VICTORY_AMBIENT_WITH_RAYS=1` (to compare).
+    static WITH_RAYS: OnceLock<bool> = OnceLock::new();
+    if crate::pipeline::structures_built()
+        && !*WITH_RAYS.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_WITH_RAYS").is_some_and(|v| v == "1"))
+    {
+        return false;
+    }
     let Some(light) = crate::resource::host_resource(light) else {
         return false;
     };

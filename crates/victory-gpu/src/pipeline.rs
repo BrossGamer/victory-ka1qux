@@ -264,6 +264,14 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
 #[cfg(windows)]
 static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the structure builder runs whole now (its structures are
+/// built): the ray-traced light is the title's own, and the stand-in for
+/// it (`crate::ambient`) steps aside.
+#[cfg(windows)]
+pub(crate) fn structures_built() -> bool {
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the programs that walk the title's ray-tracing structures may
 /// read their nodes (`victory_shader::emit::USER_STRUCTURES`); while not,
 /// every node test of theirs answers no hit without reading memory: no box
