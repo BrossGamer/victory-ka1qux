@@ -477,6 +477,54 @@ fn card_clock_watch(clock: &'static CardClock) {
     }
 }
 
+/// After the frame-rate line (diagnostics): where the heap's pass over
+/// buffer views and textures picked by index spent its time since the last
+/// such line (`crate::draw::split`), per frame, with the longest pass and
+/// the longest single texture slot. The frame-rate line's "heap buffers"
+/// field covers only its last second.
+#[cfg(feature = "diagnostics")]
+fn heap_pass_line() {
+    use crate::draw::split as s;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let frame = crate::frame::current();
+    let last = LAST.swap(frame, Ordering::Relaxed);
+    let v = crate::draw::take_heap_pass_split();
+    if last == u64::MAX {
+        return;
+    }
+    let frames = frame.saturating_sub(last).max(1) as f64;
+    let ms = |i: usize| v[i] as f64 / 1000.0 / frames;
+    let n = |i: usize| v[i] as f64 / frames;
+    tracing::info!(
+        "the heap's pass per frame over {frames:.0} frames: buffer views {:.1} ms ({:.0} slots), host copies brought up \
+         to date {:.1} ms ({:.0} copies, {:.0} MB); textures picked by index: held slots released and memory mapped since {:.1} ms, sweep {:.1} ms, \
+         looks {:.1} ms, due slots {:.1} ms; slots that uploaded {:.1} ms ({:.1} textures, {:.1} ms of it making host \
+         views), other slots {:.1} ms ({:.1} passed over unmapped, {:.1} refused for no room); of the passes since the line, \
+         {} with room, {} stopped on their time, {} on the full card's time (VICTORY_TEXTURE_FULL_MS); the longest pass {:.1} ms, \
+         the longest slot {:.1} ms",
+        ms(s::SLOTS_US),
+        n(s::SLOTS),
+        ms(s::REFRESH_US),
+        n(s::SPANS),
+        n(s::SPAN_BYTES) / 1e6,
+        ms(s::REMAPPED_US),
+        ms(s::SWEEP_US),
+        ms(s::RELOOK_US),
+        ms(s::DUE_US),
+        ms(s::MADE_US),
+        n(s::MADE),
+        ms(s::MIRROR_US),
+        ms(s::OTHER_US),
+        n(s::AWAY),
+        n(s::REFUSED),
+        v[s::WITH_ROOM],
+        v[s::STOPPED_ON_TIME],
+        v[s::CAPPED],
+        v[s::LONGEST_PASS_US] as f64 / 1000.0,
+        v[s::LONGEST_SLOT_US] as f64 / 1000.0,
+    );
+}
+
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
 fn card_clock_line(frames: f64, ms: f64) {
@@ -8416,6 +8464,8 @@ impl Meter {
                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
             );
+            #[cfg(feature = "diagnostics")]
+            heap_pass_line();
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);

@@ -389,6 +389,140 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Where the heap's pass ([`State::heap_buffers`]) spends its time, since
+/// the last frame line (diagnostics builds; [`take_heap_pass_split`]):
+/// indices are the constants of [`split`]. Only the passes the heap's pass
+/// runs are counted here, not the early ones before a frame's first draws.
+#[cfg(feature = "diagnostics")]
+static HEAP_PASS_SPLIT: [AtomicU64; split::LEN] = [const { AtomicU64::new(0) }; split::LEN];
+
+/// The parts of [`HEAP_PASS_SPLIT`].
+pub(crate) mod split {
+    /// Microseconds mirroring the buffer views' slots, and slots looked at.
+    pub(crate) const SLOTS_US: usize = 0;
+    pub(crate) const SLOTS: usize = 1;
+    /// Microseconds bringing host copies up to date, the copies, and the
+    /// bytes their spans cover.
+    pub(crate) const REFRESH_US: usize = 2;
+    pub(crate) const SPANS: usize = 3;
+    pub(crate) const SPAN_BYTES: usize = 4;
+    /// The texture pass before its loop: slots held back on a full card
+    /// released and memory the runtime mapped, the sweep of views, the
+    /// looks at uploaded textures, and the levels remade with the queue's
+    /// due slots and the card's accounting.
+    pub(crate) const REMAPPED_US: usize = 5;
+    pub(crate) const SWEEP_US: usize = 6;
+    pub(crate) const RELOOK_US: usize = 7;
+    pub(crate) const DUE_US: usize = 8;
+    /// The texture pass's loop: microseconds in slots that uploaded a
+    /// texture, how many, the microseconds of those in making the host
+    /// view (and with it the host texture), and microseconds in the slots
+    /// that uploaded nothing.
+    pub(crate) const MADE_US: usize = 9;
+    pub(crate) const MADE: usize = 10;
+    pub(crate) const MIRROR_US: usize = 11;
+    pub(crate) const OTHER_US: usize = 12;
+    /// Slots passed over unmapped, and slots refused for want of room.
+    pub(crate) const AWAY: usize = 13;
+    pub(crate) const REFUSED: usize = 14;
+    /// Passes that had room, passes whose loop stopped on its time, and
+    /// passes whose time was the full card's ([`super::full_card_span`]).
+    pub(crate) const WITH_ROOM: usize = 15;
+    pub(crate) const STOPPED_ON_TIME: usize = 16;
+    pub(crate) const CAPPED: usize = 17;
+    /// The longest pass, and the longest single slot of the loop
+    /// (microseconds; maxima, not sums).
+    pub(crate) const LONGEST_PASS_US: usize = 18;
+    pub(crate) const LONGEST_SLOT_US: usize = 19;
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) const LEN: usize = 20;
+}
+
+/// Adds `v` to part `i` of [`HEAP_PASS_SPLIT`] (nothing without
+/// diagnostics).
+#[inline]
+fn split_add(i: usize, v: u64) {
+    #[cfg(feature = "diagnostics")]
+    HEAP_PASS_SPLIT[i].fetch_add(v, Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (i, v);
+}
+
+/// Raises part `i` of [`HEAP_PASS_SPLIT`] to `v` (a maximum).
+#[inline]
+fn split_max(i: usize, v: u64) {
+    #[cfg(feature = "diagnostics")]
+    HEAP_PASS_SPLIT[i].fetch_max(v, Ordering::Relaxed);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = (i, v);
+}
+
+/// The microseconds since `at`.
+fn micros(at: std::time::Instant) -> u64 {
+    at.elapsed().as_micros() as u64
+}
+
+/// [`HEAP_PASS_SPLIT`] since the last call, and from zero again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_heap_pass_split() -> [u64; split::LEN] {
+    HEAP_PASS_SPLIT.each_ref().map(|c| c.swap(0, Ordering::Relaxed))
+}
+
+/// When the pass over textures picked by index last found the card without
+/// room for new ones (`crate::host::now_ms` plus one; 0: never).
+static LAST_FULL_MS: AtomicU64 = AtomicU64::new(0);
+
+/// How long the card counts as at its line after the pass last found it
+/// without room.
+const FULL_LATELY_MS: u64 = 10_000;
+
+/// The time a pass over textures picked by index may take while the card
+/// is at its line for new host textures (it found no room in the last ten
+/// seconds), in place of the pass's own (`VICTORY_TEXTURE_STAGE_MS`, three
+/// times that for a backlog): `VICTORY_TEXTURE_FULL_MS`, 50; 0: none, as
+/// before. Bake passes keep theirs.
+///
+/// With the card at its line the queue only moves as fast as host
+/// textures are let go: the open world held 9,000 to 15,000 slots due, so
+/// the backlog's threefold time was always on, and when some tens of MB
+/// were let go the next pass made textures for up to 750 ms of one frame
+/// (some 1,500 small ones, about 2 ms each), where the pass otherwise took
+/// 15 to 35 ms: the frames of 0.6 to 1 s among frames of 0.3 s. Spread over
+/// frames, the same textures are made in the same order.
+///
+/// With the slots a full card turns down held back ([`full_card_pass`]),
+/// the first pass that finds room makes all of them due at once, which is
+/// when the burst comes: this time bounds that pass, and the rest wait
+/// for the passes after it. The time also bounds a pass that holds slots
+/// back: one that stops on it before its 1,025th refusal leaves the rest
+/// due for the next pass, which goes on past the ones held.
+pub(crate) fn full_card_span() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_FULL_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+    });
+    let last = LAST_FULL_MS.load(Ordering::Relaxed);
+    (ms > 0 && last > 0 && crate::host::now_ms().saturating_sub(last - 1) < FULL_LATELY_MS)
+        .then(|| std::time::Duration::from_millis(ms))
+}
+
+/// The bytes and the time of the heap's pass over textures picked by index:
+/// its own (`per_frame`, `span`), three times both for a `backlog`, and no
+/// more time than the full card's (`full`, [`full_card_span`]) while the
+/// card is at its line, backlog or not.
+fn texture_pass_budget(
+    per_frame: u64,
+    span: std::time::Duration,
+    backlog: bool,
+    full: Option<std::time::Duration>,
+) -> (u64, std::time::Duration) {
+    match full {
+        Some(full) => (per_frame, full.min(span)),
+        None if backlog => (per_frame * 3, span * 3),
+        None => (per_frame, span),
+    }
+}
+
 /// Since the start, for textures picked by index that were uploaded whole
 /// and are looked at again ([`relook_textures`]): looks made, looks that
 /// found the memory changed (each puts the slot back for an upload), and
@@ -1515,6 +1649,7 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        split_add(split::SLOTS, slots.len() as u64);
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1550,6 +1685,8 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        split_add(split::SLOTS_US, micros(started));
+        let refreshing = std::time::Instant::now();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1593,11 +1730,15 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        split_add(split::REFRESH_US, micros(refreshing));
+        split_add(split::SPANS, spans.len() as u64);
+        split_add(split::SPAN_BYTES, bytes);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        split_max(split::LONGEST_PASS_US, micros(started));
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -1832,6 +1973,12 @@ impl State {
         else {
             return false;
         };
+        // The frame's early pass, not a bake's: no longer than the full
+        // card's time while the card is at its line ([`full_card_span`]).
+        let budget = match full_card_span() {
+            Some(full) if !bake => (budget.0.min(full.as_millis() as u64), budget.1),
+            _ => budget,
+        };
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         if bake && n.is_power_of_two() {
             let [slots, due, ..] = HEAP_TEXTURES_QUEUE.each_ref().map(|c| c.load(Ordering::Relaxed));
@@ -2020,9 +2167,19 @@ impl State {
         let mut since_asked = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
+            LAST_FULL_MS.store(crate::host::now_ms() + 1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
+        // The heap's own pass (not an early one): its parts are counted.
+        let counted = PASS_BUDGET.get().is_none();
+        let add = |i: usize, v: u64| {
+            if counted {
+                split_add(i, v);
+            }
+        };
+        add(split::WITH_ROOM, u64::from(room));
         let mut refused = 0;
+        let part = std::time::Instant::now();
         // Room again: the slots held back while the card was full are due
         // now (`full_card_pass`).
         if room {
@@ -2031,10 +2188,16 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
+        add(split::REMAPPED_US, micros(part));
+        let part = std::time::Instant::now();
         host.texture_sweep(heap, frame);
+        add(split::SWEEP_US, micros(part));
+        let part = std::time::Instant::now();
         if heap_recheck() {
             relook_textures(host, frame);
         }
+        add(split::RELOOK_US, micros(part));
+        let part = std::time::Instant::now();
         // Levels on demand: the slots of textures whose first level with
         // memory changed since the last pass are made again from it.
         host.texture_views_remade();
@@ -2064,6 +2227,7 @@ impl State {
         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
         // room, and every five seconds after it).
         Self::card_accounting(heap, host, frame, room);
+        add(split::DUE_US, micros(part));
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
@@ -2098,7 +2262,12 @@ impl State {
         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
+        // Not while the card is at its line ([`full_card_span`]): the
+        // backlog then waits for room, not for time, and the pass gets the
+        // full card's time.
+        let full = if counted { full_card_span() } else { None };
+        let (per_frame, span) = texture_pass_budget(per_frame, span, catchup && due.len() >= 1024, full);
+        add(split::CAPPED, u64::from(full.is_some()));
         // A run made early (`State::early_textures`) has a budget of its
         // own: its bytes on top of what the frame has spent so far.
         // (Not `most`: that is the longest wait between looks, used below.)
@@ -2109,10 +2278,30 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Per slot of the loop: when it began, and whether it uploaded.
+        let mut slot: Option<std::time::Instant> = None;
+        let mut slot_made = false;
+        // This pass's slots: uploaded, passed over unmapped, and the
+        // microseconds of the uploads in making their host views.
+        let (mut made, mut away, mut mirror_us) = (0u64, 0u64, 0u64);
+        let spent_before = SPENT.load(Ordering::Relaxed);
+        let end_slot = |slot: &mut Option<std::time::Instant>, made: bool| {
+            if let Some(at) = slot.take() {
+                let us = micros(at);
+                add(if made { split::MADE_US } else { split::OTHER_US }, us);
+                if counted {
+                    split_max(split::LONGEST_SLOT_US, us);
+                }
+            }
+        };
         for (at, (index, write)) in due.into_iter().enumerate() {
+            end_slot(&mut slot, slot_made);
+            slot_made = false;
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                add(split::STOPPED_ON_TIME, u64::from(began.elapsed() > span));
                 break;
             }
+            slot = Some(std::time::Instant::now());
             let bake_source = at < firsts;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -2134,6 +2323,8 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+                    add(split::AWAY, 1);
+                    away += 1;
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index, write);
                     host.texture_slot_later(index, write, frame, most);
@@ -2184,6 +2375,7 @@ impl State {
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
                     refused += 1;
+                    add(split::REFUSED, 1);
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
@@ -2206,7 +2398,9 @@ impl State {
                     );
                 }
             }
+            let mirroring = std::time::Instant::now();
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            let mirrored = micros(mirroring);
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2284,9 +2478,17 @@ impl State {
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
                 room = crate::resource::room();
+                if !room {
+                    LAST_FULL_MS.store(crate::host::now_ms() + 1, Ordering::Relaxed);
+                }
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            slot_made = true;
+            made += 1;
+            mirror_us += mirrored;
+            add(split::MADE, 1);
+            add(split::MIRROR_US, mirrored);
             if bake_source {
                 BAKE_SOURCES_SEEN[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -2303,6 +2505,33 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
+        end_slot(&mut slot, slot_made);
+        // A long pass of the heap's own, named (diagnostics: the first 20,
+        // then every 50th).
+        #[cfg(feature = "diagnostics")]
+        if counted && began.elapsed() >= std::time::Duration::from_millis(100) {
+            static LONG: AtomicU64 = AtomicU64::new(0);
+            let n = LONG.fetch_add(1, Ordering::Relaxed);
+            if n < 20 || n.is_multiple_of(50) {
+                tracing::info!(
+                    frame,
+                    loop_ms = began.elapsed().as_millis() as u64,
+                    span_ms = span.as_millis() as u64,
+                    room,
+                    full_card_time = full.is_some(),
+                    due_at_start = census[1],
+                    made,
+                    made_mb = SPENT.load(Ordering::Relaxed).saturating_sub(spent_before) >> 20,
+                    mirror_ms = mirror_us / 1000,
+                    away,
+                    refused,
+                    long_passes = n + 1,
+                    "a long pass over textures picked by index"
+                );
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (made, away, mirror_us, spent_before, census);
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group
@@ -3982,6 +4211,19 @@ mod early_textures_tests {
             Some(((12, 64 << 20), false))
         );
         assert_eq!(baked_ms.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a_full_card_caps_the_texture_pass_time_and_drops_the_backlog_share() {
+        let ms = std::time::Duration::from_millis;
+        // Its own budget, and three times it for a backlog.
+        assert_eq!(super::texture_pass_budget(192, ms(250), false, None), (192, ms(250)));
+        assert_eq!(super::texture_pass_budget(192, ms(250), true, None), (576, ms(750)));
+        // At the card's line: the full card's time, backlog or not.
+        assert_eq!(super::texture_pass_budget(192, ms(250), true, Some(ms(50))), (192, ms(50)));
+        assert_eq!(super::texture_pass_budget(192, ms(250), false, Some(ms(50))), (192, ms(50)));
+        // Never more than its own.
+        assert_eq!(super::texture_pass_budget(192, ms(20), true, Some(ms(50))), (192, ms(20)));
     }
 
     #[test]
