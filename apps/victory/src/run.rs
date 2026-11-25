@@ -4,6 +4,52 @@ use anyhow::{Context, Result};
 
 use crate::{Console, Unimplemented};
 
+/// Optional code patches from `VICTORY_PATCH`: `rva=hexbytes[:expected],…`,
+/// e.g. `0x1000=31c0c3:4883ec28` (write `xor eax,eax; ret` at RVA 0x1000
+/// only if the original bytes there start with `48 83 ec 28`). Applied to
+/// the prepared copy in memory, never to the title's files.
+/// (From LilBigJP/ztrx-ps5-save-import, GPL-3.0-or-later.)
+fn apply_byte_patches(prepared: &mut victory_loader::PreparedImage) -> Result<()> {
+    let Ok(spec) = std::env::var("VICTORY_PATCH") else {
+        return Ok(());
+    };
+    let hex = |s: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(s.len() % 2 == 0, "odd hex length in VICTORY_PATCH: {s}");
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("bad hex in VICTORY_PATCH"))
+            .collect()
+    };
+    for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (at, rest) = item.split_once('=').context("VICTORY_PATCH item needs rva=bytes")?;
+        let rva = u32::from_str_radix(at.trim_start_matches("0x"), 16).context("bad rva")?;
+        let (new, expected) = match rest.split_once(':') {
+            Some((n, e)) => (hex(n)?, Some(hex(e)?)),
+            None => (hex(rest)?, None),
+        };
+        let off = prepared
+            .info
+            .rva_to_file_offset(rva)
+            .with_context(|| format!("VICTORY_PATCH rva {rva:#x} is not file-backed"))?
+            as usize;
+        let slot = prepared
+            .bytes
+            .get_mut(off..off + new.len().max(expected.as_ref().map_or(0, Vec::len)))
+            .with_context(|| format!("VICTORY_PATCH rva {rva:#x} outside the image"))?;
+        if let Some(e) = &expected {
+            anyhow::ensure!(
+                slot.starts_with(e),
+                "VICTORY_PATCH rva {rva:#x}: found {:02x?}, expected {:02x?}; not patching",
+                &slot[..e.len()],
+                e
+            );
+        }
+        println!("patch          {rva:#x}: {:02x?} -> {:02x?}", &slot[..new.len()], new);
+        slot[..new.len()].copy_from_slice(&new);
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -20,7 +66,8 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
+    apply_byte_patches(&mut prepared)?;
     let hash = prepared.original_hash.to_hex();
     match victory_game::identify(&hash) {
         Some(build) => println!("build          {} ({hash})", build.label),
