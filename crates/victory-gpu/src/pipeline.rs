@@ -626,8 +626,25 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
-        let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let mut list = match std::env::var("VICTORY_SKIP_PIPELINES") {
+            Ok(val) if val.trim().eq_ignore_ascii_case("none") => Vec::new(),
+            Ok(val) => parse_skip_hashes(&val),
+            Err(_) => Vec::new(),
+        };
+        // Compute shader f133e35efed2a48a (wave64 split-scalar lane-mask loop
+        // enabled in 961ecb6) enters an infinite compute batch-buffer hang
+        // (`GEN12_DX12COMPUTE_BBHANG` / `dd180957`) on Wave32 Intel Arc right
+        // at world entry (`frame=908`). Skip it by default on Intel adapters
+        // unless `VICTORY_SKIP_PIPELINES=none` is set explicitly.
+        if crate::caps::intel_host_vram_mb().is_some()
+            && std::env::var("VICTORY_SKIP_PIPELINES")
+                .ok()
+                .is_none_or(|v| !v.trim().eq_ignore_ascii_case("none"))
+            && !list.iter().any(|h| h == "f133e35efed2a48a")
+        {
+            list.push("f133e35efed2a48a".to_owned());
+        }
+        list
     });
     if hashes.is_empty() {
         return None;

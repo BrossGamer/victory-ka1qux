@@ -32,7 +32,7 @@ $env:VICTORY_ADAPTER = $Adapter
 #   GEN12_DX12COMPUTE_BBHANG / PAGEFAULT from dropped Wave64 compute passes)
 #   without clamping or charging mesh/vertex draws.
 Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
-$env:VICTORY_INDIRECT_CLAMP = "1"
+$env:VICTORY_INDIRECT_CLAMP = "compute"
 $env:VICTORY_SKIP_MOVIES    = "1"
 $env:VICTORY_RAYS           = if ($Rays) { "1" } else { "0" }
 

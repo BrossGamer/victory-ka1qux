@@ -411,10 +411,16 @@ pub(crate) fn parse_clamp_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     parse_clamp_mode(value) == ClampMode::All
 }
 
-/// Configured [`ClampMode`] from `VICTORY_INDIRECT_CLAMP`.
+/// Configured [`ClampMode`] from `VICTORY_INDIRECT_CLAMP` (defaults to
+/// [`ClampMode::ComputeOnly`] on Intel Arc hosts where full draw budget
+/// clamping stalls world entry `dd180957` while `Off` hits `DX12COMPUTE_BBHANG`).
 pub(crate) fn clamp_mode() -> ClampMode {
     static MODE: std::sync::OnceLock<ClampMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| parse_clamp_mode(std::env::var_os("VICTORY_INDIRECT_CLAMP").as_deref()))
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_INDIRECT_CLAMP") {
+        Some(val) => parse_clamp_mode(Some(val.as_os_str())),
+        None if crate::caps::intel_host_vram_mb().is_some() => ClampMode::ComputeOnly,
+        None => ClampMode::All,
+    })
 }
 
 /// Whether indirect arguments of this kind (`is_compute` = `DISPATCH`) are

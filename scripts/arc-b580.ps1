@@ -25,7 +25,7 @@ $env:VICTORY_ADAPTER = $Adapter
 # - VICTORY_INDIRECT_CLAMP=compute bounds DispatchIndirect records without
 #   clamping or charging mesh/vertex draws.
 Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
-$env:VICTORY_INDIRECT_CLAMP       = "1"
+$env:VICTORY_INDIRECT_CLAMP       = "compute"
 $env:VICTORY_SKIP_MOVIES          = "1"
 $env:VICTORY_RAYS                 = if ($Rays) { "1" } else { "0" }
 $env:VICTORY_TEXTURE_ROOM_PERCENT = "92"
