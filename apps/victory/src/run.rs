@@ -14,7 +14,7 @@ fn apply_byte_patches(prepared: &mut victory_loader::PreparedImage) -> Result<()
         return Ok(());
     };
     let hex = |s: &str| -> Result<Vec<u8>> {
-        anyhow::ensure!(s.len() % 2 == 0, "odd hex length in VICTORY_PATCH: {s}");
+        anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length in VICTORY_PATCH: {s}");
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("bad hex in VICTORY_PATCH"))
