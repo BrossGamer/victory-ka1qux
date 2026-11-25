@@ -27,7 +27,7 @@ Medido em **Windows 10 Enterprise LTSC (19044)**, `Intel(R) Arc(TM) A770 Graphic
 
 | Propriedade / Subsistema | Arc A770 16 GB (medido) | Arc B580 12 GB (Xe2 esperado) | Adaptação no código |
 |---|---|---|---|
-| VRAM dedicada | `16258 MB` (ou `8192 MB`) | `~12288 MB` | Orçamentos separados em `scripts\arc-a770.ps1` e `scripts\arc-b580.ps1` |
+| VRAM dedicada | `16258 MB` (ou `8192 MB`) | `~12288 MB` | Orçamento dinâmico via DXGI `QueryVideoMemoryInfo` (`VICTORY_TEXTURE_ROOM_PERCENT=96` na A770 16 GB, `92` na B580 12 GB) |
 | Shader Model máximo | `6.8` (via Agility SDK; `6.5` sem ele no Win10) | `6.8` | `victory_gpu::agility` exporta `D3D12SDKVersion = 616` e `D3D12SDKPath` |
 | `WaveLaneCountMin..Max` | `8..32` (SIMD8 / SIMD16 / SIMD32) | `16..32` (SIMD16 / SIMD32) | Compute shaders com wave ops recebem `WaveSize(32)` automaticamente (`pins_wave`) e `wave64` do console divide em `2x wave32` |
 | `DoublePrecisionFloatShaderOps` | `false` (sem `f64` nativo em hardware) | `false` / emulado | `WaveActiveSum` de `f64` (`active_f64_sum`) baixa para soma IEEE-754 exata em inteiros de 32/64 bits sem exigir `DOUBLES` |
@@ -35,8 +35,8 @@ Medido em **Windows 10 Enterprise LTSC (19044)**, `Intel(R) Arc(TM) A770 Graphic
 | `DepthBoundsTestSupported` | `true` | `true` | Pipeline stream `DEPTH_STENCIL1` + `OMSetDepthBounds` validado no hardware |
 | Limite do heap de views | `1,000,000` (`PORTABLE_VIEWS`) | `1,000,000` | `probe_view_limit` escolhe o slot nulo `999,999` desde o primeiro shader |
 | `AtomicInt64OnDescriptorHeapResource` | `true` | `true` | Buffers 64-bit em `ResourceDescriptorHeap[]` funcionam nativamente |
-| `AtomicInt64OnTypedResource` | `false` | `true` (novo no Xe2) | Na A770, shaders com atomics 64-bit em texturas tipadas (`R32G32_UINT`) têm o PSO recusado sem travar; na B580 funcionam nativamente |
-| `BarycentricsSupported` (`SV_Barycentrics`) | `false` (neste driver) | verificar via `gpu-info` | Reportado por `victory gpu-info` |
+| `AtomicInt64OnTypedResource` | `false` | `true` (novo no Xe2) | Na A770, atomics 64-bit em texturas tipadas (`R32G32_UINT`) baixam automaticamente para leitura/ALU `i64`/escrita `uint2`; na B580 rodam nativamente |
+| `BarycentricsSupported` (`SV_Barycentrics`) | `false` (neste driver) | verificar via `gpu-info` | Quando `false`, `SV_Barycentrics` e `attributeAtVertex` baixam automaticamente para interpolante comum `BARYC` e interpolação de hardware |
 | Arredondamento `f32tof16` (`v_add_f16`) | Para zero (`0x4201`, igual NVIDIA) | Para zero / par | `VICTORY_F16_NEAREST=1` força arredondamento exato do console (`0x4202`) se necessário |
 | Memória *in-place* (`OpenExistingHeapFromAddress1`) | `true` (leitura e escrita, `0.7 ms` / 4 MB) | `true` | Suportado via `VICTORY_INPLACE=1` quando Agility SDK está ativo |
 
@@ -65,6 +65,8 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
    ```
 2. Carregue o perfil da sua placa na sessão do PowerShell:
    ```powershell
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
    # Para Intel Arc A770 16 GB:
    . .\scripts\arc-a770.ps1
 
@@ -94,6 +96,9 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
 |---|---|
 | `VICTORY_ADAPTER=A770` (ou `B580`, `0`, `1`) | Escolhe explicitamente o adaptador DXGI |
 | `VICTORY_SOFT_F64=1` | Força a soma `f64` em inteiros mesmo em GPUs que declaram `doubles = true` |
+| `VICTORY_SOFT_TYPED_ATOMIC64=1` (`=0` desliga) | Controla o fallback de atomics 64-bit em texturas tipadas (`RWTexture*<uint2>`) |
+| `VICTORY_WAVE_WIDE=1` | Reduz recusas de compute shaders `wave64` com branches por lane |
+| `VICTORY_BAKE_PROBE=1` | Diagnostica estado das texturas lidas e hash do resultado dos *bakes* de pele e roupas |
 | `VICTORY_F16_NEAREST=1` | Arredondamento `f16` idêntico ao console (troca truncamento do `f32tof16` da Arc por round-to-nearest-even) |
 | `VICTORY_MESH_OUTPUT_STRICT=1` | Recusa mesh shaders acima de 32 KiB caso o compilador IGC trave em algum deles |
 | `VICTORY_D3D12_DEBUG=1` / `VICTORY_D3D12_DRED=1` | Em build `diag`, identifica o comando exato caso ocorra *device removal* |
@@ -101,8 +106,9 @@ Em PCs com vídeo integrado + placa dedicada, o `victory` já escolhe a GPU de a
 
 ---
 
-## 5. Limitações conhecidas para observar quando testar com o jogo
+## 5. Limitações conhecidas em Alchemist (Arc A770)
 
 - **Pixel/Mesh shaders com operações de wave:** em SM 6.6 o atributo `WaveSize(32)` só existe para *compute shaders*. Se algum *pixel shader* do título depender de largura fixa de 32 lanes (além das garantias padrão do HLSL), o compilador Intel IGC poderá rodá-lo em SIMD8/SIMD16.
-- **Atomics 64-bit em texturas tipadas na A770:** a arquitetura Alchemist não suporta `AtomicInt64OnTypedResource` (apenas em buffers no descriptor heap); a **Arc B580 (Xe2)** suporta ambos.
-- **`BarycentricsSupported = false` na A770 (driver 32.0.101.9033):** pixel shaders que precisem de `SV_Barycentrics` explícito terão o PSO recusado caso o driver não exponha essa flag.
+- **Atomics 64-bit em texturas tipadas na A770:** a arquitetura Alchemist não suporta `AtomicInt64OnTypedResource`; o tradutor baixa essas operações para leitura/ALU `i64`/escrita em `RWTexture*<uint2>` (não atômico entre threads concorrentes no mesmo texel). Na **Arc B580 (Xe2)** o recurso é nativo.
+- **Baricêntricas em meshlets compartilhados na A770:** quando `BarycentricsSupported = false`, `SV_Barycentrics` usa o interpolante `BARYC` por canto (`vértice mod 3`), exato em triângulos desindexados e aproximado quando vértices são compartilhados no mesmo meshlet, enquanto pesos calculados pelo shader usam a interpolação perspectiva do hardware.
+- **Orçamento de texturas (`VICTORY_TEXTURE_BUDGET_MB`):** mantenha essa variável **desativada** na A770 16 GB e B580 12 GB (como já fazem `scripts\arc-a770.ps1` e `scripts\arc-b580.ps1`) para que `resource::room()` use o orçamento vivo do DXGI (`94%` / `92%`) e não interrompa os uploads antes dos *bakes* de pele e roupas dos personagens.

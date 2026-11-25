@@ -301,6 +301,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// Output element of the `BARYC` interpolant, on a host without
+    /// `SV_Barycentrics` ([`host_barycentrics`]).
+    bary_out: Option<usize>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -994,6 +997,56 @@ pub fn set_host_doubles(supported: bool) {
     HOST_DOUBLES.store(if supported { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
 }
 
+static HOST_BARYCENTRICS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets whether the host GPU supports `SV_Barycentrics` (`false` on Intel Arc
+/// A-series). A pixel shader that names the system value is refused by
+/// `CreatePixelShader` (`E_INVALIDARG`), and so is every mesh pipeline paired
+/// with it. Weights are emitted as an ordinary interpolant instead.
+pub fn set_host_barycentrics(supported: bool) {
+    HOST_BARYCENTRICS.store(if supported { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether emitted pixel shaders may declare `SV_Barycentrics`. Unset means
+/// they may: tests and a GPU that was not asked keep the system value.
+pub fn host_barycentrics() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HOST_BARYCENTRICS.get() {
+        return on;
+    }
+    HOST_BARYCENTRICS.load(std::sync::atomic::Ordering::Relaxed) != 1
+}
+
+static HOST_ATOMIC64_TYPED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets whether the host GPU supports `AtomicInt64OnTypedResourceSupported`
+/// (`false` on Intel Arc A-series; `true` on Arc B-series, AMD and NVIDIA).
+/// When unsupported, 64-bit image atomics lower to `uint2` typed UAV loads and
+/// stores (`DXGI_FORMAT_R32G32_UINT`) with 64-bit integer ALU so pipelines are
+/// not refused by `CreatePixelShader` / `CreateComputeShader`.
+pub fn set_host_atomic64_typed(supported: bool) {
+    HOST_ATOMIC64_TYPED.store(if supported { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether emitted shaders may use hardware 64-bit atomics on typed UAVs
+/// (`VICTORY_SOFT_TYPED_ATOMIC64=1` forces the `uint2` load/store lowering;
+/// `=0` keeps the hardware opcode).
+pub fn host_atomic64_typed() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HOST_ATOMIC64_TYPED.get() {
+        return on;
+    }
+    if let Some(v) = std::env::var_os("VICTORY_SOFT_TYPED_ATOMIC64") {
+        if v == "1" {
+            return false;
+        }
+        if v == "0" {
+            return true;
+        }
+    }
+    HOST_ATOMIC64_TYPED.load(std::sync::atomic::Ordering::Relaxed) != 1
+}
+
 /// Whether emitted shaders may use hardware `f64` operations (`VICTORY_SOFT_F64=1` forces
 /// the integer lowering on any GPU).
 pub fn host_doubles() -> bool {
@@ -1011,6 +1064,10 @@ pub fn host_doubles() -> bool {
 thread_local! {
     /// A test's choice for [`host_doubles`], for its thread only.
     pub(super) static TEST_HOST_DOUBLES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`host_barycentrics`], for its thread only.
+    pub(super) static TEST_HOST_BARYCENTRICS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`host_atomic64_typed`], for its thread only.
+    pub(super) static TEST_HOST_ATOMIC64_TYPED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -1644,6 +1701,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            bary_out: None,
         }
     }
 
@@ -2481,10 +2539,12 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        self.install_corner_weights();
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        self.write_vertex_corners();
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -2895,6 +2955,18 @@ impl<'a> Lower<'a> {
         if index > 1 {
             return Val::Missing("pull-model barycentrics");
         }
+        // Intel Arc A-series reports `BarycentricsSupported` false and
+        // refuses the pipeline (`E_INVALIDARG`) when the pixel shader names
+        // `SV_Barycentrics`. The same weights are an ordinary interpolant
+        // (`BARYC`) the vertex or mesh stage writes, one basis vector per
+        // corner, which the rasterizer interpolates. shortcut: that stage
+        // labels vertex n as corner n modulo 3, so a triangle whose vertices
+        // are 3k, 3k+1, 3k+2 is right and a shared or renumbered one is not.
+        // Only perspective-center is written; the title's shaders use that
+        // mode. A shader that asks for another reads the same interpolant.
+        if !host_barycentrics() {
+            return self.barycentric_weights(index);
+        }
         // One element per interpolation mode (the console's own, if its
         // signature declares one): DXIL allows two.
         let bary = |e: &SigElement| e.kind == 28;
@@ -2935,6 +3007,186 @@ impl<'a> Lower<'a> {
         e.interp = mode;
         self.s.flags |= flags::BARYCENTRICS;
         self.load_any_input(id, index + 1)
+    }
+
+    /// `BARYC` channel `index + 1` (i is y, j is z), perspective-center.
+    fn barycentric_weights(&mut self, index: u8) -> Val {
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.name == "BARYC" && e.index == 0)
+        {
+            Some(id) => id,
+            None => {
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter_map(|e| e.row)
+                    .max()
+                    .map(|r| r + 1)
+                    .unwrap_or(0);
+                self.s.inputs.push(SigElement {
+                    name: "BARYC".into(),
+                    index: 0,
+                    kind: 0,
+                    comp: 9,
+                    interp: 2,
+                    row: Some(row),
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.load_any_input(id, index + 1)
+    }
+
+    /// Declares the `BARYC` output on a vertex or mesh shader when the host
+    /// has no `SV_Barycentrics`. The pixel shader reads the same semantic.
+    fn install_corner_weights(&mut self) {
+        if host_barycentrics() {
+            return;
+        }
+        if self.x.native.stage == HwStage::Ps {
+            self.retire_console_barycentrics();
+            return;
+        }
+        if !matches!(self.x.native.stage, HwStage::Vs | HwStage::Ms) {
+            return;
+        }
+        // Past the per-primitive rows too: a pixel shader's inputs hold both,
+        // and it puts `BARYC` past all of them.
+        let row = self
+            .s
+            .outputs
+            .iter()
+            .chain(self.s.prims.iter())
+            .filter_map(|e| e.row)
+            .max()
+            .map(|r| r + 1)
+            .unwrap_or(0);
+        self.s.outputs.push(SigElement {
+            name: "BARYC".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(row),
+            col: 0,
+            cols: 3,
+            usage: 0b111,
+            half: false,
+        });
+        self.bary_out = Some(self.s.outputs.len() - 1);
+    }
+
+    /// A pixel shader whose console signature declares barycentrics
+    /// (`SV_Barycentrics`, kind 28) would still declare the system value, and
+    /// with it the Barycentrics feature the host lacks, even though every read
+    /// goes to `BARYC` ([`Self::barycentric_weights`]). The first such element
+    /// becomes `BARYC` itself, past every other input row; a second one (a
+    /// second interpolation mode) becomes `BARYC1`, which no earlier stage
+    /// writes.
+    fn retire_console_barycentrics(&mut self) {
+        let base_row = self
+            .s
+            .inputs
+            .iter()
+            .filter(|e| e.kind != 28)
+            .filter_map(|e| e.row)
+            .max()
+            .map(|r| r + 1)
+            .unwrap_or(0);
+        for (i, e) in self
+            .s
+            .inputs
+            .iter_mut()
+            .filter(|e| e.kind == 28)
+            .enumerate()
+        {
+            e.name = "BARYC".into();
+            e.index = i as u32;
+            e.kind = 0;
+            e.comp = 9;
+            e.interp = 2;
+            e.row = Some(base_row + i as u32);
+            e.col = 0;
+            e.cols = 3;
+        }
+    }
+    /// A vertex shader writes (1, 0, 0) at every vertex: it does not know
+    /// which corner of the triangle it is. The pixel shader still links.
+    fn write_vertex_corners(&mut self) {
+        if self.x.native.stage != HwStage::Vs {
+            return;
+        }
+        let Some(id) = self.bary_out else {
+            return;
+        };
+        let one = self.s.m.f32(1f32.to_bits());
+        let zero = self.s.m.f32(0);
+        let void = self.s.t.void;
+        let sig = self.s.m.i32(id as u32);
+        let row = self.s.m.i32(0);
+        let cols: Vec<V> = (0..3).map(|col| self.s.m.i8(col)).collect();
+        for (col, value) in [one, zero, zero].into_iter().enumerate() {
+            self.s.op(
+                self.cur,
+                "storeOutput.f32",
+                Attr::NoUnwind,
+                void,
+                5,
+                &[sig, row, cols[col], value],
+            );
+        }
+    }
+
+    /// Mesh: lane n writes vertex n, labelled corner n modulo 3.
+    fn write_mesh_corners(&mut self, max_vertices: u32) {
+        let Some(id) = self.bary_out else {
+            return;
+        };
+        let threads = self.s.threads.map(|t| t[0]).unwrap_or(1).max(1);
+        let flat = self.mesh_thread();
+        let passes = max_vertices.div_ceil(threads);
+        let one = self.s.m.f32(1f32.to_bits());
+        let zero = self.s.m.f32(0);
+        let three = self.s.m.i32(3);
+        let void = self.s.t.void;
+        let limit = self.s.m.i32(max_vertices);
+        let sig = self.s.m.i32(id as u32);
+        let row = self.s.m.i32(0);
+        let cols: Vec<V> = (0..3u8).map(|col| self.s.m.i8(col)).collect();
+        let which: Vec<V> = (0..3u32).map(|col| self.s.m.i32(col)).collect();
+        for pass in 0..passes {
+            let index = if pass == 0 {
+                flat
+            } else {
+                let past = self.s.m.i32(pass * threads);
+                self.s.m.bin(self.cur, Bin::Add, flat, past)
+            };
+            let guard = ((pass + 1) * threads > max_vertices)
+                .then(|| self.s.m.cmp(self.cur, pred::IULT, index, limit));
+            let at = self.begin_guarded(guard);
+            let corner = self.s.m.bin(self.cur, Bin::URem, index, three);
+            for col in 0..3 {
+                let is = self.s.m.cmp(self.cur, pred::EQ, corner, which[col]);
+                let value = self.s.m.select(self.cur, is, one, zero);
+                self.s.op(
+                    self.cur,
+                    "storeVertexOutput.f32",
+                    Attr::NoUnwind,
+                    void,
+                    171,
+                    &[sig, row, cols[col], value, index],
+                );
+            }
+            self.end_guarded(at, &[]);
+        }
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
@@ -4563,6 +4815,8 @@ impl<'a> Lower<'a> {
             );
             self.end_guarded(at, &[]);
         }
+        let vertices = self.s.mesh.map(|m| m.max_vertices).unwrap_or(mesh.max_vertices);
+        self.write_mesh_corners(vertices);
         Ok(())
     }
 
@@ -9700,7 +9954,16 @@ impl<'a> Lower<'a> {
                 ..
             } => {
                 let mode = interp_mode(barycentric).ok_or("pull-model interpolation")?;
-                let eval = if self.per_vertex(attribute.row) {
+                let eval = if self.per_vertex(attribute.row) && !host_barycentrics() {
+                    // No `attributeAtVertex` without the Barycentrics
+                    // feature: `eval_channel` reads the hardware's own
+                    // interpolation (or flat P0) instead of the vertices.
+                    Eval::Weights {
+                        p0: true,
+                        i: None,
+                        j: None,
+                    }
+                } else if self.per_vertex(attribute.row) {
                     // The element is read per vertex elsewhere, so it is
                     // constant: weigh its vertices with SV_Barycentrics.
                     let mut ij = [None; 2];
@@ -9866,6 +10129,13 @@ impl<'a> Lower<'a> {
         })
     }
 
+    /// Whether the program reads P0 of attribute row `row` as a flat value.
+    fn flat_read(&self, row: u8) -> bool {
+        self.x.io.interps.iter().any(|(_, i)| {
+            matches!(*i, Interp::Vertex { attribute, vertex: 2 } if attribute.row == row)
+        })
+    }
+
     /// Whether the program interpolates attribute row `row` (so the
     /// hardware holds P1 - P0 and P2 - P0 for it).
     fn interpolated(&self, row: u8) -> bool {
@@ -9882,8 +10152,26 @@ impl<'a> Lower<'a> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        // Without the Barycentrics feature (Intel Arc A-series) there is no
+        // `attributeAtVertex`, which the device refuses like
+        // `SV_Barycentrics`. shortcut: a weighed sum that includes P0 is the
+        // hardware's perspective-center interpolation (exact for its own
+        // weights, an approximation for weights the program computes), or
+        // flat P0 where the program also reads P0 flat; a difference term
+        // alone (P10, P20, a second half with computed j) is zero.
+        let no_vertices = !host_barycentrics() && matches!(eval, Eval::Weights { .. });
+        if no_vertices && matches!(eval, Eval::Weights { p0: false, .. }) {
+            return Ok(self.s.m.i32(0));
+        }
         let mode = match eval {
             Eval::Mode(mode) => mode,
+            Eval::Weights { .. } if no_vertices => {
+                if self.flat_read(row) {
+                    1
+                } else {
+                    2
+                }
+            }
             Eval::Weights { .. } => 1,
         };
         let e = &mut self.s.inputs[id];
@@ -9891,6 +10179,12 @@ impl<'a> Lower<'a> {
             return Err("one input interpolated two ways");
         }
         e.interp = mode;
+        if no_vertices {
+            return match self.load_any_input(id, col) {
+                Val::I32(x) => Ok(x),
+                _ => Err("an input"),
+            };
+        }
         let Eval::Weights { p0, i, j } = eval else {
             return match self.load_any_input(id, col) {
                 Val::I32(x) => Ok(x),
@@ -10077,16 +10371,99 @@ impl<'a> Lower<'a> {
             };
             let width = if wide { 2 } else { 1 };
             let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
+            let original = if wide {
+                self.join64(vals[0], vals[1])
+            } else {
+                vals[0]
+            };
+            if wide && !host_atomic64_typed() {
+                // Intel Arc A-series lacks `AtomicInt64OnTypedResource` and
+                // refuses any shader with `SFI0` bit `0x40_0000`, though it
+                // supports `Int64Ops` and `TypedUAVLoadAdditionalFormats` on
+                // the `DXGI_FORMAT_R32G32_UINT` UAV the host already binds.
+                // shortcut: non-atomic read-modify-write on `RWTexture*<uint2>`
+                // keeps the 12 world pixel shaders and their mesh pipelines
+                // alive instead of dropping all of their draws.
+                let i64t = self.s.m.int(64);
+                let i32t = self.s.t.i32;
+                let void = self.s.t.void;
+                self.s.flags |= flags::INT64 | flags::TYPED_UAV_LOADS;
+                let value = if op == "sub" {
+                    let zero = self.s.m.int_const(i64t, 0);
+                    self.s.m.bin(c, Bin::Sub, zero, original)
+                } else {
+                    original
+                };
+                let comparand = compare.then(|| self.join64(vals[2], vals[3]));
+                let h = self.handle(site, src, false, (kind | 0x1000, 0x205))?;
+                let res_i32 = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                let at = self.begin_guarded(guard);
+                let cur_blk = self.cur;
+                let loaded = self.s.op(
+                    cur_blk,
+                    "textureLoad.i32",
+                    Attr::ReadOnly,
+                    res_i32,
+                    66,
+                    &[h, iu, cs[0], cs[1], cs[2], iu, iu, iu],
+                );
+                let cur_lo = self.s.m.extract(cur_blk, loaded, 0);
+                let cur_hi = self.s.m.extract(cur_blk, loaded, 1);
+                let cur64 = self.join64(cur_lo, cur_hi);
+                let next64 = if let Some(cmp_val) = comparand {
+                    let eq = self.s.m.cmp(cur_blk, pred::EQ, cur64, cmp_val);
+                    self.s.m.select(cur_blk, eq, value, cur64)
+                } else {
+                    match op {
+                        "add" | "sub" => self.s.m.bin(cur_blk, Bin::Add, cur64, value),
+                        "and" => self.s.m.bin(cur_blk, Bin::And, cur64, value),
+                        "or" => self.s.m.bin(cur_blk, Bin::Or, cur64, value),
+                        "xor" => self.s.m.bin(cur_blk, Bin::Xor, cur64, value),
+                        "smin" => {
+                            let lt = self.s.m.cmp(cur_blk, pred::SLT, value, cur64);
+                            self.s.m.select(cur_blk, lt, value, cur64)
+                        }
+                        "smax" => {
+                            let gt = self.s.m.cmp(cur_blk, pred::SGT, value, cur64);
+                            self.s.m.select(cur_blk, gt, value, cur64)
+                        }
+                        "umin" => {
+                            let lt = self.s.m.cmp(cur_blk, pred::IULT, value, cur64);
+                            self.s.m.select(cur_blk, lt, value, cur64)
+                        }
+                        "umax" => {
+                            let gt = self.s.m.cmp(cur_blk, pred::IUGT, value, cur64);
+                            self.s.m.select(cur_blk, gt, value, cur64)
+                        }
+                        "swap" => value,
+                        _ => unreachable!(),
+                    }
+                };
+                let (next_lo, next_hi) = self.split64(next64);
+                let mask2 = self.s.m.i8(0x3);
+                self.s.op(
+                    cur_blk,
+                    "textureStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    67,
+                    &[h, cs[0], cs[1], cs[2], next_lo, next_hi, iu, iu, mask2],
+                );
+                if cache.glc {
+                    let old = self.end_guarded(at, &[(cur64, original)])[0];
+                    let (lo, hi) = self.split64(old);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.end_guarded(at, &[]);
+                }
+                return Ok(());
+            }
             let (ty, component) = if wide {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
                 (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
             } else {
                 (self.s.t.i32, 0x105)
-            };
-            let original = if wide {
-                self.join64(vals[0], vals[1])
-            } else {
-                vals[0]
             };
             let value = if op == "sub" {
                 let zero = self.s.m.int_const(ty, 0);

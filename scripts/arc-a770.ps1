@@ -23,20 +23,26 @@ $env:VICTORY_ADAPTER = $Adapter
 # Measured on A770 16 GB (driver 32.0.101.9033):
 # - wave lanes 8..32 (compute wave ops pinned to WaveSize(32) automatically)
 # - doubles = false (wave f64 sums lowered to integer IEEE-754 automatically)
+# - barycentrics = false (SV_Barycentrics / attributeAtVertex lowered automatically)
+# - typed 64-bit atomics = false (lowered to RWTexture*<uint2> load/store automatically)
 # - view heap capped at 1,000,000 descriptors (clamped to 999,999 automatically)
+#
+# Leave VICTORY_TEXTURE_BUDGET_MB unset so `resource::room()` tracks live DXGI
+# `QueryVideoMemoryInfo` (~15.5 GB budget on 16 GB A770) up to ROOM_PERCENT.
+# A static 8 GB cap choked off uploads right before character decoration bakes
+# and left ~10,000 world textures waiting while >4.5 GB of VRAM stayed free.
+Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
 $env:VICTORY_INDIRECT_CLAMP = "0"
 $env:VICTORY_SKIP_MOVIES    = "1"
 
 if ($VramGB -eq 8) {
-    $env:VICTORY_TEXTURE_BUDGET_MB   = "4096"
-    $env:VICTORY_TEXTURE_ROOM_PERCENT = "80"
-    $env:VICTORY_CARD_BUFFERS_MIN_MB = if ($Fast) { "4" } else { "16" }
-    $env:VICTORY_CARD_BUFFERS_MB     = "256"
+    $env:VICTORY_TEXTURE_ROOM_PERCENT = "90"
+    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "4" } else { "16" }
+    $env:VICTORY_CARD_BUFFERS_MB      = "256"
 } else {
-    $env:VICTORY_TEXTURE_BUDGET_MB   = "8192"
-    $env:VICTORY_TEXTURE_ROOM_PERCENT = "85"
-    $env:VICTORY_CARD_BUFFERS_MIN_MB = if ($Fast) { "1" } else { "16" }
-    $env:VICTORY_CARD_BUFFERS_MB     = if ($Fast) { "1024" } else { "512" }
+    $env:VICTORY_TEXTURE_ROOM_PERCENT = "96"
+    $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "1" } else { "16" }
+    $env:VICTORY_CARD_BUFFERS_MB      = if ($Fast) { "1024" } else { "512" }
 }
 
 if ($Fast) {
@@ -51,7 +57,7 @@ if ($Fast) {
 
 Write-Host "Intel Arc A770 (${VramGB} GB) profile active (Fast=$($Fast.IsPresent)):"
 Write-Host "  VICTORY_ADAPTER              = $env:VICTORY_ADAPTER"
-Write-Host "  VICTORY_TEXTURE_BUDGET_MB    = $env:VICTORY_TEXTURE_BUDGET_MB"
+Write-Host "  VICTORY_TEXTURE_ROOM_PERCENT = $env:VICTORY_TEXTURE_ROOM_PERCENT% (live DXGI budget)"
 Write-Host "  VICTORY_CARD_BUFFERS_MIN_MB  = $env:VICTORY_CARD_BUFFERS_MIN_MB"
 Write-Host "  VICTORY_CARD_BUFFERS_MB      = $env:VICTORY_CARD_BUFFERS_MB"
 Write-Host "  VICTORY_RELAY / WIDE_BACK    = $env:VICTORY_RELAY / $env:VICTORY_WIDE_BACK"

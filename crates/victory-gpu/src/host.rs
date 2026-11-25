@@ -658,6 +658,8 @@ fn create() -> windows::core::Result<Host> {
             victory_shader::emit::set_host_min_wave(caps.wave_min);
         }
         victory_shader::emit::set_host_doubles(caps.doubles);
+        victory_shader::emit::set_host_barycentrics(caps.barycentrics);
+        victory_shader::emit::set_host_atomic64_typed(caps.atomic64_typed);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

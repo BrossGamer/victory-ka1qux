@@ -20,12 +20,13 @@ $env:VICTORY_ADAPTER = $Adapter
 # Arc B580 (Xe2-HPG, 12 GB VRAM):
 # - wave lanes 16..32 (compute wave ops pinned to WaveSize(32) automatically)
 # - 64-bit typed + heap atomics natively supported on Xe2
-# - 12 GB dedicated VRAM: keep texture + card buffer budgets under ~8.5 GB so D3D12
-#   does not evict allocations into shared system RAM
+# - Leave VICTORY_TEXTURE_BUDGET_MB unset so `resource::room()` tracks live DXGI
+#   `QueryVideoMemoryInfo` up to 92% of the card's budget instead of starving
+#   character bakes and bindless world textures under a static byte cap.
+Remove-Item Env:VICTORY_TEXTURE_BUDGET_MB -ErrorAction SilentlyContinue
 $env:VICTORY_INDIRECT_CLAMP       = "0"
 $env:VICTORY_SKIP_MOVIES          = "1"
-$env:VICTORY_TEXTURE_BUDGET_MB    = "6144"
-$env:VICTORY_TEXTURE_ROOM_PERCENT = "85"
+$env:VICTORY_TEXTURE_ROOM_PERCENT = "92"
 $env:VICTORY_CARD_BUFFERS_MIN_MB  = if ($Fast) { "2" } else { "16" }
 $env:VICTORY_CARD_BUFFERS_MB      = if ($Fast) { "768" } else { "512" }
 
@@ -41,7 +42,7 @@ if ($Fast) {
 
 Write-Host "Intel Arc B580 (12 GB) profile active (Fast=$($Fast.IsPresent)):"
 Write-Host "  VICTORY_ADAPTER              = $env:VICTORY_ADAPTER"
-Write-Host "  VICTORY_TEXTURE_BUDGET_MB    = $env:VICTORY_TEXTURE_BUDGET_MB"
+Write-Host "  VICTORY_TEXTURE_ROOM_PERCENT = $env:VICTORY_TEXTURE_ROOM_PERCENT% (live DXGI budget)"
 Write-Host "  VICTORY_CARD_BUFFERS_MIN_MB  = $env:VICTORY_CARD_BUFFERS_MIN_MB"
 Write-Host "  VICTORY_CARD_BUFFERS_MB      = $env:VICTORY_CARD_BUFFERS_MB"
 Write-Host "  VICTORY_RELAY / WIDE_BACK    = $env:VICTORY_RELAY / $env:VICTORY_WIDE_BACK"

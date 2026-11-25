@@ -117,7 +117,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
-    host_doubles, host_max_wave, host_min_wave, set_host_doubles, set_host_max_wave,
+    host_atomic64_typed, host_barycentrics, host_doubles, host_max_wave, host_min_wave,
+    set_host_atomic64_typed, set_host_barycentrics, set_host_doubles, set_host_max_wave,
     set_host_min_wave,
 };
 pub use rect::rect_list_gs;
@@ -1824,6 +1825,76 @@ mod atomic_tests {
             }
         }
     }
+
+    #[test]
+    fn wide_image_atomics_without_typed_atomic64_use_uint2_load_store() {
+        let was = lower::TEST_HOST_ATOMIC64_TYPED.replace(Some(false));
+        for &(opcode, mask) in &[(0x17u32, 3u32), (0x10, 15)] {
+            let words = [
+                0x7E00_0280,
+                0x7E02_0280,
+                0x7E04_0281,
+                0x7E06_0282,
+                0x7E08_0283,
+                0x7E0A_0284,
+                0xF000_2008 | opcode << 18 | mask << 8,
+                0x0002_0200,
+                0xF044_0008 | 3 << 8,
+                0x0002_0200,
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 6,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [32, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, native.vgprs).unwrap();
+            let bytes = crate::dxbc::build(&[]);
+            let shader = emit(
+                &Container::parse(&bytes).unwrap(),
+                &native,
+                &p,
+                &structure::structure(&p).unwrap(),
+                &io::raise(&p, &native).unwrap(),
+                &resource::track(&p, &native.layout, native.stage, None).unwrap(),
+            )
+            .unwrap();
+            let container = Container::parse(&shader.dxil).unwrap();
+            let features = u64::from_le_bytes(
+                container
+                    .part(FourCC::SFI0)
+                    .unwrap()
+                    .data
+                    .try_into()
+                    .unwrap(),
+            );
+            // Typed/heap 64-bit atomics must be off; Int64Ops (0x8000) and
+            // TypedUAVLoadAdditionalFormats (0x800) must be on.
+            assert_eq!(features & 0x1040_0000, 0);
+            assert_eq!(features & 0x8800, 0x8800);
+            #[cfg(windows)]
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone()).unwrap();
+            }
+        }
+        lower::TEST_HOST_ATOMIC64_TYPED.set(was);
+    }
 }
 
 #[cfg(test)]
@@ -1945,6 +2016,24 @@ mod barycentric_tests {
         let isg1 = isg1.part(FourCC::ISG1).unwrap().data;
         let rw: Vec<u8> = (0..2).map(|k| isg1[8 + 32 * k + 25]).collect();
         assert!(rw.contains(&0b110), "{rw:?}");
+        validate(&shader);
+    }
+
+    /// Without the feature, i and j are channels of an ordinary interpolant.
+    /// A pixel shader that names `SV_Barycentrics` is refused on Intel Arc.
+    #[test]
+    fn barycentrics_without_the_feature_are_an_interpolant() {
+        let was = lower::TEST_HOST_BARYCENTRICS.replace(Some(false));
+        let [e0, e1] = exp_mrt0(2);
+        let words = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        lower::TEST_HOST_BARYCENTRICS.set(was);
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0, "Barycentrics feature must stay off");
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        let bary: Vec<_> = inputs.iter().filter(|e| e.name == "BARYC").collect();
+        assert_eq!(bary.len(), 1, "{inputs:?}");
+        assert_eq!((bary[0].index, bary[0].cols, bary[0].comp), (0, 3, 9));
         validate(&shader);
     }
 
@@ -2200,6 +2289,54 @@ mod barycentric_tests {
         assert_ne!(features & 0x2_0000, 0, "no Barycentrics feature");
         assert_eq!(inputs.iter().filter(|e| e.kind == 28).count(), 1);
         assert_eq!(texcoord_mode(&shader), 1);
+        validate(&shader);
+    }
+
+    /// Without the Barycentrics feature, computed weights read no vertices:
+    /// no `attributeAtVertex`, no feature, TEXCOORD0 interpolated by the
+    /// hardware (perspective center).
+    #[test]
+    fn computed_barycentrics_without_the_feature_read_no_vertices() {
+        let was = lower::TEST_HOST_BARYCENTRICS.replace(Some(false));
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+            0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        lower::TEST_HOST_BARYCENTRICS.set(was);
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0, "Barycentrics feature must stay off");
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        assert_eq!(texcoord_mode(&shader), 2);
+        validate(&shader);
+    }
+
+    /// Without the feature, P10 of an interpolated attribute is zero and the
+    /// attribute stays interpolated: no vertices are read.
+    #[test]
+    fn p10_without_the_feature_reads_no_vertices() {
+        let was = lower::TEST_HOST_BARYCENTRICS.replace(Some(false));
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xC812_0000, // v_interp_mov_f32 v4, p10, attr0.x
+            v_add_f32(2, 2, 4),
+            e0,
+            e1,
+            S_ENDPGM,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        lower::TEST_HOST_BARYCENTRICS.set(was);
+        let (features, inputs) = parts(&shader);
+        assert_eq!(features & 0x2_0000, 0, "Barycentrics feature must stay off");
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        assert_eq!(texcoord_mode(&shader), 2);
         validate(&shader);
     }
 

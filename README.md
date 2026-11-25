@@ -227,9 +227,11 @@ repository.
 See [docs/intel-arc.md](docs/intel-arc.md) for the Intel Arc hardware
 measurements, Agility SDK setup (required on Windows 10 for shader model 6.6+
 and mesh shaders), wave-size pinning (`8..32` / `16..32` → `WaveSize(32)`),
-integer `f64` wave reductions (`doubles = false`), and ready-to-use profiles:
+integer `f64` wave reductions (`doubles = false`), `SV_Barycentrics` and
+64-bit typed UAV atomic fallbacks on Alchemist, and ready-to-use profiles:
 
 ```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 powershell -ExecutionPolicy Bypass -File scripts\fetch-agility.ps1
 cargo build --profile diag -p victory --features diagnostics
 .\target\diag\victory.exe gpu-info
