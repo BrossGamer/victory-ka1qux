@@ -30,7 +30,7 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Frame rate | 🟡 | in the open world on a street with about 5,600 to 6,100 draws a frame, with ray-traced light: a median of 0.28 to 0.31 s a frame (about 3.2 to 3.6 frames a second), 0.24 s at best, with victory-fork's speed defaults and the switches below, picture right; 0.53 to 0.56 s without the speed defaults. The same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
-| Tests | ✅ | `cargo test --workspace` runs 805 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| Tests | ✅ | `cargo test --workspace` runs 811 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
@@ -274,7 +274,10 @@ of #2624 (andrewpozdnakov7-jpg), and the BCPack, tiling and write-mark speed-ups
 (BastienRodz) and audio that keeps up with slow frames #2788 (0xkn0wh3r3). Through victory-fork #1112 (KyleS98), two
 translator fixes of DexNom/VIctory; victory-fork #1126 (Vladimir-Human): more
 exact DXIL clean-up passes (loop-invariant code motion, local and shared-memory
-forwarding, redundant barriers).
+forwarding, redundant barriers). From VIctory #2825 (0xkn0wh3r3): 16-bit float
+arithmetic in native half where the host has 16-bit operations and the program
+rounds to nearest even (45 of the saved programs; it rounds as the console does,
+where the f32 path rounded toward zero; `VICTORY_F16_IN_F32=1` goes back).
 
 ## Running it
 
