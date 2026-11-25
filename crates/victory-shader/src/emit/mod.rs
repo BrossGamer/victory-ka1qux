@@ -79,6 +79,24 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **Write marks** ([`view_marks`]; added 2026-11-25, after upstream
+//!   VIctory's `cd94d35`): every store or atomic through an unordered
+//!   buffer view taken from the view heap (tables, the heap itself) also
+//!   sets bits in a bitmap, the root UAV `u`[`SLOT_VIEW_WRITES`], so that
+//!   the host compares and copies back only the 64 KiB title pages shaders
+//!   wrote. The root SRV `t`[`SLOT_VIEW_MARKS`] is the bound heap's mark
+//!   table, two dwords per slot: a first bit and, in bits 0-15, the view's
+//!   first byte's offset in its title page (bits 16-31: a typed view's
+//!   element size). A write at byte `x` of the view sets bit `first +
+//!   ((offset + x) >> 16)` for its first and its last byte, at most
+//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. Both
+//!   root views exist only in programs that write through such views:
+//!   others are as without marks. Root UAVs and title memory by address
+//!   are not marked (the host declares what they write). Every such
+//!   store and atomic is counted where its DXIL operation is emitted, and
+//!   every mark where it is made; a lowering whose counts differ (a path
+//!   that writes without marking) is done again without marks, as is a
+//!   program whose root signature would grow past what the host takes.
 
 mod bitcode;
 mod container;
@@ -89,6 +107,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod marks_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -120,9 +140,36 @@ pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_GROUP_BASE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
+    set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether translations carry write marks (module notes, "Write marks"):
+/// off until the host binds what they need; `VICTORY_VIEW_MARKS=1` asks
+/// for them. Part of the translation: the shader cache keys on it. Off in
+/// this crate's own tests, whose rig binds no mark table or bitmap
+/// (`marks_tests` asks for them).
+pub fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_some_and(|v| v == "1"))
+}
+
+/// Whether `shader` marks the pages it writes through views: the host
+/// binds the mark table and the bitmap for it.
+pub fn marks_writes(shader: &HostShader) -> bool {
+    shader.root_uavs.contains(&SLOT_VIEW_WRITES)
+}
+
+/// Whether the root signature of a program with write marks still fits
+/// the host's 64 dwords, counted as the host builds it (user data as
+/// constants, every root view as a descriptor, two dwords) with room left
+/// for a pipeline's other stage: all of it for compute, half otherwise.
+fn marks_fit(shader: &HostShader) -> bool {
+    let views = shader.root_cbvs.len() + shader.root_srvs.len() + shader.root_uavs.len();
+    let dwords = shader.user_data_dwords() + 2 * views as u32;
+    dwords <= if shader.stage == HwStage::Cs { 64 } else { 32 }
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -346,8 +393,31 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, with write marks
+/// where [`view_marks`] asks for them and they are whole (module notes,
+/// "Write marks").
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if !view_marks() {
+        return emit_unmarked(c, native, p, st, io, res);
+    }
+    let (marked, whole) = lower::with_view_marks(|| emit_unmarked(c, native, p, st, io, res));
+    match marked {
+        Ok(shader) if !marks_writes(&shader) || whole && marks_fit(&shader) => Ok(shader),
+        // Short of marks, too big, or refused with them: as without.
+        _ => emit_unmarked(c, native, p, st, io, res),
+    }
+}
+
+/// [`emit`] without write marks (unless the caller runs it inside
+/// `lower::with_view_marks`).
+fn emit_unmarked(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

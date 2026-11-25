@@ -960,6 +960,28 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_view_marks`]: whether marks are emitted, and whether a
+    /// lowering since the last [`with_view_marks`] left a store unmarked.
+    static VIEW_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static MARKS_SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with write marks emitted (`emit`, "Write marks"); also whether
+/// every lowering `f` ran marked every store and atomic through an
+/// unordered buffer view of the heap. A lowering that did not (some code
+/// path emits a write without its mark) makes the caller translate again
+/// without marks: the host then finds that program's writes as before.
+pub(super) fn with_view_marks<R>(f: impl FnOnce() -> R) -> (R, bool) {
+    let was = VIEW_MARKS.replace(true);
+    let short = MARKS_SHORT.replace(false);
+    let r = f();
+    VIEW_MARKS.set(was);
+    let whole = !MARKS_SHORT.replace(short);
+    (r, whole)
+}
+
+fn view_marks_on() -> bool {
+    VIEW_MARKS.get()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -2356,6 +2378,9 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        if view_marks_on() && self.s.view_stores != self.s.view_marks {
+            MARKS_SHORT.set(true);
+        }
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -2994,6 +3019,8 @@ impl<'a> Lower<'a> {
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000, 0));
+        // The host declares what is written by address itself.
+        self.s.unmarked(h);
         let k64k = k(self, 0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
@@ -4184,6 +4211,97 @@ impl<'a> Lower<'a> {
             _ => return Err("a result without a register"),
         }
         Ok(())
+    }
+
+    /// A dword of raw buffer `h` at byte `at`.
+    fn raw_word(&mut self, h: V, at: V) -> V {
+        let c = self.cur;
+        let (iu, mask, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(1), self.s.m.i32(4));
+        let res = self.s.t.res_ret;
+        let r = self.s.op(c, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[h, at, iu, mask, align]);
+        let f = self.s.m.extract(c, r, 0);
+        self.as_int(f)
+    }
+
+    /// Marks the pages a store or atomic through the unordered buffer view
+    /// `h` writes (module notes, "Write marks"), right after it and under
+    /// the same guard: `c0` and `c1` are its coordinates as the operation
+    /// takes them (a raw view's byte; a structured view's element and byte
+    /// in it; a typed view's element), `bytes` how many it may write from
+    /// there. The bits of the first and the last byte's 64 KiB title pages
+    /// are set, each only where still clear (most writes find their page
+    /// marked: a load, not an atomic). Nothing for handles that are no
+    /// unordered buffer view of the heap, or without marks.
+    fn mark_store(&mut self, h: V, c0: V, c1: V, bytes: u32) {
+        use super::shader::{SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, VIEW_MARK_NONE, VIEW_WRITE_BITS};
+        if !view_marks_on() {
+            return;
+        }
+        let Some(&(index, kind, stride)) = self.s.heap_uavs.get(&h) else {
+            return;
+        };
+        self.s.view_marks += 1;
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let table = self.s.root_srv_handle(SLOT_VIEW_MARKS);
+        let bitmap = self.s.root_uav_handle(SLOT_VIEW_WRITES);
+        let c = self.cur;
+        let (eight, four) = (k(self, 8), k(self, 4));
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
+        let base = self.raw_word(table, at);
+        let at = self.s.m.bin(c, Bin::Add, at, four);
+        let word = self.raw_word(table, at);
+        let low = k(self, 0xFFFF);
+        let phase = self.s.m.bin(c, Bin::And, word, low);
+        // The write's first byte in the view.
+        let x = match kind {
+            12 => {
+                let s = k(self, stride);
+                let row = self.s.m.bin(c, Bin::Mul, c0, s);
+                self.s.m.bin(c, Bin::Add, row, c1)
+            }
+            10 => {
+                let k16 = k(self, 16);
+                let element = self.s.m.bin(c, Bin::LShr, word, k16);
+                self.s.m.bin(c, Bin::Mul, c0, element)
+            }
+            _ => c0,
+        };
+        let none = k(self, VIEW_MARK_NONE);
+        let valid = self.s.m.cmp(c, pred::NE, base, none);
+        let first = self.s.m.bin(c, Bin::Add, phase, x);
+        let span = k(self, bytes.max(1) - 1);
+        let last = self.s.m.bin(c, Bin::Add, first, span);
+        let (k16, cap) = (k(self, 16), k(self, VIEW_WRITE_BITS - 1));
+        let mut bits = Vec::new();
+        for byte in [first, last] {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Add, base, page);
+            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
+            bits.push(self.s.m.select(c, over, cap, n));
+        }
+        let outer = self.begin_guarded(Some(valid));
+        for (i, &n) in bits.iter().enumerate() {
+            let c = self.cur;
+            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
+            let old = self.raw_word(bitmap, word);
+            let set = self.s.m.bin(c, Bin::And, old, bit);
+            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
+            if i == 1 {
+                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
+                clear = self.s.m.bin(c, Bin::And, clear, other);
+            }
+            let inner = self.begin_guarded(Some(clear));
+            let iu = self.s.m.undef(self.s.t.i32);
+            let i32t = self.s.t.i32;
+            // Operation 2 is OR.
+            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, k2, word, iu, iu, bit]);
+            self.end_guarded(inner, &[]);
+        }
+        self.end_guarded(outer, &[]);
     }
 
     /// Starts code only the lanes where `guard` holds run (a store under a
@@ -10995,6 +11113,7 @@ impl<'a> Lower<'a> {
                 let args = [h, op, aligned, iu, iu, x];
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                self.mark_store(h, aligned, iu, 4);
             }
             if bits == 16 {
                 let second = self.begin_guarded(Some(straddles));
@@ -11002,6 +11121,7 @@ impl<'a> Lower<'a> {
                     let args = [h, op, next, iu, iu, x];
                     self.s
                         .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                    self.mark_store(h, next, iu, 4);
                 }
                 self.end_guarded(second, &[]);
             }
@@ -11057,6 +11177,7 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
+            self.mark_store(h, coords[0], coords[1], 4);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -11130,6 +11251,9 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            // A typed element is 16 bytes at most.
+            let bytes = if typed { 16 } else { 4 * count };
+            self.mark_store(args[0], args[1], args[2], bytes);
             self.end_guarded(at, &[]);
             return Ok(());
         }
