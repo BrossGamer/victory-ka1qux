@@ -691,26 +691,65 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        make_writable(block);
     }
+    make_writable_runs(&blocks);
+    let mut alone = Vec::new();
     for &block in &linked {
         for guarded in g.links.remove(&block).unwrap_or_default() {
             g.clean.remove(&guarded);
         }
         if blocks.binary_search(&block).is_err() {
-            make_writable(block);
+            alone.push(block);
         }
     }
+    make_writable_runs(&alone);
     !blocks.is_empty() || !linked.is_empty()
 }
 
 /// Gives write access back to `block`, one we made read-only; nothing
 /// changes where it is not mapped.
 fn make_writable(block: usize) {
+    make_writable_span(block, block + 1);
+}
+
+/// Gives write access back to blocks `[from, to)` in one call; false if
+/// Windows refused (the blocks are not all of one view, or not mapped).
+fn make_writable_span(from: usize, to: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
-    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+    unsafe {
+        VirtualProtect(
+            (from * BLOCK) as *const _,
+            (to - from) * BLOCK,
+            PAGE_READWRITE,
+            &mut old,
+        ) != 0
+    }
+}
+
+/// [`make_writable`] for `blocks` (in order): a run of neighbours is one
+/// call, block by block only where Windows refuses the run (it spans two
+/// views; it never changes part of a range). A remapping or a write the
+/// runtime announces opens hundreds of neighbouring blocks, each a call
+/// into the kernel and a flush of the other cores' address caches.
+/// `VICTORY_GUARD_RUNS=0` opens block by block, as before.
+fn make_writable_runs(blocks: &[usize]) {
+    static RUNS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let runs = *RUNS.get_or_init(|| std::env::var_os("VICTORY_GUARD_RUNS").is_none_or(|v| v != "0"));
+    let mut i = 0;
+    while i < blocks.len() {
+        let mut k = i + 1;
+        while runs && k < blocks.len() && blocks[k] == blocks[k - 1] + 1 {
+            k += 1;
+        }
+        if k - i == 1 || !make_writable_span(blocks[i], blocks[k - 1] + 1) {
+            for &block in &blocks[i..k] {
+                make_writable(block);
+            }
+        }
+        i = k;
+    }
 }
 
 /// Our own write into title memory `[at, at + len)` that the handler does
@@ -925,17 +964,19 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        make_writable(block);
     }
+    make_writable_runs(&blocks);
     // Read-write as well; what they show now is linked again when the
     // runtime tells of it (`crate::title_memory_view`).
     let linked: Vec<usize> = g.links.range(range).map(|(&block, _)| block).collect();
+    let mut alone = Vec::new();
     for block in linked {
         g.links.remove(&block);
         if blocks.binary_search(&block).is_err() {
-            make_writable(block);
+            alone.push(block);
         }
     }
+    make_writable_runs(&alone);
 }
 
 /// Handles a write access violation at `at` if the block belongs to our guards
@@ -1293,6 +1334,103 @@ mod tests {
             }
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+        title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// Guarded neighbours are opened in one call when they are one view,
+    /// and block by block when they are neighbouring views (which Windows
+    /// does not change in one call): every block is writable after, and
+    /// counts as written.
+    #[test]
+    fn neighbouring_guarded_blocks_are_opened_in_views_and_across_them() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile, UnmapViewOfFile2,
+            VirtualAlloc2, VirtualQuery,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let writable = |at: usize| {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            n != 0 && info.Protect == PAGE_READWRITE
+        };
+        let pages = |at: usize, blocks: usize| -> Vec<usize> { (at / PAGE..(at + blocks * BLOCK) / PAGE).collect() };
+        // SAFETY: a pagefile section of three blocks.
+        let section = unsafe {
+            CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (3 * BLOCK) as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        // One view of the three blocks.
+        // SAFETY: our section, read-write.
+        let one = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 3 * BLOCK) }.Value as usize;
+        assert_ne!(one, 0);
+        assert_eq!(guard(one, one + 3 * BLOCK), Some(pages(one, 3)));
+        assert!((0..3).all(|b| !writable(one + b * BLOCK)));
+        writing(one, 3 * BLOCK);
+        assert!((0..3).all(|b| writable(one + b * BLOCK)), "one view");
+        assert_eq!(guard(one, one + 3 * BLOCK), Some(pages(one, 3)));
+        // Three neighbouring views of a block each, in a placeholder.
+        // SAFETY: a fresh placeholder of three blocks.
+        let p = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                3 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let views: Vec<MEMORY_MAPPED_VIEW_ADDRESS> = (0..3)
+            .map(|block| {
+                // SAFETY: splits the placeholder at the block and maps the
+                // section's block there.
+                let view = unsafe {
+                    if block < 2 {
+                        VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    }
+                    MapViewOfFile3(
+                        section,
+                        GetCurrentProcess(),
+                        (p + block * BLOCK) as *const _,
+                        (block * BLOCK) as u64,
+                        BLOCK,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(view.Value as usize, p + block * BLOCK);
+                view
+            })
+            .collect();
+        title_memory_remapped(p, 3 * BLOCK);
+        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(p, 3)));
+        assert!((0..3).all(|b| !writable(p + b * BLOCK)));
+        writing(p, 3 * BLOCK);
+        assert!((0..3).all(|b| writable(p + b * BLOCK)), "neighbouring views");
+        assert_eq!(guard(p, p + 3 * BLOCK), Some(pages(p, 3)));
+        // A remapping opens them too.
+        title_memory_remapped(p, 3 * BLOCK);
+        assert!((0..3).all(|b| writable(p + b * BLOCK)), "remapped");
+        // SAFETY: our views, placeholder and section.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for block in 0..3 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: one as *mut _ });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(one, 3 * BLOCK);
         title_memory_remapped(p, 3 * BLOCK);
     }
 
