@@ -51,7 +51,8 @@ pub const SLOT_VIEW_ADDRESSES: u8 = 251;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   dword 0 of the user-data kind [`USER_MEMORY_BASE`] (dword 1: how many
+///   copies have a view for the bind; a later number reads as none); slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the

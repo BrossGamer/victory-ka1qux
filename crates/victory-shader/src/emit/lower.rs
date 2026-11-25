@@ -3050,6 +3050,14 @@ impl<'a> Lower<'a> {
         // A page without a copy: its number, at a place by the number, or
         // at the sink for lanes that do not run and pages that have one.
         let zero = k(self, 0);
+        // A copy numbered after this bind (by another recording thread, in
+        // the directory all lists share) may have no view in this bind's
+        // run yet: only the copies prepared for the bind are read (dword 1
+        // of `USER_MEMORY_BASE`); a later one is a page without a copy.
+        // After DexNom/VIctory 921d8d3.
+        let count = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 1);
+        let in_range = self.s.m.cmp(c, pred::IULE, copy, count);
+        let copy = self.s.m.select(c, in_range, copy, zero);
         let mut missing = self.s.m.cmp(c, pred::EQ, copy, zero);
         if let Some(g) = guard {
             missing = self.s.m.bin(c, Bin::And, missing, g);

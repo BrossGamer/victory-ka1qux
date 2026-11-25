@@ -151,6 +151,9 @@ pub(crate) struct Ready {
     pub(crate) faults: u64,
     /// The view heap slot of the null view; copy `n`'s view is `n` further.
     pub(crate) base: u32,
+    /// How many copies have their view in the run at this bind: shaders
+    /// read no later number (`USER_MEMORY_BASE` dword 1).
+    pub(crate) count: u32,
 }
 
 impl Memory {
@@ -685,6 +688,7 @@ pub(crate) fn ready(
             directory: m.directory.2,
             faults: m.faults.2,
             base,
+            count: m.copies.len() as u32,
         });
     }
     // Once per list, and for copies numbered since: the builder alone
@@ -712,6 +716,7 @@ pub(crate) fn ready(
         directory: m.directory.2,
         faults: m.faults.2,
         base,
+        count: m.copies.len() as u32,
     })
 }
 
