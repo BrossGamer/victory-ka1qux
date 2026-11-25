@@ -158,6 +158,13 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps, with the structure builder asked for: the title address
+    /// of the buffer or ray-tracing structure view at each title slot, for
+    /// shaders that take it out of a descriptor they pick by an index they
+    /// compute (`victory_shader::emit::SLOT_VIEW_ADDRESSES`): an upload
+    /// buffer of two dwords a slot, its GPU address and its mapping. After
+    /// victory-fork pull request 994.
+    addresses: Option<(ID3D12Resource, u64, usize)>,
     /// View heaps: the mark table of translated shaders' write marks
     /// (`victory_shader::emit`, "Write marks"; `crate::marks`): per slot,
     /// two dwords, the first bit and page offset of the unordered buffer
@@ -1320,6 +1327,20 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        // (16 MiB of upload memory a view heap: only for the builder's runs.)
+        let addresses = (!sampler && crate::pipeline::builder_allowed())
+            .then(|| {
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 8;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view addresses by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let marks = (!sampler)
             .then(|| {
                 let bytes = u64::from(size) * 8;
@@ -1349,6 +1370,7 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            addresses,
             marks,
             buffers: BufferViews::new(),
             textures: Mutex::default(),
@@ -1502,6 +1524,13 @@ impl HostHeap {
 
     /// The GPU address of the table of element strides by title slot (view
     /// heaps).
+    /// The table of view addresses by title slot (view heaps, with the
+    /// builder asked for): its GPU address and its buffer, for a list to
+    /// hold.
+    pub(crate) fn addresses(&self) -> Option<(u64, &ID3D12Resource)> {
+        self.addresses.as_ref().map(|a| (a.1, &a.0))
+    }
+
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
     }
@@ -2203,6 +2232,19 @@ impl HostHeap {
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
+        if let Some((_, _, data)) = &self.addresses
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            let address = view.map_or(0, view_address);
+            // SAFETY: inside the mapping (two dwords a slot); a shader that
+            // reads while we write may see half of the new address, as a
+            // console shader may read a descriptor the CPU is writing.
+            unsafe {
+                let at = (*data as *mut u32).add(2 * index as usize);
+                at.write_volatile(address as u32);
+                at.add(1).write_volatile((address >> 32) as u32);
+            }
+        }
         // The pass over buffer views takes the range of a slot it makes
         // itself: noted, not marked changed for the next pass, which looked
         // at every slot it made a second time (half of the 50,000 to
@@ -2853,6 +2895,26 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
         4
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+    }
+}
+
+/// The title address a buffer view or a ray-tracing structure view starts
+/// at; 0 for other views.
+fn view_address(view: &View) -> u64 {
+    if let Some((start, _)) = buffer_range(view) {
+        return start;
+    }
+    match view {
+        View::Shader(_, Some(words)) => {
+            let desc = srv_desc(words);
+            if desc.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE {
+                // SAFETY: the union member of that dimension.
+                unsafe { desc.Anonymous.RaytracingAccelerationStructure.Location }
+            } else {
+                0
+            }
+        }
+        _ => 0,
     }
 }
 

@@ -27,6 +27,18 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that reads the address out of a buffer descriptor it picks from the view
+/// heap at an index it computes, and uses it as a pointer (the title's sun
+/// shadow tracing takes the address of its ray-tracing structure so): a raw
+/// buffer of 2 x [`SLOT_STRIDES_COUNT`] dwords the host keeps, dwords `2i`
+/// and `2i + 1` the title address of the view at heap slot `i` (low dword,
+/// bits from 32 up; 0 for a slot without a buffer or structure view). As
+/// [`USER_VIEW_ADDRESS`] for a table entry at a fixed place. After
+/// victory-fork pull request 994 (PiloteCode), there slot 252, which the
+/// write marks hold here.
+pub const SLOT_VIEW_ADDRESSES: u8 = 251;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -96,6 +108,14 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 /// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
 /// for a normal thread-group dispatch (all threads in every group active).
 pub const USER_DISPATCH_THREADS: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`): while 0, every node test answers no hit
+/// without reading the node (a box node enters no child, any other node
+/// is a triangle missed). The title's passes run whether or not anything
+/// built the structures, and would otherwise walk whatever bytes lie where
+/// they would be. After victory-fork pull request 994 (PiloteCode).
+pub const USER_STRUCTURES: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

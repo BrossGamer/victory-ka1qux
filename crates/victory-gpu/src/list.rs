@@ -1594,9 +1594,9 @@ impl Uploads {
 
 /// List upload memory ([`allocate_upload`]) that shaders reach by address.
 ///
-/// The title's ray-tracing structure builder (`XboxBvhBuilder.dll`) writes
+/// The title's ray-tracing structure builder writes
 /// what its stages read into list upload memory and hands the stages its
-/// addresses: its header stage (InitHeaders) gets the address of its
+/// addresses: its header stage gets the address of its
 /// 40-byte records as a root view and reads them through a buffer
 /// descriptor it makes of that address, that is by address. Blocks of the
 /// process heap, which the layer gave out before, lie at 1.5-1.8 TiB (runs

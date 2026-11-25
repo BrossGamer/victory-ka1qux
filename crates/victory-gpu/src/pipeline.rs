@@ -258,6 +258,34 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// The builder runs whole and is not turned off ([`Builder`]): read at
+/// every dispatch of a program that walks the structures
+/// ([`structures_walked`]), without the builder's lock.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the programs that walk the title's ray-tracing structures may
+/// read their nodes (`victory_shader::emit::USER_STRUCTURES`); while not,
+/// every node test of theirs answers no hit without reading memory: no box
+/// is entered and no triangle hit, so their rays see an empty scene instead
+/// of whatever bytes lie where the structures would be (victory-fork pull
+/// request 994 saw screen-aligned dark tiles on sunlit hair, lit squares in
+/// shadow, and light changing from run to run). True while the builder
+/// runs whole. Otherwise: with the builder asked for ([`builder_allowed`]),
+/// false (before its first dispatch, or once turned off); without it, true,
+/// as before. `VICTORY_BVH_NO_HIT=1` makes it false without the builder,
+/// `=0` true always.
+#[cfg(windows)]
+pub(crate) fn structures_walked() -> bool {
+    static WALK: OnceLock<bool> = OnceLock::new();
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        || *WALK.get_or_init(|| match std::env::var("VICTORY_BVH_NO_HIT").as_deref() {
+            Ok("0") => true,
+            Ok("1") => false,
+            _ => !builder_allowed(),
+        })
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -381,6 +409,7 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
@@ -450,6 +479,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 

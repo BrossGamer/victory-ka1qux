@@ -491,7 +491,36 @@ impl Drop for Memory {
 /// Runs every batch on the hardware adapter and WARP and compares with
 /// the reference. `pointers` is what node pointers count from, in bytes
 /// before the first node.
+/// What the instruction gives while no structure may be read
+/// ([`super::USER_STRUCTURES`] 0): a box node no child, any other node a
+/// triangle missed.
+fn absent(case: &Case) -> [u32; 4] {
+    match case {
+        Some((_, 4 | 5, _)) => [bvh::NONE; 4],
+        Some(_) => bvh::MISS.map(f32::to_bits),
+        None => BEFORE,
+    }
+}
+
+/// The program's user data: zeros (its table is at heap slot 0), and
+/// whether the structures may be read (`built`, [`super::USER_STRUCTURES`]).
+fn constants(shader: &HostShader, built: bool) -> Vec<u32> {
+    let mut values = vec![0; (shader.user_data_dwords() as usize).max(5)];
+    for u in &shader.user_data {
+        if u.root == RootType::Other(super::USER_STRUCTURES) {
+            values[u.index as usize] = u32::from(built);
+        }
+    }
+    values
+}
+
 fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
+    run_built(wide, descriptor, pointers, sort, true);
+}
+
+/// [`run`], with the structures readable or not ([`super::USER_STRUCTURES`];
+/// if not, every result is [`absent`]).
+fn run_built(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool, built: bool) {
     let (shader, res) = build(wide, descriptor).expect("the program lowers");
     assert_eq!(res.bvh.len(), 1);
     let (scene, batches) = scene();
@@ -549,7 +578,7 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
                     &root,
                     &pso,
                     &Dispatch {
-                        roots: vec![(0, Root::Constants(vec![0; 5]))],
+                        roots: vec![(0, Root::Constants(constants(&shader, built)))],
                         views: &[
                             View::Buffer {
                                 data: &data,
@@ -565,7 +594,8 @@ fn run(wide: bool, descriptor: Descriptor, pointers: u64, sort: bool) {
             for t in 0..THREADS as usize {
                 let case = batch.get(t).copied().flatten();
                 let want = match batch.get(t) {
-                    Some(c) => expected(&scene, c, sort),
+                    Some(c) if built => expected(&scene, c, sort),
+                    Some(c) => absent(c),
                     // A thread past the batch: its record is zeros, so it
                     // is masked out.
                     None => BEFORE,
@@ -611,6 +641,21 @@ fn the_64_bit_node_test_over_title_memory_matches_the_reference_on_the_card() {
     // address folded into a 64-bit pointer.
     let _memory = Memory::at(BASE);
     run(true, WHOLE, BASE + u64::from(NODES), true);
+}
+
+#[test]
+fn with_no_structure_readable_every_node_test_answers_no_hit_on_the_card() {
+    // USER_STRUCTURES 0: a box node enters no child and any other node is
+    // missed, over title memory and in a host buffer alike; threads masked
+    // out keep their registers.
+    {
+        let base = 0x312_3456_7800u64;
+        let structure = base + u64::from(NODES);
+        let _memory = Memory::at(base);
+        let descriptor = Descriptor::Numbers((structure >> 8) as u32, (structure >> 40) as u32);
+        run_built(false, descriptor, 0, false, false);
+    }
+    run_built(true, Descriptor::Table, u64::from(NODES), true, false);
 }
 
 #[test]
