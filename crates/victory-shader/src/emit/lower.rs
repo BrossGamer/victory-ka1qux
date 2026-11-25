@@ -1020,6 +1020,17 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Samples whose level the hardware takes from the derivatives across a quad.
+const IMPLICIT_SAMPLES: [&str; 3] = ["image_sample", "image_sample_o", "image_sample_cl"];
+
+/// Whether a compute program's samples with implicit derivatives take them from the lanes of
+/// their quad ([`Lower::quad_gradients`]) instead of reading level 0. On by default;
+/// `VICTORY_COMPUTE_GRADIENTS=0` reads level 0 as before.
+fn compute_gradients() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_GRADIENTS").is_none_or(|v| v != "0"))
+}
+
 /// Whether a wave sum of 16-bit floats where not every lane runs, in one host wave of 64
 /// lanes, is taken near the console's ([`Lower::half_sum_near`]) instead of refused.
 /// On by default; `VICTORY_HALF_SUM_NEAR=0` refuses it as before.
@@ -1287,6 +1298,8 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    // its derivatives are its quad's (`Lower::quad_gradients`)
+                    || IMPLICIT_SAMPLES.contains(&n) && compute_gradients()
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -4399,6 +4412,41 @@ impl<'a> Lower<'a> {
         let i1 = self.s.t.i1;
         let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
         self.s.m.select(c, helper, own, first)
+    }
+
+    /// The derivatives of coordinates `cs` across this lane's quad, as the
+    /// console takes them for a sample with implicit derivatives outside a
+    /// pixel shader: lane 1 of the quad less lane 0 along x, lane 2 less
+    /// lane 0 along y; then the six gradients of `sampleGrad` (x of each
+    /// coordinate, then y; unused ones undefined). The host gives compute
+    /// programs no implicit derivatives, and such samples read level 0:
+    /// over 700 compute programs, among them the resolves of the scene's
+    /// materials and the sky, took the largest level of every texture
+    /// whatever its distance. Needs the console's lanes (the program asks
+    /// for them when it has such samples).
+    /// (After Belobug/VIctory-Belobug-AMD e510ba7, from upstream PR #180.)
+    fn quad_gradients(&mut self, cs: &[V]) -> Vec<V> {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let lane = self.console_lane();
+        let quad = self.s.m.i32(!3);
+        let base = self.s.m.bin(c, Bin::And, lane, quad);
+        let (one, two) = (self.s.m.i32(1), self.s.m.i32(2));
+        let right = self.s.m.bin(c, Bin::Or, base, one);
+        let below = self.s.m.bin(c, Bin::Or, base, two);
+        let fu = self.s.m.undef(self.s.t.f32);
+        let mut g = vec![fu; 6];
+        for (k, &x) in cs.iter().enumerate().take(3) {
+            let bits = self.as_int(x);
+            let at = |l: &mut Self, lane: V| {
+                let v = l.read_lane(bits, lane);
+                l.as_float(v)
+            };
+            let (b, r, d) = (at(self, base), at(self, right), at(self, below));
+            g[k] = self.s.m.bin(c, Bin::Sub, r, b);
+            g[3 + k] = self.s.m.bin(c, Bin::Sub, d, b);
+        }
+        g
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -10186,10 +10234,24 @@ impl<'a> Lower<'a> {
                 // incompatible with the shader stage": 730 compute programs,
                 // among them the G-buffer resolves and the sky), and what a
                 // driver does with it is its own affair.
-                // shortcut: such a sample reads level 0 (a bias: that
-                // level). The console takes derivatives from neighbouring
-                // lanes there; compute them from the lanes if a resolve
-                // shows the wrong mip.
+                // The console takes derivatives from the lanes of the quad
+                // there ([`Self::quad_gradients`]): the sample takes them
+                // so where the host's lanes are the console's.
+                // shortcut: a cube's, a sample with a bias and one in two
+                // host waves that exchange read level 0 (a bias: that
+                // level).
+                60 if !self.s.pixel
+                    && kind != 5
+                    && self.console_lanes
+                    && self.exchange.is_none()
+                    && compute_gradients() =>
+                {
+                    let g = self.quad_gradients(&cs[..spatial]);
+                    args.extend(&os);
+                    args.extend(g);
+                    args.push(clamp);
+                    call_sample(self, "sampleGrad.f32", 63, &args, &mut gathered)
+                }
                 60 if !self.s.pixel => {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
