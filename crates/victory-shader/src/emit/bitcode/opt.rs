@@ -4901,6 +4901,9 @@ mod tests {
             });
             let elapsed = t0.elapsed();
             let shader = HostShader {
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
+                half_views: Vec::new(),
                 stage: HwStage::Cs,
                 dxil,
                 user_data: (0..4)
@@ -5002,6 +5005,9 @@ mod tests {
             });
             let elapsed = t0.elapsed();
             let shader = HostShader {
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
+                half_views: Vec::new(),
                 stage: HwStage::Cs,
                 dxil,
                 user_data: (0..4)
@@ -5129,6 +5135,9 @@ mod tests {
             });
             let elapsed = t0.elapsed();
             let shader = HostShader {
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
+                half_views: Vec::new(),
                 stage: HwStage::Cs,
                 dxil: lowered.dxil,
                 user_data: lowered.user_data,
@@ -5523,6 +5532,9 @@ mod tests {
                     .unwrap()
                 });
                 let shader = HostShader {
+                    written_root_uavs: Vec::new(),
+                    writes_guest_memory: false,
+                    half_views: Vec::new(),
                     stage: HwStage::Cs,
                     dxil: lowered.dxil,
                     user_data: lowered.user_data,
@@ -5750,6 +5762,9 @@ mod tests {
                 let insts = crate::emit::census::take(&lowered.dxil).map(|c| c.counts[0]);
                 validate_dxil(&lowered.dxil);
                 let wf_shader = HostShader {
+                    written_root_uavs: Vec::new(),
+                    writes_guest_memory: false,
+                    half_views: Vec::new(),
                     stage: HwStage::Cs,
                     dxil: lowered.dxil,
                     user_data: lowered.user_data,
