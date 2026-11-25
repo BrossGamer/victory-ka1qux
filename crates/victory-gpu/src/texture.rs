@@ -776,7 +776,8 @@ impl Staging {
         // What it is no view any more is asked as the first time.
         let mut by_guards = None;
         if self.guarded.load(std::sync::atomic::Ordering::Relaxed) {
-            by_guards = waited(1, || crate::watch::writes_guarded(start, start + size));
+            by_guards = waited(1, || crate::watch::writes_guarded(start, start + size))
+                .map(|(now, written, _)| (now, written));
             if by_guards.is_none() {
                 self.guarded.store(false, std::sync::atomic::Ordering::Relaxed);
             }

@@ -127,6 +127,10 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// Refreshes of view memory passed over with nothing asked, as found
+    /// all clean before (`shadow::clean_spans`), and their bytes.
+    CleanSkips,
+    CleanSkipBytes,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1099,7 +1103,8 @@ pub(crate) fn log(frames: f64) {
          threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
          refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
          {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
+         guards {:.1} ms ({:.0} refreshes of view memory clean since their last look not asked, \
+         {:.1} MB); {:.1} MB copied whole (memory not watched); {:.1} frame waits \
          sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
          {:.0} steps {:.1} MB left out",
         c[C::RecordCalls as usize],
@@ -1115,6 +1120,8 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BackCompared as usize]),
         ms(c[C::SparseUs as usize]),
         ms(c[C::GuardUs as usize]),
+        c[C::CleanSkips as usize],
+        mb(c[C::CleanSkipBytes as usize]),
         mb(c[C::WholeBytes as usize]),
         c[C::PaceWaits as usize],
         ms(c[C::PaceUs as usize]),

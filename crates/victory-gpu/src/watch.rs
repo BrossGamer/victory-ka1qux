@@ -37,6 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -402,7 +403,10 @@ pub(crate) fn writes_how(start: usize, end: usize, guarded: bool) -> Option<(u64
 /// asked it again for each such range, halving runs that held one:
 /// system calls that fail, thousands a frame. `VICTORY_GUARD_KNOWN=0`
 /// asks the write watch first every time, as before.
-pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+///
+/// Also whether every block of the range is clean after the asking
+/// ([`guard_changes`] then tells whether it still is).
+pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Held across the guards' answer, as `writes` holds it: another asker
     // must not find the blocks clean before their writes are in the
@@ -410,7 +414,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let written = guard(first * PAGE, last * PAGE)?;
+    let (written, settled) = guard_settled(first * PAGE, last * PAGE)?;
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -431,6 +435,7 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
+        settled,
     ))
 }
 
@@ -480,10 +485,63 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Clean blocks made written, by 64 MiB region of addresses (folded into
+/// [`REGIONS`] counters): while the count of a range's regions stays as
+/// it was, no block of it has been taken out of the clean ones, so a range
+/// all clean then is all clean still ([`guard_changes`]). Counted under
+/// the guards' lock, after the blocks are taken out.
+static REGION_CHANGES: [AtomicU64; REGIONS] = [const { AtomicU64::new(0) }; REGIONS];
+const REGION_SHIFT: u32 = 26;
+const REGIONS: usize = 1024;
+
+/// Counts a change in the regions of blocks `[from, to)`.
+fn changed(from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let (first, last) = (block_region(from), block_region(to - 1));
+    if last - first >= REGIONS {
+        for counter in &REGION_CHANGES {
+            counter.fetch_add(1, Ordering::Release);
+        }
+        return;
+    }
+    for region in first..=last {
+        REGION_CHANGES[region % REGIONS].fetch_add(1, Ordering::Release);
+    }
+}
+
+fn block_region(block: usize) -> usize {
+    block.saturating_mul(BLOCK) >> REGION_SHIFT
+}
+
+/// The changes counted so far in the regions of `[start, end)`: as long
+/// as it is the same, no guarded block there was written, mapped or
+/// unmapped since. It only grows.
+pub(crate) fn guard_changes(start: usize, end: usize) -> u64 {
+    if start >= end {
+        return 0;
+    }
+    let (first, last) = (start >> REGION_SHIFT, (end - 1) >> REGION_SHIFT);
+    if last - first >= REGIONS {
+        return REGION_CHANGES.iter().map(|c| c.load(Ordering::Acquire)).fold(0, u64::wrapping_add);
+    }
+    (first..=last)
+        .map(|region| REGION_CHANGES[region % REGIONS].load(Ordering::Acquire))
+        .fold(0, u64::wrapping_add)
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    guard_settled(start, end).map(|(written, _)| written)
+}
+
+/// [`guard`], and whether every block of the range is clean after it:
+/// none absent, held or left unguarded, which the next asking would take
+/// as written again whatever happened.
+fn guard_settled(start: usize, end: usize) -> Option<(Vec<usize>, bool)> {
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -513,7 +571,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
     if clean.len() == last - first {
         // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
+        return Some((written, true));
     }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
@@ -570,7 +628,8 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             link(&mut g, pairs);
         }
     }
-    Some(written)
+    let settled = g.clean.range(first..last).count() == last - first;
+    Some((written, settled))
 }
 
 /// Whether writes through another view of a guarded block's pages are seen
@@ -751,10 +810,14 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
     }
     make_writable_runs(&blocks);
+    if let (Some(&from), Some(&to)) = (blocks.first(), blocks.last()) {
+        changed(from, to + 1);
+    }
     let mut alone = Vec::new();
     for &block in &linked {
         for guarded in g.links.remove(&block).unwrap_or_default() {
             g.clean.remove(&guarded);
+            changed(guarded, guarded + 1);
         }
         if blocks.binary_search(&block).is_err() {
             alone.push(block);
@@ -864,6 +927,7 @@ impl Drop for Writing {
             if !still {
                 // What the guarded block showed may predate the write.
                 clean.remove(&guarded);
+                changed(guarded, guarded + 1);
             }
             still
         });
@@ -1024,6 +1088,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.clean.remove(&block);
     }
     make_writable_runs(&blocks);
+    // Only guarded blocks were clean: a range noted all clean is all
+    // guarded, so a remapping elsewhere changes nothing it holds.
+    if let (Some(&from), Some(&to)) = (blocks.first(), blocks.last()) {
+        changed(from, to + 1);
+    }
     // Read-write as well; what they show now is linked again when the
     // runtime tells of it (`crate::title_memory_view`).
     let linked: Vec<usize> = g.links.range(range).map(|(&block, _)| block).collect();
@@ -1672,6 +1741,59 @@ mod tests {
         // The kernel writes into the pool once the runtime opened it.
         writing(pool, 1);
         assert_eq!(guard(texture, texture + 2 * BLOCK), Some(pages(texture, 0)));
+    }
+
+    /// A range of view memory asked of the guards alone is said all clean
+    /// once guarded, and the count of changes of its regions moves with
+    /// every way a clean block stops being clean: a write of the title's,
+    /// one the runtime tells of, one under way, and a remapping. (Only
+    /// growth is checked: other tests may change the same regions.)
+    #[test]
+    fn guard_changes_move_whenever_a_clean_block_is_written() {
+        let mut shown = Shown::new();
+        let at = shown.map(false);
+        let range = (at, at + 2 * BLOCK);
+        let all: Vec<usize> = (at / PAGE..(at + 2 * BLOCK) / PAGE).collect();
+        let (_, written, settled) = writes_guarded(range.0, range.1).expect("a view");
+        assert_eq!(written.into_iter().map(|(page, _)| page).collect::<Vec<_>>(), all);
+        assert!(settled, "all guarded");
+        let (_, _, settled) = writes_guarded(range.0, range.1).expect("a view");
+        assert!(settled);
+        let count = || guard_changes(range.0, range.1);
+        // The title writes.
+        let before = count();
+        // SAFETY: inside the view's second block.
+        unsafe { ((at + BLOCK + 8) as *mut u8).write_volatile(1) };
+        assert!(count() > before, "a write of the title's");
+        assert!(writes_guarded(range.0, range.1).expect("a view").2);
+        // The runtime tells of a write.
+        let before = count();
+        writing(at + 8, 1);
+        assert!(count() > before, "a write told");
+        assert!(writes_guarded(range.0, range.1).expect("a view").2);
+        // A write under way: not clean while it lasts, changed when done.
+        let before = count();
+        let held = writing_held(at + 8, 1);
+        assert!(count() > before, "a write under way");
+        let (_, _, settled) = writes_guarded(range.0, range.1).expect("a view");
+        assert!(!settled, "a block held open is not clean");
+        drop(held);
+        assert!(writes_guarded(range.0, range.1).expect("a view").2);
+        // A remapping.
+        let before = count();
+        title_memory_remapped(at, 2 * BLOCK);
+        assert!(count() > before, "a remapping");
+        // Memory that is no view is not answered for.
+        let local = [0u8; 16];
+        let mine = local.as_ptr() as usize;
+        assert!(writes_guarded(mine, mine + local.len()).is_none());
+        // The journal forgets the view's pages before the address is given
+        // back: a test that is handed it next starts from nothing written.
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j.written.range(at / PAGE..(at + 2 * BLOCK) / PAGE).map(|(&p, _)| p).collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
     }
 
     /// A kernel write into pages another view guards must not fail because

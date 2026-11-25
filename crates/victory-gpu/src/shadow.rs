@@ -38,6 +38,11 @@ pub(crate) struct Shadow {
     /// Whether the memory is write-watched: unknown, yes, no, or view
     /// memory, which the guards answer for ([`GUARDED`]).
     watched: AtomicU8,
+    /// Ranges of view memory found all clean by their last refresh, with
+    /// the guards' count of changes in their regions then
+    /// (`crate::watch::guard_changes`): while the count is the same, a
+    /// refresh of the range has nothing to copy ([`clean_spans`]).
+    clean: Mutex<std::collections::HashMap<(usize, usize), u64>>,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
@@ -860,6 +865,40 @@ const NOT_WATCHED: u8 = 2;
 /// [`Shadow::watched`]: view memory, asked of the guards alone
 /// (`crate::watch::writes_guarded`).
 const GUARDED: u8 = 3;
+
+/// Whether a refresh of view memory that its last refresh found all clean
+/// is passed over while no guarded block of its regions was written,
+/// mapped or unmapped since (`crate::watch::guard_changes`).
+///
+/// A frame refreshes some 10 GB of view memory in tens of thousands of
+/// ranges, nearly all of it unchanged, and each refresh walked the guards'
+/// sets and the journal under their locks (the frame line's "guards",
+/// 22-24 ms a frame, on the submitting threads and in the way of the
+/// title's threads, whose write faults take the same lock). Nothing else
+/// changes: a range is passed over only when the asking would have found
+/// nothing to copy. `VICTORY_CLEAN_SPANS=0` asks every time; the
+/// diagnostics that look at the copies (`VICTORY_FULL_REFRESH`,
+/// `VICTORY_STALE_CHECK`, `VICTORY_REFRESH_CHECK`) turn it off.
+fn clean_spans() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CLEAN_SPANS").is_none_or(|v| v != "0")
+            && crate::watch::guards_known()
+            && stale_check() == 0
+            && !refresh_checks()
+    })
+}
+
+/// Whether [`Shadow::refresh_check`] runs (`VICTORY_REFRESH_CHECK=1`, or
+/// the walls trace).
+fn refresh_checks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1") || crate::host::walls_trace())
+}
+
+/// The most ranges a copy keeps in [`Shadow::clean`] (forgotten all at
+/// once beyond it).
+const CLEAN_SPANS: usize = 1024;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1747,6 +1786,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
+            clean: Mutex::default(),
             pending: Mutex::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
@@ -2436,16 +2476,49 @@ impl Shadow {
         }
         let watched = self.watched.load(Ordering::Relaxed);
         if watched != NOT_WATCHED {
+            // View memory found all clean at an earlier refresh of this
+            // range, with nothing taken out of the clean blocks of its
+            // regions since: the copy holds what the title does there.
+            let changes = (watched == GUARDED && clean_spans()).then(|| crate::watch::guard_changes(from, to));
+            if let Some(changes) = changes
+                && self.clean.lock().unwrap_or_else(|e| e.into_inner()).get(&(from, to)) == Some(&changes)
+            {
+                // What the asking would still copy: a page the range holds
+                // in part and no refresh of this copy took whole.
+                let copied = self.copy_never_taken_ends(from, to);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    add(C::CleanSkips, 1);
+                    add(C::CleanSkipBytes, (to - from) as u64);
+                }
+                return copied;
+            }
             // View memory found so before: the guards alone (unless it is
             // no view now; then asked as the first time).
-            let known = (watched == GUARDED)
-                .then(|| crate::watch::writes_guarded(from, to))
-                .flatten()
-                .map(|(now, written)| (now, written, true));
+            let known = (watched == GUARDED).then(|| crate::watch::writes_guarded(from, to)).flatten();
+            let settled = known.as_ref().is_some_and(|k| k.2);
+            let known = known.map(|(now, written, _)| (now, written, true));
             if let Some((now, written, by_guards)) = known.or_else(|| crate::watch::writes_how(from, to, true)) {
                 let guarded = by_guards && crate::watch::guards_known();
                 self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                // All clean after the asking, and nothing taken out of the
+                // clean blocks since the count was read (before it): the
+                // copy is the title's here until the count moves. Noted
+                // with the count read before, so a change between is seen.
+                if let Some(changes) = changes
+                    && settled
+                    && crate::watch::guard_changes(from, to) == changes
+                {
+                    let mut clean = self.clean.lock().unwrap_or_else(|e| e.into_inner());
+                    if clean.len() >= CLEAN_SPANS {
+                        clean.clear();
+                    }
+                    clean.insert((from, to), changes);
+                }
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2477,8 +2550,7 @@ impl Shadow {
     /// the copy and the address. One that differs once is a write of the
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1") || crate::host::walls_trace()) {
+        if !refresh_checks() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -2522,6 +2594,28 @@ impl Shadow {
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
         }
+    }
+
+    /// Of `[from, to)`: the parts of its first and last pages that no
+    /// refresh of this copy has taken whole (a page the range holds only
+    /// in part is copied in part at every refresh, and stays never taken,
+    /// [`Shadow::copy_stale`]). Returns the bytes copied.
+    fn copy_never_taken_ends(&self, from: usize, to: usize) -> usize {
+        let base = self.start as usize / PAGE;
+        let (first, last) = (from / PAGE, (to - 1) / PAGE);
+        let never: Vec<usize> = {
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let mut never: Vec<usize> = [first, last]
+                .into_iter()
+                .filter(|&page| copied.get(page - base).is_some_and(|&at| at == 0))
+                .collect();
+            never.dedup();
+            never
+        };
+        never
+            .into_iter()
+            .map(|page| self.copy((page * PAGE).max(from), ((page + 1) * PAGE).min(to)))
+            .sum()
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
