@@ -122,6 +122,10 @@ pub const USER_STRUCTURES: u32 = 0x106;
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
@@ -572,9 +576,14 @@ impl Shader {
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
         let passes = super::shader_opt() & super::bitcode::opt::MODULE;
+        // Native 16-bit types (`half` arithmetic, module notes "16-bit
+        // floats") are declared exactly where live code still has them:
+        // flags, the SFI0 bit and the module's data layout.
+        let native16;
         if passes != 0 {
             self.m.optimise(passes);
             let used = self.m.usage();
+            native16 = used.native16;
             let has_bary_input = self.inputs.iter().any(|e| e.kind == 28);
             for (flag, used) in [
                 (flags::WAVE_OPS, used.wave_ops),
@@ -593,7 +602,16 @@ impl Shader {
             for (e, mask) in self.inputs.iter_mut().zip(input_usage) {
                 e.usage = mask;
             }
+        } else {
+            native16 = self.m.usage().native16;
         }
+        let low = flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION;
+        self.flags = if native16 {
+            self.flags | low
+        } else {
+            self.flags & !low
+        };
+        self.m.native16 = native16;
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -919,6 +937,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;

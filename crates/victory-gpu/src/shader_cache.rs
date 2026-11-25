@@ -105,8 +105,8 @@ fn build() -> [u8; 32] {
 /// `victory translate --warm <file>`: `container` is translated into the
 /// cache unless it is there already. `Ok(true)`: it was translated now;
 /// `Err`: it does not translate. Needs [`use_shader_cache`] and the host
-/// facts the run will have ([`prepare_host`], or `VICTORY_HOST_WAVE` and
-/// `VICTORY_VIEW_LIMIT`).
+/// facts the run will have ([`prepare_host`], or `VICTORY_HOST_WAVE`,
+/// `VICTORY_VIEW_LIMIT` and `VICTORY_HOST_NATIVE16`).
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     match precompile_shader(container)? {
         PrecompileOutcome::Translated => Ok(true),

@@ -99,8 +99,8 @@ enum Command {
         /// hex digits a run's log names a shader by, anywhere in a line);
         /// the containers with those hashes are translated into the
         /// cache and nothing else is done (`all`: every container found).
-        /// Set `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` to what the
-        /// run's log says of the host.
+        /// Set `VICTORY_HOST_WAVE`, `VICTORY_VIEW_LIMIT` and
+        /// `VICTORY_HOST_NATIVE16` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
     },
@@ -191,6 +191,11 @@ fn main() -> Result<()> {
             // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
+            }
+            // `VICTORY_HOST_NATIVE16=1`: translate as for a GPU with native 16-bit operations
+            // (f16 arithmetic in `half`; the run's log says "host native 16-bit float operations")
+            if std::env::var_os("VICTORY_HOST_NATIVE16").is_some_and(|v| v == "1") {
+                victory_shader::emit::set_host_native16(true);
             }
             if let Some(file) = warm {
                 return translate::warm_hashes(paths, &file, jobs);

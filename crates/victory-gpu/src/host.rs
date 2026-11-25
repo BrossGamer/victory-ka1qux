@@ -733,6 +733,20 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // native 16-bit operations: translated shaders then do the console's f16 arithmetic in
+        // `half` (`VICTORY_F16_IN_F32=1` keeps it in f32; after upstream VIctory's pull
+        // request 2825)
+        let mut o4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+        let native16 = device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS4, (&raw mut o4).cast(), size_of_val(&o4) as u32)
+            .is_ok()
+            && o4.Native16BitShaderOpsSupported.as_bool();
+        victory_shader::emit::set_host_native16(native16);
+        tracing::info!(
+            supported = native16,
+            native = victory_shader::emit::host_native16(),
+            "host native 16-bit float operations"
+        );
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();

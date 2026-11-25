@@ -99,6 +99,32 @@
 //!   every mark where it is made; a lowering whose counts differ (a path
 //!   that writes without marking) is done again without marks, as is a
 //!   program whose root signature would grow past what the host takes.
+//! * **16-bit floats** (native `half` where [`host_native16`]; added
+//!   2026-11-25, after upstream VIctory's pull request 2825 by
+//!   0xkn0wh3r3). Without it, an f16 operation is done in f32 on its
+//!   widened sources and the result converted to f16 by the host
+//!   (`legacyF32ToF16`, which may round toward zero; `VICTORY_F16_NEAREST=1`
+//!   rounds to nearest even in integer code). With it, where the program
+//!   rounds 16-bit results to nearest even (MODE bits 3:2 known to be 0 at
+//!   the instruction), `v_add/sub/subrev/mul_f16`, `v_fma/fmac_f16`,
+//!   `v_min/max/min3/max3/med3_f16` and the packed
+//!   `v_pk_add/mul/fma/min/max_f16` are `half` arithmetic (SM 6.2 16-bit
+//!   types, flagged as native low precision, the 16-bit data layout and
+//!   SFI0's native 16-bit bit, only where live code keeps them): sums,
+//!   differences and products rounded once to nearest even, as the
+//!   console does; the exact minima and maxima, with the -0/+0 order and
+//!   the clamp (+0 for NaN and -0) decided on the bits; NaN payloads are
+//!   the host's. A fused multiply-add rounds once where the host's 16-bit
+//!   `FMad` is fused (as RDNA's `v_fma_f16`), where the f32 path rounds the
+//!   f32 sum, then that. Toward zero (the title's around its 16-bit
+//!   interpolation), toward an infinity or a mode not known, an output
+//!   modifier, conversions, interpolation, `v_mad/mac_f16`, `v_fma_mix*`
+//!   and the transcendental and rounding operations stay on the f32 path.
+//!   Only arithmetic changes: every value crosses in and out of `half` as
+//!   bits in an i32, so no signature, output or memory access has a 16-bit
+//!   type (16-bit floats a mesh program outputs arrive as zeros in the
+//!   pixel program on the RX 7800 XT). `VICTORY_F16_IN_F32=1` keeps the
+//!   f32 path on any host.
 
 mod bitcode;
 mod container;
@@ -113,6 +139,8 @@ pub mod host;
 mod lower;
 #[cfg(all(test, windows))]
 mod marks_tests;
+#[cfg(all(test, windows))]
+mod native16_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -140,7 +168,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_max_wave};
+pub use lower::{host_max_wave, host_native16, set_host_max_wave, set_host_native16};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -274,9 +302,10 @@ pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
 /// Everything a translation depends on besides the container: the
 /// translator's own source (hashed at build time), the value of every
 /// `VICTORY_*` switch it reads, the host facts the device hands it (widest
-/// wave, view heap limit) and the settings above. The shader cache keys on
-/// this instead of on the whole executable, so a rebuild that leaves the
-/// translator alone keeps its translations. Call it after the device is made.
+/// wave, native 16-bit operations, view heap limit) and the settings
+/// above. The shader cache keys on this instead of on the whole
+/// executable, so a rebuild that leaves the translator alone keeps its
+/// translations. Call it after the device is made.
 pub fn translation_fingerprint() -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
@@ -291,6 +320,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
         out.push(0);
     }
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.push(u8::from(lower::host_native16()));
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
     out.push(group_sync());

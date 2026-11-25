@@ -68,6 +68,8 @@ struct Tally {
     /// (`emit::USER_GROUP_BASE`: a dispatch of more groups than the host
     /// runs in one dimension is run in parts for them).
     cs_group_base: usize,
+    /// Programs doing f16 arithmetic in native `half` (`VICTORY_HOST_NATIVE16=1`).
+    native16: usize,
     /// The same for mesh programs.
     ms_programs: usize,
     ms_emitted: usize,
@@ -131,6 +133,7 @@ impl Tally {
         self.cs_validated += other.cs_validated;
         self.cs_pipelines += other.cs_pipelines;
         self.cs_group_base += other.cs_group_base;
+        self.native16 += other.native16;
         self.ms_programs += other.ms_programs;
         self.ms_emitted += other.ms_emitted;
         self.ms_validated += other.ms_validated;
@@ -358,6 +361,7 @@ pub fn run(
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
     );
     println!("             {} of the compute programs take a group base", t.cs_group_base);
+    println!("             {} of the programs do f16 arithmetic in native half", t.native16);
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
@@ -811,6 +815,21 @@ fn check(
         t.cs_group_base += 1;
         if t.list {
             t.lines.push(format!("{}  takes a group base", label()));
+        }
+    }
+    // Native 16-bit operations (SFI0), where f16 arithmetic is native `half`.
+    let features = |c: Container<'_>| -> Option<u64> {
+        let bytes = c.part(FourCC::SFI0)?.data.get(..8)?;
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    };
+    let native16 = Container::parse(&shader.dxil)
+        .ok()
+        .and_then(features)
+        .is_some_and(|f| f & 0x4_0000 != 0);
+    if native16 {
+        t.native16 += 1;
+        if t.list {
+            t.lines.push(format!("{}  does f16 arithmetic in native half", label()));
         }
     }
     // `VICTORY_EMIT_DUMP` with `--list`: every emitted shader as a file.
