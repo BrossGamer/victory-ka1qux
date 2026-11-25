@@ -844,7 +844,17 @@ fn unlike(dst: This, src: This) -> bool {
             tracing::warn!(?dst, ?src, "copy between a stand-in target and title-format texels skipped")
         });
     }
-    unlike
+    // shortcut: a copy from or into a host copy without the title's largest
+    // mips (`crate::resource::drop_levels`) is not made; one into it keeps
+    // what the title's memory gives it.
+    let short = crate::resource::dropped(dst) > 0 || crate::resource::dropped(src) > 0;
+    if short {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(?dst, ?src, "copy with a texture whose host copy leaves out its largest mips skipped")
+        });
+    }
+    unlike || short
 }
 
 /// Copies left out because both sides were one host texture
@@ -1127,6 +1137,9 @@ fn read_back(
     }
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
         return Err("not a texture subresource into a placed footprint");
+    }
+    if crate::resource::dropped(src.resource) > 0 {
+        return Err("a texture whose host copy leaves out its largest mips");
     }
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");

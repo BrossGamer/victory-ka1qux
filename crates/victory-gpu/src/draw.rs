@@ -388,6 +388,11 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Since the start, for the memory line: slots not made because the card
+/// had no room, and slots made while it had none, without their largest
+/// mips (`crate::resource::ShortOfRoom`).
+pub(crate) static HEAP_TEXTURES_REFUSED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static HEAP_TEXTURES_SHORT: AtomicU64 = AtomicU64::new(0);
 
 /// Where the heap's pass ([`State::heap_buffers`]) spends its time, since
 /// the last frame line (diagnostics builds; [`take_heap_pass_split`]):
@@ -2366,6 +2371,7 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
+            let (mut short, mut reupload) = (false, false);
             if !room && bake_source && crate::resource::room_for_bake() {
                 // A bake's own source: made past the line, up to the
                 // bake's ([`bake_sources_first`]).
@@ -2373,9 +2379,13 @@ impl State {
             } else if !room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
-                if !has_its_texture {
+                // Not whole, then: without its largest mips, up to a higher
+                // line ([`crate::resource::ShortOfRoom`]).
+                short = !has_its_texture && crate::resource::room_for_short();
+                if !has_its_texture && !short {
                     refused += 1;
                     add(split::REFUSED, 1);
+                    HEAP_TEXTURES_REFUSED.fetch_add(1, Ordering::Relaxed);
                     if full_card_pass() {
                         // Held back for the frames of about four seconds
                         // (`most`), or until the card has room; the pass
@@ -2389,6 +2399,15 @@ impl State {
                     }
                     continue;
                 }
+                if short {
+                    HEAP_TEXTURES_SHORT.fetch_add(1, Ordering::Relaxed);
+                }
+                reupload = has_its_texture;
+            }
+            // For the rest of this slot's turn: a host copy made here is
+            // made without its largest mips.
+            let _short = short.then(crate::resource::ShortOfRoom::begin);
+            if reupload {
                 let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
                 if n == 1 || n.is_multiple_of(500) {
                     tracing::info!(

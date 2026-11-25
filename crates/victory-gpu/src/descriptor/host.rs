@@ -3356,6 +3356,39 @@ fn twin_uav(
 /// whole 256s, and at most the 64 KiB a shader can index. The host removes
 /// the device for a larger view, and the title's heap holds such sizes in
 /// slots it does not use.
+/// A shader view `desc` of a texture whose host copy leaves out its
+/// `dropped` largest mips (`crate::resource::drop_levels`), made a view of
+/// that host copy: its mips moved down by them.
+/// (After victory-fork PR #610.)
+fn shift_view_levels(dropped: u32, desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) {
+    if dropped == 0 {
+        return;
+    }
+    let shift = crate::resource::shift_levels;
+    // SAFETY: the union member the view's dimension names.
+    unsafe {
+        match desc.ViewDimension {
+            D3D12_SRV_DIMENSION_TEXTURE2D => {
+                let t = &mut desc.Anonymous.Texture2D;
+                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                let t = &mut desc.Anonymous.Texture2DArray;
+                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                let t = &mut desc.Anonymous.TextureCube;
+                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                let t = &mut desc.Anonymous.TextureCubeArray;
+                shift(dropped, &mut t.MostDetailedMip, &mut t.MipLevels, &mut t.ResourceMinLODClamp);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn constant_bytes(size: u32) -> u32 {
     const LARGEST: u32 = 64 << 10;
     size.min(LARGEST).next_multiple_of(256)
@@ -3481,6 +3514,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         },
                     };
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                }
+                // A host copy without the title's largest mips: the view's
+                // mips are its own, that many lower.
+                if let Some(d) = desc.as_mut() {
+                    shift_view_levels(crate::resource::dropped(resource), d);
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {

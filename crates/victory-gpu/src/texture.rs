@@ -41,9 +41,13 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     /// The first of them that is uploaded, and the bytes of title memory
-    /// read for it and the smaller ones.
+    /// read for it and the smaller ones (title mips).
     first: u32,
     size: usize,
+    /// The title's largest mips the host texture leaves out
+    /// (`crate::resource::dropped`): host mip `m` is the title's
+    /// `m + dropped`, and `first` is never below it.
+    dropped: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
     memory: *const u8,
@@ -278,6 +282,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // Host copies with other mips than each other's: not copied.
+    if crate::resource::dropped(placed) != crate::resource::dropped(source) {
+        return false;
+    }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
@@ -756,6 +764,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
+    // (A host copy without the largest mips has none before its first.)
+    let first = first.max(crate::resource::dropped(resource));
     if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
         return;
     }
@@ -1002,10 +1012,12 @@ impl Staging {
         (self.memory as usize, self.size)
     }
 
-    /// The mip and the array slice of the `i`th part of the staging buffer.
+    /// The host texture's mip and the array slice of the `i`th part of the
+    /// staging buffer (the title's mip is `dropped` more).
     fn part(&self, i: usize) -> (u32, u32) {
-        let mips = self.mips - self.first;
-        (self.first + i as u32 % mips, i as u32 / mips)
+        let first = self.first - self.dropped;
+        let mips = self.mips - first;
+        (first + i as u32 % mips, i as u32 / mips)
     }
 
     /// The texture's subresource the `i`th part of the staging buffer is.
@@ -1304,10 +1316,16 @@ impl Staging {
                 linear.fill(0);
                 continue;
             }
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            // (Of a host copy without the title's largest mips, the title's
+            // mip is `dropped` more than the host's.)
+            if let Err(e) = self.layout.detile(
+                tiled,
+                mip + self.dropped,
+                slice,
+                linear,
+                pitch,
+                pitch * rows as usize,
+            ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
@@ -1578,7 +1596,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
-        && s.first <= first
+        && s.first <= first.max(s.dropped)
     {
         return Some(s.clone());
     }
@@ -1598,17 +1616,21 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    // A host copy without the title's largest mips begins at the first it
+    // has (`d` is the host texture's description, without them).
+    let dropped = crate::resource::dropped(resource);
+    let wanted = first.max(dropped);
     // Only where the title's layout can end behind the smaller mips.
-    let first = if first < u32::from(d.MipLevels) && layout.bytes_from(first) < layout.size {
-        first
+    let first = if wanted - dropped < u32::from(d.MipLevels) && layout.bytes_from(wanted) < layout.size {
+        wanted
     } else {
-        0
+        dropped
     };
     let size = layout.bytes_from(first) as usize;
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - (first - dropped)
     };
     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
     let mut rows = vec![0u32; count as usize];
@@ -1617,7 +1639,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     unsafe {
         host.device.GetCopyableFootprints(
             &d,
-            first,
+            first - dropped,
             count,
             0,
             Some(footprints.as_mut_ptr()),
@@ -1645,6 +1667,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         mips: u32::from(d.MipLevels),
         first,
         size,
+        dropped,
         bytes: total,
         memory,
         last: Mutex::default(),
@@ -1661,6 +1684,51 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
     map.insert(resource as usize, s.clone());
     add_to_address_index(&s);
     Some(s)
+}
+
+#[cfg(test)]
+mod short_tests {
+    /// A host copy made short of room leaves out the mips past 256 texels a
+    /// side, and its staging buffer begins at the title's first mip it has.
+    #[test]
+    fn a_texture_made_short_of_room_is_staged_from_the_mips_it_has() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        use windows_sys::Win32::System::Memory::*;
+        const BYTES: usize = 2 << 20;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        // A linear 512x512 RGBA8 texture with 4 mips, the title's to fill.
+        let description = [3, 0, 0, 0, 512, 0, 512, 0x4_0001, 28, 1, 0, 1, 0, 0];
+        let made = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = {
+                let _short = crate::resource::ShortOfRoom::begin();
+                crate::resource::host_resource(resource)?
+            };
+            Some((resource, host_texture.clone()))
+        });
+        // `None`: no GPU to make the host texture on.
+        if let Some((resource, host_texture)) = made {
+            assert_eq!(crate::resource::dropped(resource), 1);
+            // SAFETY: a live resource.
+            let d = unsafe { host_texture.GetDesc() };
+            assert_eq!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+            assert_eq!((d.Width, d.Height, d.MipLevels), (256, 256, 3));
+            let staging = super::staging(resource, &host_texture, 0).expect("staging");
+            assert_eq!((staging.first, staging.dropped), (1, 1));
+            assert_eq!(staging.footprints.len(), 3);
+            assert_eq!(staging.footprints[0].Footprint.Width, 256);
+            assert_eq!(staging.part(0), (0, 0));
+            assert_eq!(staging.subresource(2), 2);
+            assert_eq!(staging.size as u64, staging.layout.bytes_from(1));
+            // A view that asks for the title's mip 0 on asks for what it has.
+            assert!(std::sync::Arc::ptr_eq(&staging, &super::staging(resource, &host_texture, 0).unwrap()));
+            drop(staging);
+            super::unstage(resource);
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+    }
 }
 
 #[cfg(test)]
