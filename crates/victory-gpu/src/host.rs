@@ -8471,12 +8471,14 @@ impl Meter {
                 tracing::info!(
                     "buffer view records per frame: {:.0} named the view their slot showed and left it as it was, \
                      {:.0} were made (VICTORY_SAME_VIEWS=0: all made), {:.0} of them at the mirroring of copied \
-                     records (VICTORY_SYNC_MAKES=0: made null there and left to the pass); the pass over buffer \
-                     views looked at {:.0} slots made already (VICTORY_PASS_REVISITS=1: it looks again at every \
-                     slot it made)",
+                     records (VICTORY_SYNC_MAKES=0: made null there and left to the pass), {:.0} of those giving \
+                     their range to the pass, which does not look at them (VICTORY_SYNC_RANGES=0: it does); the \
+                     pass over buffer views looked at {:.0} slots made already (VICTORY_PASS_REVISITS=1: it looks \
+                     again at every slot it made)",
                     same as f64 / frames,
                     again as f64 / frames,
                     at_sync as f64 / frames,
+                    crate::descriptor::host::SYNC_TAKEN.swap(0, Ordering::Relaxed) as f64 / frames,
                     made as f64 / frames
                 );
             }

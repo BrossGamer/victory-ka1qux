@@ -24,6 +24,10 @@ pub(crate) struct BufferViews<T> {
     slots: Mutex<std::collections::BTreeSet<u32>>,
     changed: Mutex<std::collections::HashSet<u32>>,
     ranges: Mutex<BufferRanges<T>>,
+    /// Ranges of slots made elsewhere (at the mirroring of copied records,
+    /// [`sync_ranges`]) for the next pass to take as they are, without a
+    /// look at the slot: by slot, the last one given.
+    taken: Mutex<std::collections::HashMap<u32, (T, u64, u64)>>,
 }
 
 impl<T> BufferViews<T> {
@@ -35,7 +39,14 @@ impl<T> BufferViews<T> {
                 passes: 0,
                 by_slot: Default::default(),
             }),
+            taken: Mutex::default(),
         }
+    }
+
+    /// Slot `index` was made elsewhere and reads `range` (copy, from, to):
+    /// the next pass takes it without looking at the slot.
+    fn take_range(&self, index: u32, range: (T, u64, u64)) {
+        self.taken.lock().unwrap_or_else(|e| e.into_inner()).insert(index, range);
     }
 
     fn written(&self, index: u32, buffer: bool) {
@@ -65,8 +76,18 @@ impl<T> BufferViews<T> {
         let mut kept = self.ranges.lock().unwrap_or_else(|e| e.into_inner());
         let changed = std::mem::take(&mut *self.changed.lock().unwrap_or_else(|e| e.into_inner()));
         // A view may go stale without a write. Revisit all slots in a
-        // fresh heap and every 16 passes thereafter.
-        let slots = if kept.passes.is_multiple_of(16) {
+        // fresh heap and every 16 passes thereafter: with [`rolling_rescan`]
+        // a sixteenth of them at each pass.
+        let slots = if kept.passes > 0 && rolling_rescan() {
+            let phase = (kept.passes % 16) as u32;
+            let all = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+            // What the share's slots no longer are goes, as the whole set
+            // went every 16 passes.
+            kept.by_slot.retain(|&index, _| index % 16 != phase || all.contains(&index));
+            let mut slots: std::collections::HashSet<u32> = changed;
+            slots.extend(all.iter().copied().filter(|&index| index % 16 == phase));
+            slots.into_iter().collect()
+        } else if kept.passes.is_multiple_of(16) {
             kept.by_slot.clear();
             self.slots
                 .lock()
@@ -77,6 +98,10 @@ impl<T> BufferViews<T> {
         } else {
             changed.into_iter().collect()
         };
+        // The ranges given since the last pass, before the slots it looks
+        // at (a look at one of those takes what the slot shows now).
+        let taken = std::mem::take(&mut *self.taken.lock().unwrap_or_else(|e| e.into_inner()));
+        kept.by_slot.extend(taken);
         kept.passes = kept.passes.wrapping_add(1);
         (slots, kept)
     }
@@ -2183,7 +2208,9 @@ impl HostHeap {
         // at every slot it made a second time (half of the 50,000 to
         // 140,000 slots a frame in the open world).
         // `VICTORY_PASS_REVISITS=1`: marked, as before.
-        if in_heap_pass() && !pass_revisits() {
+        if SYNC_NOTING.get() {
+            SYNC_NOTED.set(self.buffers.noted(index, stride.is_some()));
+        } else if in_heap_pass() && !pass_revisits() {
             self.buffers.noted(index, stride.is_some());
         } else {
             self.buffers.written(index, stride.is_some());
@@ -2558,10 +2585,18 @@ impl HostHeap {
             }
             #[cfg(feature = "diagnostics")]
             let making = std::time::Instant::now();
+            let make_now = make_buffers && buffer_view_kind(&view);
+            // Made here and its range given to the pass ([`sync_ranges`]):
+            // the books note the slot without marking it changed.
+            let gives_range = make_now && sync_ranges();
+            SYNC_NOTING.set(gives_range);
+            SYNC_NOTED.set(false);
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            let stale_slots = self.note_buffer(index, Some(&view), for_draw);
+            SYNC_NOTING.set(false);
+            for stale in stale_slots {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
@@ -2574,7 +2609,6 @@ impl HostHeap {
             if let Some(texture) = waiting {
                 super::wait_for(texture, handle);
             }
-            let make_now = make_buffers && buffer_view_kind(&view);
             if make_now {
                 SYNC_MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
@@ -2610,6 +2644,18 @@ impl HostHeap {
                 && shows
             {
                 self.note_shown(index, sig);
+            }
+            // Where the books would have marked the slot for the pass (it is
+            // one of the buffer views, or was): the range the pass would
+            // take, given now. Without a copy, marked as before.
+            if gives_range && SYNC_NOTED.get() {
+                match buffer_copy(&view) {
+                    Some((copy, address, len)) => {
+                        self.buffers.take_range(index, (copy, address, address + len));
+                        SYNC_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    None => self.buffers.written(index, true),
+                }
             }
             #[cfg(feature = "diagnostics")]
             if buffer_view_kind(&view) {
@@ -3570,7 +3616,31 @@ thread_local! {
     /// Whether this thread is in the pass over the heap's buffer views
     /// (`crate::draw`, [`HeapPass`]).
     static IN_HEAP_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the slot whose books are kept now is made at the mirroring
+    /// of copied records and gives its range to the pass itself
+    /// ([`sync_ranges`]): noted, not marked changed.
+    static SYNC_NOTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether those books found the slot one of the buffer views (or a
+    /// former one): where marking it would have sent the pass to it.
+    static SYNC_NOTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Whether a buffer view made at the mirroring of copied records
+/// ([`sync_makes`]) gives its range to the next pass over the heap's buffer
+/// views at once, so the pass does not look at the slot
+/// (`VICTORY_SYNC_RANGES=0`: it is marked changed and looked at).
+///
+/// Looked at, each such slot cost the pass about 1.3 us (its record read
+/// again, the view found, the copy it shows found): some 35,000 a frame in
+/// the open world, 75 to 85 ms of the pass.
+fn sync_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_RANGES").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line: ranges given to the pass by slots made at
+/// the mirroring ([`sync_ranges`]).
+pub(crate) static SYNC_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// While it lives, this thread is in the pass over the heap's buffer views.
 pub(crate) struct HeapPass(());
@@ -3590,6 +3660,16 @@ impl Drop for HeapPass {
 
 fn in_heap_pass() -> bool {
     IN_HEAP_PASS.get()
+}
+
+/// Whether the pass over the heap's buffer views looks at a sixteenth of all
+/// buffer view slots at each pass (`VICTORY_ROLLING_RESCAN=0`: all of them
+/// at every sixteenth pass, as before). All of them at once was some
+/// 130,000 slots in the open world, the frames whose pass took 200 to 275
+/// ms.
+fn rolling_rescan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROLLING_RESCAN").is_none_or(|v| v != "0"))
 }
 
 /// Whether a slot the pass over buffer views makes is marked changed for
@@ -4177,14 +4257,33 @@ mod tests {
         let weak = Arc::downgrade(&shadow);
         pass.by_slot.insert(7, (shadow, 16, 48));
         drop(pass);
-        for _ in 1..16 {
-            views.written(3, true);
-            assert_eq!(views.begin_pass().0, [3]);
-            assert!(weak.upgrade().is_some());
+        if rolling_rescan() {
+            // A sixteenth of the slots at each pass, with the changed ones.
+            for phase in 1..16u32 {
+                views.written(3, true);
+                let mut slots = views.begin_pass().0;
+                slots.sort_unstable();
+                assert_eq!(slots, if phase == 7 { vec![3, 7] } else { vec![3] }, "{phase}");
+                assert!(weak.upgrade().is_some(), "slot 7 is a buffer view still");
+            }
+            // Slot 7 is no buffer view any more: its range goes at its share.
+            views.noted(7, false);
+            for _ in 0..16 {
+                drop(views.begin_pass());
+            }
+            assert!(weak.upgrade().is_none());
+        } else {
+            for _ in 1..16 {
+                views.written(3, true);
+                assert_eq!(views.begin_pass().0, [3]);
+                assert!(weak.upgrade().is_some());
+            }
+            let (slots, pass) = views.begin_pass();
+            drop(pass);
+            assert_eq!(slots, [3, 7]);
+            assert!(weak.upgrade().is_none());
         }
-        let (slots, mut pass) = views.begin_pass();
-        assert_eq!(slots, [3, 7]);
-        assert!(weak.upgrade().is_none());
+        let (_, mut pass) = views.begin_pass();
 
         let shadow = Arc::new(());
         let weak = Arc::downgrade(&shadow);
@@ -4503,7 +4602,14 @@ mod tests {
         assert!(heap.mirror_copied(copied, words.as_ptr() as u64, &bytes));
         assert_eq!(heap.made.lock().unwrap()[copied as usize], key);
         assert!(heap.kept.lock().unwrap()[copied as usize].is_some(), "made, not left null");
-        assert!(heap.buffers.changed.lock().unwrap().contains(&copied), "the pass takes its range");
+        if sync_ranges() {
+            // Its range is given to the pass, which does not look at it.
+            assert!(!heap.buffers.changed.lock().unwrap().contains(&copied));
+            let (_, ranges) = heap.buffers.begin_pass();
+            assert!(ranges.by_slot.contains_key(&copied), "the pass has its range");
+        } else {
+            assert!(heap.buffers.changed.lock().unwrap().contains(&copied), "the pass looks at it");
+        }
         crate::shadow::unregister(RESOURCE, start);
     }
 
