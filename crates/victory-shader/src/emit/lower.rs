@@ -1031,6 +1031,12 @@ fn compute_gradients() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_COMPUTE_GRADIENTS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a thread group of these sizes is made of whole quads of lanes (a group of fewer
+/// threads has no neighbours to take derivatives from).
+fn in_quads(threads: [u32; 3]) -> bool {
+    threads.iter().product::<u32>().is_multiple_of(4)
+}
+
 /// Whether a wave sum of 16-bit floats where not every lane runs, in one host wave of 64
 /// lanes, is taken near the console's ([`Lower::half_sum_near`]) instead of refused.
 /// On by default; `VICTORY_HALF_SUM_NEAR=0` refuses it as before.
@@ -1299,7 +1305,7 @@ impl<'a> Lower<'a> {
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
                     // its derivatives are its quad's (`Lower::quad_gradients`)
-                    || IMPLICIT_SAMPLES.contains(&n) && compute_gradients()
+                    || IMPLICIT_SAMPLES.contains(&n) && compute_gradients() && in_quads(cs.threads)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
                 || !x.st.wide.is_empty();
@@ -10243,6 +10249,7 @@ impl<'a> Lower<'a> {
                 60 if !self.s.pixel
                     && kind != 5
                     && self.console_lanes
+                    && self.s.threads.is_some_and(in_quads)
                     && self.exchange.is_none()
                     && compute_gradients() =>
                 {
