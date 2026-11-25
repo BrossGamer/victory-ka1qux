@@ -154,6 +154,7 @@ fn lowered(words: &[u32], heap: bool) -> Result<HostShader, ShaderError> {
         written_root_uavs: lowered.written_root_uavs,
         writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
