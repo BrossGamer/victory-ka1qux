@@ -656,7 +656,33 @@ fn join<T>(mut lists: Vec<T>, mut order: Vec<usize>, more: Vec<T>, more_order: V
 /// Parts joined, host submissions they went in, their lists, signals
 /// delivered behind them, and waits passed for a write of a part taken.
 #[cfg(windows)]
-static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Then: parts sent apart from those taken because preparing them reads
+/// what those may write ([`join_strict`]).
+static JOINED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Whether a part joins those taken only when preparing it reads nothing
+/// they may write (`crate::host::joinable`; `VICTORY_JOIN_STRICT=0`: as the
+/// fork had it). Joined parts are prepared together before any of them
+/// runs, so a title buffer copy, a fill, a texture or another copy of the
+/// same bytes in a later part would read what an earlier part's shaders
+/// write before it is there; waited for one by one, it read it after.
+#[cfg(windows)]
+fn join_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_STRICT").is_none_or(|v| v != "0"))
+}
+
+/// Whether the part `lists`/`order` may join those `joined` holds
+/// ([`join_strict`]).
+#[cfg(windows)]
+fn joins(joined: &Joined, lists: &[crate::list::Detached], order: &[usize]) -> bool {
+    if joined.is_empty() || !join_strict() {
+        return true;
+    }
+    let taken: Vec<&crate::host::HostList> = joined.order.iter().map(|&i| joined.lists[i].host()).collect();
+    let next: Vec<&crate::host::HostList> = order.iter().map(|&i| lists[i].host()).collect();
+    crate::host::joinable(&taken, &next)
+}
 
 /// Gives the host what [`Joined`] holds, as one submission, delivers the
 /// signals met behind it, and takes the marks off the lines. Called with
@@ -669,16 +695,17 @@ fn send_joined(joined: &mut Joined) {
         let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
         JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
         JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
-        if sent.is_multiple_of(2048) {
+        if sent.is_multiple_of(512) {
             let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
             tracing::info!(
-                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
+                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet, {} parts sent apart as they read what the parts before may write (VICTORY_JOIN_STRICT)",
                 n[0],
                 n[1],
                 n[0] as f64 / n[1].max(1) as f64,
                 n[2] as f64 / n[1].max(1) as f64,
                 n[3],
-                n[4]
+                n[4],
+                n[5]
             );
         }
         match crate::host::host() {
@@ -811,6 +838,14 @@ fn release_held_now(all: bool) {
                             }
                         }
                         if joining {
+                            // Preparing it reads what the parts taken may
+                            // write: those go first ([`join_strict`]).
+                            if !joins(&joined, &lists, &order) {
+                                JOINED[5].fetch_add(1, Ordering::Relaxed);
+                                drop(held);
+                                send_joined(&mut joined);
+                                held = lock(line);
+                            }
                             // Taken, to go with the parts that follow it.
                             // The line stays open behind our mark.
                             if !joined.marked.contains(&q) {

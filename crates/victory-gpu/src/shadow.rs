@@ -101,6 +101,9 @@ pub(crate) struct Shadow {
     /// kept a snapshot all the same (not all guarded and clean).
     marked: Mutex<Vec<(usize, usize)>>,
     fallback: Mutex<Vec<(usize, usize)>>,
+    /// In place through a view of ours (`crate::inplace`'s stretches): the
+    /// view, unmapped after `place`'s heap goes (fields drop in order).
+    own_view: Option<crate::inplace::OwnView>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -753,7 +756,12 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // `VICTORY_ONE_FLIGHT=1` turns it off (`crate::host::one_flight`).
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2")
+            && !keeps()
+            && !crate::host::one_flight_asked()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -1246,6 +1254,10 @@ static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    if snapshot_pool() {
+        let reused = SIZED.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+        return reused.unwrap_or_else(|| Vec::with_capacity(n));
+    }
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1265,6 +1277,10 @@ fn pooled(n: usize) -> Vec<u8> {
 /// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
 /// of those the largest one and the next ones up to `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
+    if snapshot_pool() {
+        SIZED.lock().unwrap_or_else(|e| e.into_inner()).put(v);
+        return;
+    }
     const KEPT: usize = 512 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
@@ -1276,6 +1292,116 @@ fn give_back(v: Vec<u8>) {
         total = total.saturating_add(v.capacity());
         seen == 1 || total <= KEPT
     });
+}
+
+/// `VICTORY_SNAPSHOT_POOL=1` (off by default): snapshot buffers are kept
+/// by size, up to 512 of them and 512 MiB, instead of the eight largest
+/// (after DexNom/VIctory b8ff22e: a submission that lets go of hundreds of
+/// 4 MiB windows at once lost all but eight of their already-touched
+/// buffers, and the next one paged them in again).
+fn snapshot_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SNAPSHOT_POOL").is_some_and(|v| v == "1"))
+}
+
+/// The buffers of [`snapshot_pool`], by capacity. A buffer is reused, never
+/// what it holds.
+#[derive(Default)]
+struct SnapshotPool {
+    by_capacity: BTreeMap<usize, Vec<Vec<u8>>>,
+    bytes: usize,
+    count: usize,
+}
+
+impl SnapshotPool {
+    /// The smallest kept buffer with room for `n` bytes and not more than
+    /// four times that (a tiny snapshot must not take the one large
+    /// buffer a heap-wide one needs next).
+    fn take(&mut self, n: usize) -> Option<Vec<u8>> {
+        let most = n.saturating_mul(4).max(1 << 20);
+        let (&capacity, bucket) = self.by_capacity.range_mut(n..=most).next()?;
+        let mut buffer = bucket.pop()?;
+        if bucket.is_empty() {
+            self.by_capacity.remove(&capacity);
+        }
+        self.count -= 1;
+        self.bytes -= capacity;
+        buffer.clear();
+        Some(buffer)
+    }
+
+    /// Keeps `buffer`, letting smaller ones go when the pool is full; the
+    /// larger buffers are the dearer ones to make again.
+    fn put(&mut self, buffer: Vec<u8>) {
+        const MAX_BYTES: usize = 512 << 20;
+        const MAX_COUNT: usize = 512;
+        let capacity = buffer.capacity();
+        if capacity == 0 || capacity > MAX_BYTES {
+            return;
+        }
+        while self.count >= MAX_COUNT || self.bytes > MAX_BYTES - capacity {
+            let Some(mut smallest) = self.by_capacity.first_entry() else {
+                return;
+            };
+            let size = *smallest.key();
+            if size >= capacity {
+                return;
+            }
+            smallest.get_mut().pop();
+            if smallest.get().is_empty() {
+                smallest.remove();
+            }
+            self.count -= 1;
+            self.bytes -= size;
+        }
+        self.by_capacity.entry(capacity).or_default().push(buffer);
+        self.bytes += capacity;
+        self.count += 1;
+    }
+}
+
+static SIZED: Mutex<SnapshotPool> =
+    Mutex::new(SnapshotPool { by_capacity: BTreeMap::new(), bytes: 0, count: 0 });
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    use super::SnapshotPool;
+
+    #[test]
+    fn a_batch_of_windows_reuses_each_buffer_without_its_contents() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..64 {
+            pool.put(vec![0x6b; 4096]);
+        }
+        let medium = vec![0; 8192];
+        let medium_capacity = medium.capacity();
+        pool.put(medium);
+        let count = pool.count;
+        let mut active = Vec::new();
+        for _ in 0..64 {
+            let buffer = pool.take(4096).unwrap();
+            assert_eq!(buffer.capacity(), 4096);
+            assert!(buffer.is_empty());
+            active.push(buffer);
+        }
+        assert_eq!(pool.count, count - 64);
+        assert_eq!(pool.bytes, medium_capacity);
+        assert!(pool.take(8193).is_none());
+        assert_eq!(pool.take(4097).unwrap().capacity(), medium_capacity);
+        assert_eq!((pool.count, pool.bytes), (0, 0));
+    }
+
+    #[test]
+    fn a_full_pool_lets_small_buffers_go_for_larger_ones() {
+        let mut pool = SnapshotPool::default();
+        for _ in 0..1024 {
+            pool.put(Vec::with_capacity(8));
+        }
+        assert_eq!((pool.count, pool.bytes), (512, 4096));
+        pool.put(Vec::with_capacity(16));
+        assert_eq!((pool.count, pool.bytes), (512, 4104));
+        assert_eq!(pool.take(16).unwrap().capacity(), 16);
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -2530,7 +2656,10 @@ pub(crate) fn memory() -> [u64; 6] {
             .sum();
         (seen.len() as u64, bytes)
     };
-    let (kept, kept_bytes) = {
+    let (kept, kept_bytes) = if snapshot_pool() {
+        let pool = SIZED.lock().unwrap_or_else(|e| e.into_inner());
+        (pool.count as u64, pool.bytes as u64)
+    } else {
         let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
         (pool.len() as u64, pool.iter().map(|v| v.capacity() as u64).sum::<u64>())
     };
@@ -2608,6 +2737,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.own_view = placed.view;
         shadow
     }
 
@@ -2649,6 +2779,7 @@ impl Shadow {
             marked_now: std::sync::atomic::AtomicBool::new(false),
             marked: Mutex::default(),
             fallback: Mutex::default(),
+            own_view: None,
         }
     }
 
@@ -2857,6 +2988,13 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // Through a view of ours on the title's section: declared all
+            // the same, so that when the submission is done the guards are
+            // told ([`Shadow::copy_back_with`]).
+            if self.own_view.is_some() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize, false);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -3014,6 +3152,14 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            // The shaders wrote the title's pages themselves: through a
+            // view of ours no guard saw it, so the guards are told now,
+            // the submission done (every other copy of those pages takes
+            // them again).
+            if self.own_view.is_some() {
+                let (from, to) = self.inside(address, len);
+                crate::watch::gpu_wrote(self.start as usize + from, to - from);
+            }
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());

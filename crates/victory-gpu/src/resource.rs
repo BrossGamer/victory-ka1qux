@@ -1153,6 +1153,10 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
+    /// Where its title memory ends, worked out the first time a material
+    /// asks whether a texture the host writes lies over some memory
+    /// ([`writable_texture_overlaps`]).
+    guest_end: std::sync::OnceLock<u64>,
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
@@ -1193,9 +1197,54 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
+///
+/// Each address holds every live texture there, the newest last: the one
+/// the lookups take, as the single entry before. When the newest is
+/// released the entry went with it, though an older texture still lay
+/// there; `VICTORY_TARGET_OWNERS=1` (off by default) lets the older one
+/// be found again (after DexNom/VIctory b8ff22e).
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
+static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// [`TARGETS_AT`]: whether an older texture there is found again once the
+/// newest is released (also with `crate::material_demand`, whose uploads
+/// must not go over any texture the card writes).
+#[cfg(windows)]
+fn target_owners() -> bool {
+    #[cfg(test)]
+    if TARGET_OWNERS_ON.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_OWNERS").is_some_and(|v| v == "1"))
+        || crate::material_demand::enabled()
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Tests: [`target_owners`] on for the test's own thread.
+    pub(crate) static TARGET_OWNERS_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a title texture the host renders to or writes (any in
+/// [`TARGETS_AT`], not only the newest at its address) lies over title
+/// memory `[start, end)`: bytes uploaded there from title memory would go
+/// over what the card wrote (`crate::material_demand`).
+#[cfg(windows)]
+pub(crate) fn writable_texture_overlaps(start: u64, end: u64) -> bool {
+    let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
+    targets.range(..end).rev().any(|(&at, owners)| {
+        owners.iter().any(|&object| {
+            let r = resource(object as This);
+            let target_end = r
+                .host
+                .guest_end
+                .get_or_init(|| footprint(&r.desc).map_or(u64::MAX, |f| at.saturating_add(f.size)));
+            *target_end > start
+        })
+    })
+}
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1243,7 +1292,7 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
+    let other = *targets.get(&(r.data() as u64))?.last()? as This;
     let o = resource(other);
     const DEPTH: u32 = 0x2;
     let same = one(&o.desc)
@@ -2666,6 +2715,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: Hosted {
+            guest_end: std::sync::OnceLock::new(),
             made: std::sync::Mutex::new(None),
             state,
             // SAFETY: the title passes a whole clear value (the format,
@@ -2686,7 +2736,9 @@ fn hand_out_resource(
             TARGETS_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(resource.data() as u64, at);
+                .entry(resource.data() as u64)
+                .or_default()
+                .push(at);
         }
         if !lazy() {
             let _ = hosted(at as This, true);
@@ -2710,8 +2762,18 @@ impl Drop for Resource {
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
+                let me = std::ptr::from_ref::<Resource>(self) as usize;
+                if let Some(owners) = targets.get_mut(&at) {
+                    // The newest going takes the address out, as when it
+                    // held one texture alone, unless [`target_owners`].
+                    if owners.last() == Some(&me) && !target_owners() {
+                        targets.remove(&at);
+                    } else {
+                        owners.retain(|&object| object != me);
+                        if owners.is_empty() {
+                            targets.remove(&at);
+                        }
+                    }
                 }
             }
         }
@@ -2746,7 +2808,7 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
         crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
@@ -3110,7 +3172,7 @@ pub(crate) fn uav_texture_at(address: u64, desc: &[u32; 14], view_format: u32) -
     };
     {
         let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(&other) = targets.get(&address) {
+        if let Some(&other) = targets.get(&address).and_then(|owners| owners.last()) {
             let o = resource(other as This);
             let o_fmt = target_format(pc_format(o.desc.format));
             let w_fmt = target_format(wanted);

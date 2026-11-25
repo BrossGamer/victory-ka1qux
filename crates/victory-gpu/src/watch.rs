@@ -1920,6 +1920,21 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     crate::descriptor::host::page_written(at, len);
 }
 
+/// The card wrote title memory `[at, at + len)` in place, through a view
+/// of ours on its section (`crate::inplace`'s stretches): no guard saw it.
+/// Its blocks, and the same pages at every other view, count as written,
+/// so every host copy of them takes them again; textures there are told.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    {
+        let mut g = guards();
+        open(&mut g, at, at.saturating_add(len), false);
+    }
+    crate::descriptor::host::page_written(at, len);
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked

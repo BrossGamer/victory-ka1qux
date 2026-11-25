@@ -53,6 +53,8 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod material_demand;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -62,6 +64,8 @@ mod plaincopy;
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
+#[cfg(all(test, windows))]
+mod unified_probe;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
