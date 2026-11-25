@@ -902,13 +902,14 @@ const PAGE: u64 = 64 << 10;
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
     _flags: u32,
 ) -> HRESULT {
+    let _ = this;
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
@@ -919,6 +920,10 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // The bake probe: whether this queue still holds submissions behind a
+    // fence (on the console they would run before the mapping).
+    #[cfg(feature = "diagnostics")]
+    let held = u64::from(!this.is_null() && !lock(&queue(this).held).is_empty());
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -931,6 +936,10 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            #[cfg(feature = "diagnostics")]
+            if r.kind != 3 {
+                crate::bake_probe::note(crate::bake_probe::Writer::PageBatch, at as usize, len as usize, held);
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),

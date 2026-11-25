@@ -802,6 +802,12 @@ fn uncommitted_end(block: usize) -> usize {
 /// notes them written, and the blocks guarded through them; true if any
 /// was guarded.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
+    open_as(g, start, end, None)
+}
+
+/// [`open`]; `fault`: the instruction of a store that faulted there (the
+/// bake probe tells a store from a write of the runtime by it).
+fn open_as(g: &mut Guards, start: usize, end: usize, fault: Option<usize>) -> bool {
     let range = start / BLOCK..end.div_ceil(BLOCK);
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     let linked: Vec<usize> = g.links.range(range).map(|(&block, _)| block).collect();
@@ -824,7 +830,111 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         }
     }
     make_writable_runs(&alone);
-    !blocks.is_empty() || !linked.is_empty()
+    #[cfg(feature = "diagnostics")]
+    let probed = {
+        let taken = probe_take(start, end);
+        for &block in &taken {
+            if blocks.binary_search(&block).is_err() && linked.binary_search(&block).is_err() {
+                make_writable(block);
+            }
+            changed(block, block + 1);
+        }
+        if !taken.is_empty() {
+            let kind = match fault {
+                Some(_) => crate::bake_probe::Writer::ProbeFault,
+                None => crate::bake_probe::Writer::RuntimeIntoGuarded,
+            };
+            crate::bake_probe::note(kind, start, end - start, fault.unwrap_or(0) as u64);
+        } else if let Some(pc) = fault
+            && (!blocks.is_empty() || !linked.is_empty())
+        {
+            crate::bake_probe::note(crate::bake_probe::Writer::GuardFault, start, end - start, pc as u64);
+        }
+        !taken.is_empty()
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let probed = {
+        let _ = fault;
+        false
+    };
+    !blocks.is_empty() || !linked.is_empty() || probed
+}
+
+/// Blocks the bake probe made read-only, each with the bake whose sources
+/// it guards ([`probe_guard`]).
+#[cfg(feature = "diagnostics")]
+static PROBED: Mutex<BTreeMap<usize, u64>> = Mutex::new(BTreeMap::new());
+
+/// Takes the probe's blocks of `[start, end)` off its list (their
+/// protection is the caller's to give back).
+#[cfg(feature = "diagnostics")]
+fn probe_take(start: usize, end: usize) -> Vec<usize> {
+    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
+    if probed.is_empty() {
+        return Vec::new();
+    }
+    let taken: Vec<usize> = probed.range(start / BLOCK..end.div_ceil(BLOCK)).map(|(&b, _)| b).collect();
+    for b in &taken {
+        probed.remove(b);
+    }
+    taken
+}
+
+/// The bake probe: makes the blocks of `ranges` that are read-write view
+/// memory read-only, for bake `bake`, so that the first store to each
+/// faults once and is noted ([`open_as`]); the runtime's own writes there
+/// open them as they open the copies' guards. Blocks a kernel write is
+/// under way into, and blocks the copies guard already (their faults are
+/// noted too), are left alone. Returns the blocks made read-only.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_guard(ranges: &[(usize, usize)], bake: u64) -> usize {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    install();
+    let g = guards();
+    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut made = 0;
+    for &(start, end) in ranges {
+        for block in start / BLOCK..end.div_ceil(BLOCK) {
+            if probed.contains_key(&block)
+                || g.protected.contains(&block)
+                || g.links.contains_key(&block)
+                || g.held.iter().any(|&(from, to, _)| (from..to).contains(&block))
+            {
+                continue;
+            }
+            let mut old = 0;
+            // SAFETY: title view memory; only its protection changes.
+            if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } == 0 {
+                continue;
+            }
+            if old != PAGE_READWRITE {
+                // Not plain read-write memory: left as it was.
+                let mut back = 0;
+                // SAFETY: as above, back to the protection it had.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, old, &mut back) };
+                continue;
+            }
+            probed.insert(block, bake);
+            made += 1;
+        }
+    }
+    made
+}
+
+/// The bake probe watched bake `bake`'s sources long enough: the blocks it
+/// still guards for it get write access back (unless the copies guard
+/// them now).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn probe_release(bake: u64) {
+    let g = guards();
+    let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
+    let mine: Vec<usize> = probed.iter().filter(|&(_, &b)| b == bake).map(|(&block, _)| block).collect();
+    for block in mine {
+        probed.remove(&block);
+        if !g.protected.contains(&block) && !g.links.contains_key(&block) {
+            make_writable(block);
+        }
+    }
 }
 
 /// Gives write access back to `block`, one we made read-only; nothing
@@ -1062,6 +1172,13 @@ fn mapping_writer_pending_for_test(at: usize, len: usize) -> bool {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // The bake probe: the mapping is new (read-write); its blocks are no
+    // longer guarded by the probe.
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::bake_probe::note(crate::bake_probe::Writer::Remap, at, len, 0);
+        probe_take(at, at.saturating_add(len));
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1108,9 +1225,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Handles a write access violation at `at` if the block belongs to our guards
 /// or became writable concurrently.
-pub(crate) fn handle_write_fault(at: usize) -> bool {
+pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
     let mut g = guards();
-    if open(&mut g, at, at + 1) {
+    if open_as(&mut g, at, at + 1, Some(instruction)) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
         return true;
@@ -1140,7 +1257,7 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        if handle_write_fault(at) {
+        if handle_write_fault(at, r.ExceptionAddress as usize) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH

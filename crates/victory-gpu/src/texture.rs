@@ -564,6 +564,8 @@ pub(crate) fn host_written(resource: This) {
         let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
         let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
         if !at.is_null() && bytes > 0 {
+            #[cfg(feature = "diagnostics")]
+            crate::bake_probe::note(crate::bake_probe::Writer::HostTexture, at as usize, bytes as usize, 0);
             HOST_WRITTEN_AT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

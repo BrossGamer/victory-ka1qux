@@ -511,6 +511,8 @@ fn work(scheduler: &'static Scheduler) {
         };
         drop(lanes);
         let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        PROBE_TAG.set(victory_gpu::bake_probe_dstorage_tag(job.lane, job.seq));
         let result = execute(&job.request);
         walls_request(&job.request, &result, started);
         lanes = scheduler.lock();
@@ -600,7 +602,7 @@ impl Lanes {
             if let Err(hr) = result {
                 lane.failures.insert(job.seq, hr);
             }
-            lane.flush();
+            lane.flush(job.lane);
         }
     }
 
@@ -632,7 +634,7 @@ impl Lanes {
                 Command::Status(status) => lane.statuses.push_back((seq, status)),
             }
         }
-        lane.flush();
+        lane.flush(id);
     }
 }
 
@@ -656,8 +658,10 @@ impl Lane {
         self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
     }
 
-    /// Writes the status entries whose earlier reads have all finished.
-    fn flush(&mut self) {
+    /// Writes the status entries whose earlier reads have all finished
+    /// (`id`: the lane's, for the bake probe).
+    fn flush(&mut self, id: u64) {
+        let _ = id;
         while let Some(&(seq, _)) = self.statuses.front() {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
@@ -673,6 +677,8 @@ impl Lane {
             status
                 .entry()
                 .store(first.unwrap_or(S_OK), Ordering::Release);
+            #[cfg(feature = "diagnostics")]
+            victory_gpu::bake_probe_dstorage_signal(id, seq);
         }
     }
 }
@@ -1054,7 +1060,16 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        return fill(out).map(drop);
+        let n = fill(out)?;
+        #[cfg(feature = "diagnostics")]
+        victory_gpu::bake_probe_note(
+            victory_gpu::BakeProbeWriter::DstorageToAddress,
+            request.destination as usize,
+            n,
+            PROBE_TAG.get(),
+        );
+        let _ = n;
+        return Ok(());
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let list = request.destination.cast::<usize>();
@@ -1145,6 +1160,13 @@ fn into_destination(
     Err(E_INVALIDARG)
 }
 
+/// The bake probe's tag of the request a worker runs (its queue and
+/// number), for the writes it notes.
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static PROBE_TAG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// How long a request's page list naming page 0 is read again for.
 const LATE_LIST_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 /// Page lists filled after their request started (written late).
@@ -1173,6 +1195,12 @@ static SHOWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// took before (nothing yet, or the mip it replaced) until something else
 /// made it due. `VICTORY_DSTORAGE_SHOWN=0`: not told, as before.
 fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    if victory_gpu::bake_probe_on() {
+        for (at, bytes) in super::xmem::shown_at(pages, offset, len) {
+            victory_gpu::bake_probe_note(victory_gpu::BakeProbeWriter::DstorageToPages, at, bytes, PROBE_TAG.get());
+        }
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_SHOWN").is_none_or(|v| v != "0")) {
         return;

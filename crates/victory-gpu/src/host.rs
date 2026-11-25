@@ -3086,6 +3086,13 @@ fn read_backs(list: &HostList) {
         // copy was recorded).
         unsafe {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
+                #[cfg(feature = "diagnostics")]
+                crate::bake_probe::note(
+                    crate::bake_probe::Writer::ReadBack,
+                    *at,
+                    rows.saturating_sub(1) * pitch + row,
+                    0,
+                );
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
@@ -5821,6 +5828,7 @@ impl HostList {
                     shadow.writing(*address, *len);
                     #[cfg(feature = "diagnostics")]
                     {
+                        crate::bake_probe::note(crate::bake_probe::Writer::ShaderWrites, *address, *len, 0);
                         add(C::GpuWrites, 1);
                         add(C::SnapshotUs, snapshot.elapsed().as_micros() as u64);
                     }
@@ -6206,7 +6214,7 @@ mod direct_copy {
         if code == EXCEPTION_ACCESS_VIOLATION as NTSTATUS
             && record.NumberParameters >= 2
             && record.ExceptionInformation[0] == WRITE
-            && crate::watch::handle_write_fault(record.ExceptionInformation[1])
+            && crate::watch::handle_write_fault(record.ExceptionInformation[1], rip)
         {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -6297,6 +6305,8 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    crate::bake_probe::note(crate::bake_probe::Writer::CopyBack, dst as usize, len, 0);
     // The kernel writes nothing read-only, and a guard taken meanwhile on
     // another thread (a texture showing these pages) would make it so.
     let _writing = crate::watch::writing_held(dst as usize, len);
