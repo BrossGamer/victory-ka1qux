@@ -795,7 +795,7 @@ pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// What became of buffer views that did not fit the host copy of their
 /// memory as they were, since the start (see [`view_fates`] for the order).
-static VIEW_FATES: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+static VIEW_FATES: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 const FATE_NO_ELEMENTS: usize = 0;
 const FATE_RAW_OFF_16: usize = 1;
 const FATE_OWN_TYPED: usize = 2;
@@ -805,6 +805,7 @@ const FATE_UNORDERED_OFF_ELEMENT: usize = 5;
 const FATE_UNORDERED_STRUCTURED: usize = 6;
 const FATE_OFF_ELEMENT: usize = 7;
 const FATE_CONSTANT_OFF_256: usize = 8;
+const FATE_CONSTANT_OWN: usize = 9;
 
 fn fate(which: usize) {
     VIEW_FATES[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -816,7 +817,7 @@ pub(crate) fn view_fates() -> String {
     format!(
         "{} (of no elements {}, raw ones not on 16 bytes {}); buffer views left null off their copy's \
          elements: {} read, {} unordered; unordered structured views not on 16 bytes, left structured: {}; \
-         buffer views on a copy of their own range: {} typed, {} raw, {} structured; constant buffer          views left null as not on 256 bytes of the host's copy: {}{}",
+         buffer views on a copy of their own range: {} typed, {} raw, {} structured; constant buffer          views left null as not on 256 bytes of the host's copy: {}, made on a copy of their own range: {}{}",
         REFUSED_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
         f(FATE_NO_ELEMENTS),
         f(FATE_RAW_OFF_16),
@@ -827,6 +828,7 @@ pub(crate) fn view_fates() -> String {
         f(FATE_OWN_RAW),
         f(FATE_OWN_STRUCTURED),
         f(FATE_CONSTANT_OFF_256),
+        f(FATE_CONSTANT_OWN),
         crate::shadow::stale_report(),
     )
 }
@@ -2192,6 +2194,12 @@ fn view_extent() -> bool {
 /// buffer object. The slot then showed a copy nothing brought up to date,
 /// and what shaders wrote through it was looked for in the other copy.
 pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
+    if let &View::Constant(address, size) = view {
+        return heap_constants()
+            .then(|| constant_copy(address, size))
+            .flatten()
+            .map(|(shadow, address, len, _)| (shadow, address, len));
+    }
     let (address, len) = buffer_range(view)?;
     if len == 0 {
         return None;
@@ -2680,6 +2688,42 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Whether constant buffer views of the view heap (the ones a shader picks
+/// by an index it computes) are brought up to date for shaders, and made on
+/// a copy of their own range where the copy of the memory they are in does
+/// not put them on 256 bytes. On by default; `VICTORY_HEAP_CONSTANTS=0`
+/// leaves them as before: made once on whatever copy holds them, never
+/// brought up to date by the heap's pass, and left null off 256 bytes.
+fn heap_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_CONSTANTS").is_none_or(|v| v != "0"))
+}
+
+/// The host copy a constant buffer view of `size` bytes at `address` is
+/// made on, and the title range (address, bytes) it reads there.
+///
+/// The console takes a constant buffer anywhere on 16 bytes; the host's
+/// begin on 256 bytes of their resource. Where the copy of the memory the
+/// view is in does not put it on 256 bytes, the view gets a copy of its own
+/// range ([`crate::shadow::exact`]), which begins at its resource's first
+/// byte. Such views were left null, and shaders read zeros as constants:
+/// some 100,000 views a run (the heap's pass names the same copy, through
+/// [`buffer_copy`], and brings it up to date). The copy reaches to the
+/// bytes the host's view reads, rounded up to 256.
+/// (After Belobug/VIctory-Belobug-AMD 00fc4a7, which copies such views into
+/// aligned slices at each submission.)
+/// The last of the four says whether the copy is the view's own.
+fn constant_copy(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)> {
+    let len = u64::from(size);
+    let shadow = crate::shadow::find(address, len)?;
+    if shadow.gpu(address).is_multiple_of(256) || !heap_constants() {
+        return Some((shadow, address, len, false));
+    }
+    let reach = u64::from(constant_bytes(size));
+    let own = crate::shadow::exact(address, reach)?;
+    Some((own, address, reach, true))
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -2687,7 +2731,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let (shadow, _, _, own) = constant_copy(address, size)?;
+            if own {
+                fate(FATE_CONSTANT_OWN);
+            }
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 fate(FATE_CONSTANT_OFF_256);
