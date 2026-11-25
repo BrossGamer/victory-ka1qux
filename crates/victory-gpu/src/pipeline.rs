@@ -143,6 +143,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Compute thread-group dimensions `[x, y, z]` (`[0; 3]` for non-compute).
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -201,17 +203,23 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        threads,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -377,12 +385,47 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
+/// Whether the run asks for the ray-tracing structure builder:
+/// `VICTORY_BVH_BUILDER=1`, or `VICTORY_RAYS=1` (the builder, the programs
+/// that shade ray hits, and what makes the builder's writes safe,
+/// together).
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        on("VICTORY_BVH_BUILDER") || on("VICTORY_RAYS")
+    })
+}
+
+/// Whether a shader that reads title memory by address declares the
+/// copies it reaches written only when its code stores through title
+/// memory, and a root UAV written only when its code stores through that
+/// view (the translation says: `HostShader::writes_guest_memory`,
+/// `written_root_uavs`). Without it any such shader whose code can store
+/// at all (a walk of the structures writes its result to a texture or
+/// buffer) declares every numbered copy written: each such dispatch
+/// snapshots, compares and copies back all of them, and one stage's
+/// copy-back carries the bytes every other stage left in those copies.
+/// After DexNom/VIctory, which measured 3.4 s a frame before and 0.97 s
+/// after, with 12.8 GB of title memory compared a frame before and 2.7 GB
+/// after. On with the builder ([`builder_allowed`]);
+/// `VICTORY_RAY_WRITES=precise` turns it on without, `=all` off.
+#[cfg(windows)]
+pub(crate) fn precise_ray_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_RAY_WRITES").as_deref() {
+        Ok("precise") => true,
+        Ok("all") => false,
+        _ => builder_allowed(),
+    })
+}
+
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());

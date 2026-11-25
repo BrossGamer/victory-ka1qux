@@ -367,6 +367,9 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Raw thread counts `[x, y, z]` for a partial `DispatchX` call with
+    /// `USE_THREAD_DIMENSIONS` (`0` along an axis means full groups / no cap).
+    dispatch_threads: [u32; 3],
 }
 
 impl Drop for State {
@@ -1131,10 +1134,15 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{
+            USER_DISPATCH_THREADS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+        };
         // Set between the parts of a large dispatch ([`group_base`]).
         if kind == USER_GROUP_BASE {
             return 0;
+        }
+        if kind == USER_DISPATCH_THREADS {
+            return self.dispatch_threads.get(dword as usize).copied().unwrap_or(0);
         }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
@@ -1386,9 +1394,21 @@ impl State {
             // copied back into title memory afterwards.
             let writes = (t.stores || !write_skip())
                 && !crate::pipeline::builder_quarantined(self.pipeline as This);
+            // With precise ray writes (`crate::pipeline::precise_ray_writes`)
+            // a shader that reads title memory by address declares the
+            // copies its directory names written only if it stores through
+            // them, and a root UAV written only if it stores through that
+            // one: a walk of the structures writes its result to a texture
+            // or a separate buffer.
+            let precise = crate::pipeline::precise_ray_writes();
+            let raw_writes = if precise {
+                writes && (t.host.writes_guest_memory || !write_skip())
+            } else {
+                writes
+            };
             // Title memory by address: what the shader finds it by.
             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
-                let Some(ready) = self.memory_ready(list, compute, writes) else {
+                let Some(ready) = self.memory_ready(list, compute, raw_writes) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
                     return false;
                 };
@@ -1566,6 +1586,11 @@ impl State {
                         once!(slot, "a shader writes through a root view the title did not set");
                         None
                     }
+                };
+                let writes = if precise {
+                    writes && (!write_skip() || t.host.written_root_uavs.contains(&slot))
+                } else {
+                    writes
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
@@ -2790,6 +2815,20 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_inner(list, x, y, z, 0);
+    }
+
+    /// Runs a console `DispatchX(x, y, z, flags)` on the host.
+    ///
+    /// Bit 5 (`0x20`) of `COMPUTE_DISPATCH_INITIATOR` is
+    /// `USE_THREAD_DIMENSIONS`: `(x, y, z)` are raw thread counts rather than
+    /// thread-group counts, and trailing lanes of partial tail groups are
+    /// masked off in initial hardware `EXEC`.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        self.dispatch_inner(list, x, y, z, flags);
+    }
+
+    fn dispatch_inner(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(windows)]
@@ -2832,7 +2871,27 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        let t = p.stages[0].translated();
+        let flags = thread_dimension_flags(crate::pipeline::is_builder(self.pipeline as This), flags);
+        let Some(([gx, gy, gz], partial)) = dispatch_dimensions([x, y, z], t.threads, flags) else {
+            return;
+        };
+        if partial != [0; 3]
+            && !t.host.user_data.iter().any(|u| {
+                u.root == RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)
+            })
+        {
+            once!(
+                pipeline = %p.name,
+                threads = ?[x, y, z],
+                group = ?t.threads,
+                "partial DispatchX(USE_THREAD_DIMENSIONS) on a compute shader without thread-count masking"
+            );
+        }
+        self.dispatch_threads = partial;
+        let bound = self.bind(list, p, true);
+        self.dispatch_threads = [0; 3];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2842,7 +2901,8 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
+        let (x, y, z) = (gx, gy, gz);
         match (x > crate::indirect::PART).then(|| group_base(p)).flatten() {
             Some((param, dword)) => {
                 // More groups in x than the host runs in one dimension: in
@@ -4625,6 +4685,75 @@ mod early_textures_tests {
     }
 }
 
+/// AMD GFX10 / console `COMPUTE_DISPATCH_INITIATOR` bit 5:
+/// `USE_THREAD_DIMENSIONS` (`DispatchX` arguments are raw thread counts rather
+/// than thread-group counts, with trailing lanes masked off in initial `EXEC`).
+const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 0x20;
+
+/// The `DispatchX` flags the host honours for a pipeline (`builder`: one
+/// of the ray-tracing structure builder's). `VICTORY_DISPATCH_THREADS`:
+/// unset or `builder`, thread counts are honoured for the builder's stages
+/// only (they run only with `VICTORY_BVH_BUILDER=1`, so a run without it is
+/// as before); `all`, for every program; `0`, for none (counts are taken
+/// for groups, as before: the builder then dispatches up to 64 times its
+/// threads and its stages store past the structures they build).
+fn thread_dimension_flags(builder: bool, flags: u32) -> u32 {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Scope {
+        Builder,
+        All,
+        None,
+    }
+    static SCOPE: std::sync::OnceLock<Scope> = std::sync::OnceLock::new();
+    let scope = *SCOPE.get_or_init(|| match std::env::var("VICTORY_DISPATCH_THREADS").as_deref() {
+        Ok("all") => Scope::All,
+        Ok("0") => Scope::None,
+        _ => Scope::Builder,
+    });
+    if flags & DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+        return flags;
+    }
+    match scope {
+        Scope::All => flags,
+        Scope::Builder if builder => flags,
+        _ => {
+            if !builder {
+                once!(
+                    flags = format_args!("{flags:#x}"),
+                    "a DispatchX of thread counts by a program outside the ray-tracing structure builder: taken for groups (VICTORY_DISPATCH_THREADS=all honours it)"
+                );
+            }
+            flags & !DISPATCH_USE_THREAD_DIMENSIONS
+        }
+    }
+}
+
+/// Converts console `Dispatch` / `DispatchX(x, y, z, flags)` dimensions to
+/// `(host_groups, partial_thread_limits)`. Returns `None` when a
+/// thread-dimension dispatch has zero threads along any axis.
+fn dispatch_dimensions(
+    dims: [u32; 3],
+    group: [u32; 3],
+    flags: u32,
+) -> Option<([u32; 3], [u32; 3])> {
+    if flags & DISPATCH_USE_THREAD_DIMENSIONS == 0 {
+        return Some((dims, [0; 3]));
+    }
+    if dims.contains(&0) {
+        return None;
+    }
+    let mut groups = [0; 3];
+    let mut partial = [0; 3];
+    for i in 0..3 {
+        let g = group[i].max(1);
+        groups[i] = dims[i].div_ceil(g);
+        if g > 1 && !dims[i].is_multiple_of(g) {
+            partial[i] = dims[i];
+        }
+    }
+    Some((groups, partial))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4644,5 +4773,43 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    #[test]
+    fn dispatch_x_thread_dimensions_convert_to_groups_and_partial_limits() {
+        // Normal Dispatch / DispatchX without bit 5 passes group counts through.
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0),
+            Some(([48, 1, 1], [0, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x8000),
+            Some(([48, 1, 1], [0, 0, 0]))
+        );
+        // Bit 5 (0x20 / 0x8020): raw thread counts -> ceil(threads / group) + partial limits.
+        assert_eq!(
+            dispatch_dimensions([48, 1, 1], [64, 1, 1], 0x20),
+            Some(([1, 1, 1], [48, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([1, 1, 1], [64, 1, 1], 0x8020),
+            Some(([1, 1, 1], [1, 0, 0]))
+        );
+        assert_eq!(
+            dispatch_dimensions([65, 1, 1], [64, 1, 1], 0x20),
+            Some(([2, 1, 1], [65, 0, 0]))
+        );
+        // Exact multiple of group size needs no partial-lane limit.
+        assert_eq!(
+            dispatch_dimensions([128, 1, 1], [64, 1, 1], 0x20),
+            Some(([2, 1, 1], [0, 0, 0]))
+        );
+        // 3D partial dimensions.
+        assert_eq!(
+            dispatch_dimensions([10, 16, 5], [8, 8, 4], 0x20),
+            Some(([2, 2, 2], [10, 0, 5]))
+        );
+        // Zero threads along any axis is a no-op.
+        assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
     }
 }

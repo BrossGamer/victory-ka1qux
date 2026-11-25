@@ -57,7 +57,7 @@ pub(super) fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     let on = |name: &str, value: &str| std::env::var_os(name).is_some_and(|v| v == value);
     // Made with the structure builder on, or when asked for.
     static RESOLVES: OnceLock<bool> = OnceLock::new();
-    let resolves = *RESOLVES.get_or_init(|| on("VICTORY_RT_RESOLVE", "1") || on("VICTORY_BVH_BUILDER", "1"));
+    let resolves = *RESOLVES.get_or_init(|| on("VICTORY_RT_RESOLVE", "1") || super::builder_allowed());
     static ACTIVATE: OnceLock<bool> = OnceLock::new();
     let activate = *ACTIVATE.get_or_init(|| on("VICTORY_ACTIVATE_RAYS", "0"));
     static EXTRA: OnceLock<Vec<String>> = OnceLock::new();
@@ -582,7 +582,10 @@ mod tests {
         let resolve = |at: usize| Arc::new(Pending::new(vec![shader("compute", RAY_TRACING_RESOLVES[at])], None));
         let (first, last) = (resolve(0), resolve(RAY_TRACING_RESOLVES.len() - 1));
         // Unless a run of the tests asks for them to be made.
-        if std::env::var_os("VICTORY_RT_RESOLVE").is_some() || std::env::var_os("VICTORY_BVH_BUILDER").is_some() {
+        if std::env::var_os("VICTORY_RT_RESOLVE").is_some()
+            || std::env::var_os("VICTORY_BVH_BUILDER").is_some()
+            || std::env::var_os("VICTORY_RAYS").is_some()
+        {
             return;
         }
         for p in [&first, &last] {

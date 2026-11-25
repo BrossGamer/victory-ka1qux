@@ -46,8 +46,16 @@ enum NodeAt {
     Buffer { handle: V, byte: V },
     /// In title memory: the raw view of the host copy holding the node's
     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
-    /// and the node's address, for the second half of a 128-byte node.
-    Memory { handle: V, byte: V, low: V, high: V },
+    /// and the node's address, for the second half of a 128-byte node;
+    /// and whether the first half's page has a copy (a page without one
+    /// reads zeros, which look like a node).
+    Memory {
+        handle: V,
+        byte: V,
+        low: V,
+        high: V,
+        mapped: V,
+    },
 }
 
 /// The ray operands, as floats.
@@ -163,12 +171,13 @@ impl<'a> Lower<'a> {
                 // One look for the node's copy, before the branches: a
                 // node is 64 bytes on 64, so its first half lies in one
                 // 64 KiB page whatever its kind.
-                let (handle, byte) = self.bvh_memory(low, high, guard);
+                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
                 NodeAt::Memory {
                     handle,
                     byte,
                     low,
                     high,
+                    mapped,
                 }
             }
         };
@@ -225,7 +234,7 @@ impl<'a> Lower<'a> {
     /// host copy holding the address and the byte in that view
     /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
     /// is left for the host to fetch, for lanes that run).
-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
+    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
         #[cfg(test)]
         if let Some((slot, base)) = TEST_MEMORY.get() {
             // The buffer at heap slot `slot` holds the bytes from title
@@ -242,7 +251,7 @@ impl<'a> Lower<'a> {
             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
             let outside = self.s.m.i32(0xffff_ff00);
             let at = self.s.m.select(c, inside, at, outside);
-            return (handle, at);
+            return (handle, at, inside);
         }
         self.memory(low, high, guard)
     }
@@ -251,6 +260,13 @@ impl<'a> Lower<'a> {
     /// computed, `offset` fixed; none of the node's bytes past 127), read
     /// four at a time.
     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
+        self.bvh_node_words_mapped(at, base, offset, count).0
+    }
+
+    /// [`Lower::bvh_node_words`], and, if some of the words are in the
+    /// second half of a node in title memory, whether that half's page has
+    /// a copy.
+    fn bvh_node_words_mapped(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> (Vec<V>, Option<V>) {
         let c = self.cur;
         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
         // The second half of a 128-byte node may lie in the next 64 KiB
@@ -263,13 +279,16 @@ impl<'a> Lower<'a> {
             let (handle, mut byte) = match at {
                 NodeAt::Buffer { handle, byte } => (handle, byte),
                 NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
-                NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
-                    let (low, high) = self.address_plus(low, high, 64);
-                    // Every lane in this block runs the instruction.
-                    let (handle, byte) = self.bvh_memory(low, high, None);
-                    let k64 = self.s.m.i32(64);
-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
-                }),
+                NodeAt::Memory { low, high, .. } => {
+                    let (handle, byte, _) = *second.get_or_insert_with(|| {
+                        let (low, high) = self.address_plus(low, high, 64);
+                        // Every lane in this block runs the instruction.
+                        let (handle, byte, mapped) = self.bvh_memory(low, high, None);
+                        let k64 = self.s.m.i32(64);
+                        (handle, self.s.m.bin(c, Bin::Sub, byte, k64), mapped)
+                    });
+                    (handle, byte)
+                }
             };
             if let Some(b) = base {
                 byte = self.s.m.bin(c, Bin::Add, byte, b);
@@ -290,7 +309,7 @@ impl<'a> Lower<'a> {
                 out.push(self.as_int(f));
             }
         }
-        out
+        (out, second.map(|s| s.2))
     }
 
     /// The node's title address, [`bvh::node_address`]: the descriptor's
@@ -328,7 +347,7 @@ impl<'a> Lower<'a> {
         // 32-bit floats: 24 dwords from byte 16.
         self.cur = wide_block;
         let k16 = self.s.m.i32(16);
-        let words = self.bvh_node_words(at, None, 16, 24);
+        let (words, second) = self.bvh_node_words_mapped(at, None, 16, 24);
         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
         self.s.m.terminate(wide_block, Term::Br(join));
         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
@@ -354,6 +373,24 @@ impl<'a> Lower<'a> {
         }
         self.s.m.terminate(half_block, Term::Br(join));
         self.cur = join;
+        // Whether a child's bounds were read from pages with a copy (after
+        // DexNom/VIctory): the pointers and the first two boxes lie in the
+        // node's first 64 bytes, the last two boxes of a 32-bit node in its
+        // second. A page without a copy reads zeros, which are a valid
+        // pointer and valid bounds: a box made of them would be entered.
+        let residency = match (at, second) {
+            (NodeAt::Memory { mapped: first, .. }, Some(last)) => {
+                let i1 = self.s.m.type_of(first);
+                let mapped = self.s.m.phi(join, i1);
+                self.s
+                    .m
+                    .set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
+                let both = self.s.m.bin(join, Bin::And, first, mapped);
+                Some([first, first, both, both])
+            }
+            (NodeAt::Memory { mapped: first, .. }, None) => Some([first; 4]),
+            _ => None,
+        };
         let mut coords = Vec::with_capacity(24);
         for n in 0..24 {
             let phi = self.s.m.phi(join, f32t);
@@ -403,6 +440,15 @@ impl<'a> Lower<'a> {
             let on = self.s.m.bin(c, Bin::Xor, off, on);
             let hit = self.s.m.bin(c, Bin::And, through, before);
             let hit = self.s.m.bin(c, Bin::And, hit, on);
+            // A child that is not there (an empty slot the builder left,
+            // with inverted infinite bounds) is no hit: as a hit it took a
+            // distance and could be sorted ahead of the real ones.
+            let present = self.s.m.cmp(c, pred::NE, children[n], none);
+            let hit = self.s.m.bin(c, Bin::And, hit, present);
+            let hit = match residency {
+                Some(pages) => self.s.m.bin(c, Bin::And, hit, pages[n]),
+                None => hit,
+            };
             ids[n] = self.s.m.select(c, hit, children[n], none);
             distances[n] = self.s.m.select(c, hit, enter, infinity);
         }

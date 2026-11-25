@@ -111,6 +111,8 @@ fn program(views: u32, body: &[[u32; 2]], marks: bool) -> HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

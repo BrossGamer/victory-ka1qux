@@ -118,6 +118,8 @@ fn pixel_shader(l: Lowered) -> HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: Vec::new(),
     }
 }
@@ -146,6 +148,8 @@ fn pass_through() -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: Vec::new(),
     }
 }

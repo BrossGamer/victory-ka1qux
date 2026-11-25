@@ -140,8 +140,8 @@ pub use lower::{host_max_wave, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_GROUP_BASE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_DISPATCH_THREADS,
+    USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -316,6 +316,15 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The root UAVs the shader may write through: those an emitted
+    /// operation other than a read uses. A root UAV the title binds for a
+    /// program that only reads it need not be copied back.
+    pub written_root_uavs: Vec<u8>,
+    /// Whether a store or atomic goes through title memory by address
+    /// ([`SLOT_MEMORY`]). A program that walks ray-tracing structures reads
+    /// title memory by address and writes its result elsewhere: the copies
+    /// its directory names need not be copied back.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -775,6 +784,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1176,6 +1187,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1188,6 +1201,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1655,6 +1670,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1815,6 +1832,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             // 32 dwords = 128 bytes = 8 elements of stride 16.
@@ -2170,6 +2189,8 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         validate(&vs);
@@ -2473,6 +2494,8 @@ fn raw_buffer_get_dimensions_compiles_on_host() {
         root_cbvs: vec![],
         root_srvs: vec![],
         root_uavs: vec![],
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: vec![],
     };
     host.compute_pipeline(&shader)

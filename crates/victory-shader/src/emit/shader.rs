@@ -91,6 +91,11 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// in parts). Asked for by compute programs that are told the x number
 /// alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// raw thread count along axis `dword` (0 = X, 1 = Y, 2 = Z) of a
+/// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
+/// for a normal thread-group dispatch (all threads in every group active).
+pub const USER_DISPATCH_THREADS: u32 = 0x105;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -176,6 +181,12 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The root UAV slots an emitted operation other than a read uses (a
+    /// store, an atomic, anything not known to leave the buffer as it was).
+    pub written_root_uavs: Vec<u8>,
+    /// A store or atomic is emitted through title memory by address
+    /// (`SLOT_MEMORY`).
+    pub writes_guest_memory: bool,
     pub flags: u64,
     /// Unordered buffer views taken from the view heap (write marks): each
     /// handle's heap index, kind (10 typed, 11 raw, 12 structured) and
@@ -244,6 +255,8 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             flags: 0,
             heap_uavs: std::collections::HashMap::new(),
             view_stores: 0,
@@ -282,6 +295,16 @@ impl Shader {
         args: &[V],
     ) -> V {
         self.discards += u32::from(name == "discard");
+        // A root UAV is also a legal input: only a read through its handle
+        // (BufferLoad 68, GetDimensions 72, RawBufferLoad 139) is known to
+        // leave it unchanged; any other use counts as a write.
+        if !matches!(opcode, 68 | 72 | 139)
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
         // Every store and atomic through an unordered buffer view of the
         // heap is counted, whatever code emitted it: the marks must match.
         let writes = ["bufferStore", "rawBufferStore", "atomicBinOp", "atomicCompareExchange"];
