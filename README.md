@@ -265,7 +265,8 @@ out because its tests fail on this card.
 #135 (alexdeliu), #154 (BitWuehler), #169 (HailLucifer666), #186 (Vyacheslav
 Venglovsky), #191 (gdawid94), #196 (JaumeMarRib), #237 (fffluffy-dev), #282
 (t4l03), #362 (renzowit35), #438 (sennecools), #452 (MalfoyDraco99), #571
-(arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev).
+(arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev),
+#987 (several authors), #1023 and #1031 (Lkxex / NetherySiloX).
 
 ## Running it
 
@@ -305,6 +306,9 @@ and in the open world from 0.33 s to 0.144 to 0.150 s in steady views (about
 7 frames a second), with no failure in a 17-minute session. Baked hair and skin
 still come out wrong with them (too light now, black on an earlier build), so
 they are off in the recommended settings until that is fixed.
+
+The frame rate is drawn in the top left corner of the window
+(`VICTORY_FPS_COUNTER=0` turns it off; victory-fork's main).
 
 Input: XInput pads; with none connected the keyboard is a pad while the
 title's window has focus. Commands, the full list of switches and debugging
