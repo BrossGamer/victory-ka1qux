@@ -9354,6 +9354,14 @@ impl Meter {
                     made as f64 / frames
                 );
             }
+            let fast = crate::descriptor::host::MIRROR_FAST.swap(0, Ordering::Relaxed);
+            if fast > 0 {
+                tracing::info!(
+                    "slots mirrored per frame without taking their heap's lock, made from the record they hold \
+                     already: {:.0} (VICTORY_HEAP_LOCKS=0: the lock is taken every time)",
+                    fast as f64 / frames
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 let v = crate::descriptor::host::MIRROR_SPLIT.each_ref().map(|c| c.swap(0, Ordering::Relaxed));

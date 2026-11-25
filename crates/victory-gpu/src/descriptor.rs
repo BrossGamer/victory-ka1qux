@@ -1396,6 +1396,60 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// A slot mirrored again from the record it was made from is found
+    /// made without its heap's lock (`HostHeap::mirror`'s fast path); a
+    /// slot cleared since is made anew from the record, not taken for made.
+    #[test]
+    fn a_slot_mirrored_again_from_its_record_is_found_without_the_lock() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a private allocation of the test's own.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            // SAFETY: slot 7 of the heap's memory, 16 bytes.
+            let at = unsafe { memory.cast::<u8>().add(7 * 16) } as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, at);
+            assert!(host.mirror(7, at, true).is_some());
+            assert!(host.made(7));
+            // SAFETY: as above.
+            let record = unsafe { (at as *const [u8; 16]).read_unaligned() };
+            let before = crate::descriptor::host::MIRROR_FAST.load(Relaxed);
+            assert!(host.mirror(7, at, true).is_some());
+            assert!(crate::descriptor::host::MIRROR_FAST.load(Relaxed) > before);
+            // Cleared by the title: null, and the record written back later
+            // is made again rather than taken for made.
+            // SAFETY: as above.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0, 16) };
+            assert!(host.mirror(7, at, true).is_none());
+            assert!(!host.made(7));
+            // SAFETY: as above.
+            unsafe { (at as *mut [u8; 16]).write_unaligned(record) };
+            assert!(host.mirror(7, at, true).is_some());
+            assert!(host.made(7));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
     /// What a material record names (`crate::material_demand`): a slot
     /// waiting for its upload as it was when the record was read; a null
     /// slot out of the queue whose memory is all there and no other view

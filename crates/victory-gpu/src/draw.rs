@@ -1483,7 +1483,18 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // On the stack: a root signature holds 64 dwords at most,
+                // and a list made one small allocation a bind (6,000 to
+                // 10,000 a frame) for these (after victory-fork's pull
+                // request #1117). More, should there be: on the heap.
+                let mut stack_values = [0u32; 64];
+                let mut heap_values = Vec::new();
+                let values: &mut [u32] = if (dwords as usize) <= stack_values.len() {
+                    &mut stack_values[..dwords as usize]
+                } else {
+                    heap_values.resize(dwords as usize, 0);
+                    &mut heap_values
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
