@@ -1227,6 +1227,9 @@ mod tests {
     /// driver is what a run with `VICTORY_INPLACE_PROBE=1` adds.
     #[test]
     fn warp_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let _one = crate::host::WARP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             eprintln!("no ID3D12Device13 here: parts of an allocation cannot be opened");
@@ -1243,6 +1246,24 @@ mod tests {
         assert!(probe.reserved_section_refused, "a reserved section is refused");
     }
 
+    /// The same probe on the host hardware GPU, when present: checks that the
+    /// card's driver reads and writes private memory and committed sections
+    /// opened in place (`VICTORY_INPLACE`).
+    #[test]
+    fn hardware_probe_opens_title_like_memory_on_the_card() {
+        let Some(host) = crate::host::host() else { return };
+        if host.device.cast::<ID3D12Device13>().is_err() {
+            eprintln!("no ID3D12Device13 on the host runtime: parts cannot be opened");
+            return;
+        }
+        let p = probe(&host.device, &|| host.video_memory(), 4);
+        for line in &p.lines {
+            eprintln!("card in-place probe: {line}");
+        }
+        assert!(p.part_reads && p.part_writes, "the card reads and writes private memory in place");
+        assert!(p.section_reads && p.section_writes, "the card reads and writes a committed section in place");
+    }
+
     /// Stage 1's own call on the software adapter: a title buffer that
     /// begins and ends off the 64 KiB lines is placed over its pages, the
     /// GPU reads the buffer's bytes at the offset the views use, and its
@@ -1250,6 +1271,9 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _one = crate::host::WARP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;

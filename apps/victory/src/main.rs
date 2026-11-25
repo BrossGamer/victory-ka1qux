@@ -118,6 +118,9 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Show the host GPU, D3D12 runtime and shader capabilities (`VICTORY_ADAPTER` selects an adapter).
+    #[cfg(windows)]
+    GpuInfo,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -183,6 +186,10 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
+            // `VICTORY_HOST_MIN_WAVE=8` (or `16`): translate as for an Intel Arc GPU
+            if let Some(n) = std::env::var("VICTORY_HOST_MIN_WAVE").ok().and_then(|v| v.parse().ok()) {
+                victory_shader::emit::set_host_min_wave(n);
+            }
             translate::run(paths, validate, pipelines, list, jobs)
         }
         Command::Run {
@@ -194,7 +201,40 @@ fn main() -> Result<()> {
             title_args: _,
         } => run::run(&exe, unimplemented, strict, execute, console),
         Command::Config => show_config(),
+        #[cfg(windows)]
+        Command::GpuInfo => show_gpu_info(),
     }
+}
+
+#[cfg(windows)]
+fn show_gpu_info() -> Result<()> {
+    // Touch the Agility export so the linker retains it in every build of `victory`.
+    let _ = (
+        std::ptr::addr_of!(victory_gpu::agility::D3D12SDKVersion),
+        std::ptr::addr_of!(victory_gpu::agility::D3D12SDKPath),
+    );
+    println!("adapters (high-performance order; set VICTORY_ADAPTER=<index|name> to pick one):");
+    for line in victory_gpu::caps::adapters() {
+        println!("  {line}");
+    }
+    println!();
+    let Some((caps, views)) = victory_gpu::caps::report() else {
+        anyhow::bail!("could not create a host D3D12 device");
+    };
+    for line in caps.lines() {
+        println!("{line}");
+    }
+    println!("view heap      {views} views");
+    let missing = caps.missing();
+    if missing.is_empty() {
+        println!("world verdict  OK (shader model 6.6+, mesh shaders, resource binding tier 3)");
+    } else {
+        println!("world verdict  MISSING:");
+        for m in missing {
+            println!("  - {m}");
+        }
+    }
+    Ok(())
 }
 
 fn show_config() -> Result<()> {

@@ -581,19 +581,33 @@ void main() {
 "#;
 
     struct WarpHarness {
-        device: ID3D12Device,
-        queue: ID3D12CommandQueue,
-        allocator: ID3D12CommandAllocator,
+        _lock: std::sync::MutexGuard<'static, ()>,
         list: ID3D12GraphicsCommandList,
+        allocator: ID3D12CommandAllocator,
+        queue: ID3D12CommandQueue,
         fence: ID3D12Fence,
         submitted: u64,
         event: HANDLE,
         clamp: Clamp,
         worker: Clamp,
+        device: ID3D12Device,
+    }
+
+    impl Drop for WarpHarness {
+        fn drop(&mut self) {
+            // SAFETY: close the open list before the allocator drops, and close our event.
+            unsafe {
+                let _ = self.list.Close();
+                let _ = windows::Win32::Foundation::CloseHandle(self.event);
+            }
+        }
     }
 
     impl WarpHarness {
         fn new() -> Option<Self> {
+            let guard = crate::host::WARP_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             // SAFETY: plain DXGI WARP query and D3D12 test harness setup.
             unsafe {
                 let factory: IDXGIFactory4 =
@@ -623,15 +637,16 @@ void main() {
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
                 let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
                 Some(Self {
-                    device,
-                    queue,
-                    allocator,
+                    _lock: guard,
                     list,
+                    allocator,
+                    queue,
                     fence,
                     submitted: 0,
                     event,
                     clamp,
                     worker,
+                    device,
                 })
             }
         }

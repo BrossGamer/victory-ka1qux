@@ -62,6 +62,8 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
+    /// What the device can do ([`crate::caps`]), asked once.
+    pub(crate) caps: crate::caps::Caps,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -608,7 +610,13 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // The high-performance hardware adapter (`VICTORY_ADAPTER` picks
+            // another): with integrated graphics beside the card, adapter 0
+            // can be the integrated one.
+            match crate::caps::pick_adapter() {
+                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
+            }
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         // `VICTORY_D3D12_BACKGROUND=0`: the runtime's background work (the
@@ -630,16 +638,26 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
-        // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
-        // cross-lane code stays in 32-lane halves translated for waves of 32
-        let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-        if device
-            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o1).cast(), size_of_val(&o1) as u32)
-            .is_ok()
-        {
-            tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+        // the widest wave the GPU runs: 32 (NVIDIA, Intel Arc) gets console wave64 compute
+        // programs whose cross-lane code stays in 32-lane halves translated for waves of 32;
+        // the narrowest: below 32 (Intel Arc: 8 or 16) compute programs with wave operations
+        // are pinned to the console's width
+        let adapter1 = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .ok();
+        let caps = crate::caps::query(&device, adapter1.as_ref());
+        for line in caps.lines() {
+            tracing::info!("host GPU: {line}");
         }
+        for missing in caps.missing() {
+            tracing::warn!("host GPU lacks {missing}");
+        }
+        tracing::info!(min = caps.wave_min, max = caps.wave_max, "host wave lanes");
+        if caps.wave_max > 0 {
+            victory_shader::emit::set_host_max_wave(caps.wave_max);
+            victory_shader::emit::set_host_min_wave(caps.wave_min);
+        }
+        victory_shader::emit::set_host_doubles(caps.doubles);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -693,6 +711,7 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
+            caps,
         })
     }
 }
@@ -718,6 +737,12 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
         Ok(adapter)
     }
 }
+
+#[cfg(test)]
+/// Serialises tests that share D3D12's per-adapter WARP singleton device
+/// (`d3d10warp.dll` faults under concurrent `OpenExistingHeapFromAddress1`
+/// and JIT shader submissions across threads).
+pub(crate) static WARP_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 mod tests {

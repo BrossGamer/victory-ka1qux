@@ -84,6 +84,7 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_F16_NEAREST",
+            "VICTORY_SOFT_F64",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_STRICT_JOINS",
@@ -126,14 +127,17 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     result
 }
 
-/// What the host GPU adds to the translation: its wave width and the null
-/// slot at the end of its view heaps (it differs by GPU, and a translation
-/// cached without the clamp, or with another one, must not be served). The
-/// slot is picked before the first key is made.
-fn target() -> [u32; 2] {
+/// What the host GPU adds to the translation: its wave width bounds, whether
+/// it runs double-precision shader operations in hardware, and the null slot
+/// at the end of its view heaps (it differs by GPU, and a translation cached
+/// for another GPU's capabilities must not be served). The slot is picked
+/// before the first key is made.
+fn target() -> [u32; 4] {
     crate::descriptor::host::probe_view_limit();
     [
         victory_shader::emit::host_max_wave(),
+        victory_shader::emit::host_min_wave(),
+        u32::from(victory_shader::emit::host_doubles()),
         victory_shader::emit::view_heap_limit(),
     ]
 }
@@ -184,14 +188,20 @@ fn lookup(cache: &Cache, container: &[u8]) -> (Translation, CacheStatus) {
     (Err(error.clone()), CacheStatus::Failed(error))
 }
 
-fn shader_key(build: &[u8; 32], [wave, view_limit]: [u32; 2], container: &[u8]) -> CacheKey {
+fn shader_key(
+    build: &[u8; 32],
+    [wave, min_wave, doubles, view_limit]: [u32; 4],
+    container: &[u8],
+) -> CacheKey {
     // Bump the format version if the serialized HostShader or refusal changes.
     CacheKey::from_parts(
         "shader.dxil",
-        2,
+        3,
         &[
             build,
             &wave.to_le_bytes(),
+            &min_wave.to_le_bytes(),
+            &doubles.to_le_bytes(),
             &view_limit.to_le_bytes(),
             container,
         ],
@@ -201,7 +211,7 @@ fn shader_key(build: &[u8; 32], [wave, view_limit]: [u32; 2], container: &[u8]) 
 fn cached(
     cache: &Cache,
     build: &[u8; 32],
-    target: [u32; 2],
+    target: [u32; 4],
     container: &[u8],
     translate: impl FnOnce(&[u8]) -> Result<HostShader, ShaderError>,
     still_current: impl FnOnce() -> bool,
@@ -466,13 +476,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
-        let target = [32, 999_999];
+        let target = [32, 8, 0, 999_999];
         let container = b"a console container".as_slice();
         let translate = |_: &[u8]| Ok(shader());
         let entry = || cached(&cache, &build, target, container, translate, || true);
         assert_eq!(entry(), (Ok(shader()), CacheStatus::Stored));
         assert_eq!(entry(), (Ok(shader()), CacheStatus::Hit));
-        for other_target in [[64, target[1]], [target[0], 0]] {
+        for other_target in [
+            [64, target[1], target[2], target[3]],
+            [target[0], 32, target[2], target[3]],
+            [target[0], target[1], 1, target[3]],
+            [target[0], target[1], target[2], 0],
+        ] {
             assert_eq!(
                 cached(&cache, &build, other_target, container, translate, || true),
                 (Ok(shader()), CacheStatus::Stored)
@@ -496,7 +511,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
-        let target = [32, 999_999];
+        let target = [32, 32, 1, 999_999];
         let error = || ShaderError::Unsupported {
             offset: 4,
             what: "test opcode",
@@ -540,7 +555,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = Cache::open(dir.path()).unwrap();
         let build = [7u8; 32];
-        let target = [32, 999_999];
+        let target = [32, 32, 1, 999_999];
         let container = b"shader";
         std::fs::create_dir_all(cache.path_for(&shader_key(&build, target, container))).unwrap();
         let (translated, status) =

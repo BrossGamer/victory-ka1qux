@@ -56,6 +56,21 @@ fn main() {
         "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={}",
         hash.finalize().to_hex()
     );
+    agility();
+}
+
+/// The test executables run translated shaders on the host GPU: they load
+/// the DirectX 12 Agility SDK as `victory-gpu`'s do (`src/agility_tests.rs`;
+/// `scripts\fetch-agility.ps1` puts the runtime beside them). This crate
+/// links no other executable.
+fn agility() {
+    println!("cargo:rerun-if-env-changed=VICTORY_AGILITY_VERSION");
+    let version = std::env::var("VICTORY_AGILITY_VERSION").unwrap_or_else(|_| "616".to_owned());
+    println!("cargo:rustc-env=VICTORY_AGILITY_VERSION={}", version.trim());
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
+        println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+    }
 }
 
 fn field(hash: &mut blake3::Hasher, name: &str, value: &[u8]) {

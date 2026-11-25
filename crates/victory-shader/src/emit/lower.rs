@@ -953,6 +953,66 @@ pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The narrowest wave the host GPU runs (0: not known); see [`set_host_min_wave`].
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host GPU's `WaveLaneCountMin`: below 32 (Intel Arc: 8 on Alchemist, 16 on
+/// Battlemage) the driver may run a compute program in narrower waves unless it declares a
+/// wave size, and programs using wave operations are pinned to 32 ([`pins_wave`]).
+pub fn set_host_min_wave(lanes: u32) {
+    HOST_MIN_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The narrowest wave width selected for shader translation (0: not known).
+pub fn host_min_wave() -> u32 {
+    #[cfg(test)]
+    if let Some(lanes) = TEST_HOST_MIN_WAVE.get() {
+        return lanes;
+    }
+    HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's narrowest host wave, for its thread only.
+    pub(super) static TEST_HOST_MIN_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether compute programs with wave operations declare `WaveSize(32)` on a host of these
+/// wave widths: where it may pick waves under 32 lanes and can run 32.
+pub(super) fn pins_wave(min: u32, max: u32) -> bool {
+    min != 0 && min < 32 && max >= 32
+}
+
+/// Whether the host GPU supports double-precision shader operations (0: not known – taken as
+/// `true` so offline translation matches AMD/NVIDIA unless told; 1: `false`, 2: `true`).
+static HOST_DOUBLES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets whether the host GPU supports `DoublePrecisionFloatShaderOps` (`false` on Intel Arc:
+/// 64-bit float wave sums then lower to integer IEEE-754 arithmetic without `DOUBLES`).
+pub fn set_host_doubles(supported: bool) {
+    HOST_DOUBLES.store(if supported { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether emitted shaders may use hardware `f64` operations (`VICTORY_SOFT_F64=1` forces
+/// the integer lowering on any GPU).
+pub fn host_doubles() -> bool {
+    #[cfg(test)]
+    if let Some(d) = TEST_HOST_DOUBLES.get() {
+        return d;
+    }
+    if std::env::var_os("VICTORY_SOFT_F64").is_some_and(|v| v == "1") {
+        return false;
+    }
+    HOST_DOUBLES.load(std::sync::atomic::Ordering::Relaxed) != 1
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`host_doubles`], for its thread only.
+    pub(super) static TEST_HOST_DOUBLES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -2004,6 +2064,9 @@ impl<'a> Lower<'a> {
         let on = self.boolean(m, c)?;
         let lo = self.i32_of(lo)?;
         let hi = self.i32_of(hi)?;
+        if !host_doubles() {
+            return self.soft_active_f64_sum(lo, hi, on, high);
+        }
         let z = self.s.m.i32(0);
         let lo = self.s.m.select(c, on, lo, z);
         let hi = self.s.m.select(c, on, hi, z);
@@ -2048,6 +2111,262 @@ impl<'a> Lower<'a> {
             r_hi = self.s.m.extract(c, split, 1);
         }
         Ok(if high { r_hi } else { r_lo })
+    }
+
+    /// [`Self::active_f64_sum`] without `DOUBLES` (Intel Arc, or `VICTORY_SOFT_F64=1`): walks
+    /// the lanes whose mask bit `on` is set (`waveActiveBallot`) in lane order and adds their
+    /// IEEE-754 binary64 values in integer arithmetic.
+    fn soft_active_f64_sum(&mut self, lo: V, hi: V, on: V, high: bool) -> Result<V, Why> {
+        if self.exchange.is_some() && !self.all_lanes(self.cur_ir) {
+            need(self.cur_ir);
+            return Err("a wave reduction where not every lane runs");
+        }
+        self.s.flags |= flags::WAVE_OPS | flags::INT64;
+        let pre = self.cur;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(pre, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
+        let b_lo0 = self.s.m.extract(pre, ballot, 0);
+        let b_hi0 = self.s.m.extract(pre, ballot, 1);
+        let z = self.s.m.i32(0);
+
+        let (hdr, body, exit) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(pre, Term::Br(hdr));
+
+        let rem_lo = self.s.m.phi(hdr, i32t);
+        let rem_hi = self.s.m.phi(hdr, i32t);
+        let acc_lo = self.s.m.phi(hdr, i32t);
+        let acc_hi = self.s.m.phi(hdr, i32t);
+        let any_bits = self.s.m.bin(hdr, Bin::Or, rem_lo, rem_hi);
+        let more = self.s.m.cmp(hdr, pred::NE, any_bits, z);
+        self.s.m.terminate(hdr, Term::CondBr(more, body, exit));
+
+        self.cur = body;
+        let k1 = self.s.m.i32(1);
+        let k32 = self.s.m.i32(32);
+        let flo = self.s.op(body, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[rem_lo]);
+        let fhi = self.s.op(body, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[rem_hi]);
+        let fhi = self.s.m.bin(body, Bin::Add, fhi, k32);
+        let in_lo = self.s.m.cmp(body, pred::NE, rem_lo, z);
+        let lane = self.s.m.select(body, in_lo, flo, fhi);
+        let lo_m1 = self.s.m.bin(body, Bin::Sub, rem_lo, k1);
+        let lo_clr = self.s.m.bin(body, Bin::And, rem_lo, lo_m1);
+        let hi_m1 = self.s.m.bin(body, Bin::Sub, rem_hi, k1);
+        let hi_clr = self.s.m.bin(body, Bin::And, rem_hi, hi_m1);
+        let next_rem_lo = self.s.m.select(body, in_lo, lo_clr, rem_lo);
+        let next_rem_hi = self.s.m.select(body, in_lo, rem_hi, hi_clr);
+
+        let term_lo = self.read_lane(lo, lane);
+        let term_hi = self.read_lane(hi, lane);
+        let (next_acc_lo, next_acc_hi) = self.soft_f64_add(acc_lo, acc_hi, term_lo, term_hi);
+        let latch = self.cur;
+        self.s.m.terminate(latch, Term::Br(hdr));
+        self.s
+            .m
+            .set_phi(rem_lo, vec![(b_lo0, pre), (next_rem_lo, latch)]);
+        self.s
+            .m
+            .set_phi(rem_hi, vec![(b_hi0, pre), (next_rem_hi, latch)]);
+        self.s
+            .m
+            .set_phi(acc_lo, vec![(z, pre), (next_acc_lo, latch)]);
+        self.s
+            .m
+            .set_phi(acc_hi, vec![(z, pre), (next_acc_hi, latch)]);
+
+        self.cur = exit;
+        let (mut r_lo, mut r_hi) = (acc_lo, acc_hi);
+        if self.exchange.is_some() {
+            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
+            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            (r_lo, r_hi) = self.soft_f64_add(lo0, hi0, lo1, hi1);
+        }
+        Ok(if high { r_hi } else { r_lo })
+    }
+
+    /// Exact IEEE-754 binary64 addition `(a_lo, a_hi) + (b_lo, b_hi)` (round to nearest, ties
+    /// to even) using 32/64-bit integer operations only (`flags::INT64`, no `flags::DOUBLES`).
+    fn soft_f64_add(&mut self, a_lo: V, a_hi: V, b_lo: V, b_hi: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let i64t = self.s.m.int(64);
+        let k32 = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let k64 = |l: &mut Self, v: u64| l.s.m.int_const(i64t, v as i64);
+
+        let abs32 = k32(self, 0x7FFF_FFFF);
+        let ah = self.s.m.bin(c, Bin::And, a_hi, abs32);
+        let bh = self.s.m.bin(c, Bin::And, b_hi, abs32);
+        let gt_hi = self.s.m.cmp(c, pred::IUGT, bh, ah);
+        let eq_hi = self.s.m.cmp(c, pred::EQ, bh, ah);
+        let gt_lo = self.s.m.cmp(c, pred::IUGT, b_lo, a_lo);
+        let eq_gt = self.s.m.bin(c, Bin::And, eq_hi, gt_lo);
+        let swap = self.s.m.bin(c, Bin::Or, gt_hi, eq_gt);
+
+        // Order so |x| >= |y|.
+        let x_lo = self.s.m.select(c, swap, b_lo, a_lo);
+        let x_hi = self.s.m.select(c, swap, b_hi, a_hi);
+        let y_lo = self.s.m.select(c, swap, a_lo, b_lo);
+        let y_hi = self.s.m.select(c, swap, a_hi, b_hi);
+        let x64 = self.join64(x_lo, x_hi);
+        let y64 = self.join64(y_lo, y_hi);
+
+        let sign32 = k32(self, 0x8000_0000);
+        let z32 = k32(self, 0);
+        let k1_32 = k32(self, 1);
+        let sx = self.s.m.bin(c, Bin::And, x_hi, sign32);
+        let sy = self.s.m.bin(c, Bin::And, y_hi, sign32);
+        let s_xor = self.s.m.bin(c, Bin::Xor, sx, sy);
+        let diff_sign = self.s.m.cmp(c, pred::NE, s_xor, z32);
+
+        let (k20, k7ff, frac_hi_mask) = (k32(self, 20), k32(self, 0x7FF), k32(self, 0x000F_FFFF));
+        let ex = self.s.m.bin(c, Bin::LShr, x_hi, k20);
+        let ex = self.s.m.bin(c, Bin::And, ex, k7ff);
+        let ey = self.s.m.bin(c, Bin::LShr, y_hi, k20);
+        let ey = self.s.m.bin(c, Bin::And, ey, k7ff);
+
+        let x_fh = self.s.m.bin(c, Bin::And, x_hi, frac_hi_mask);
+        let x_f_any = self.s.m.bin(c, Bin::Or, x_fh, x_lo);
+
+        // Inf / NaN on x (since |x| >= |y|, if either is Inf/NaN then ex == 0x7FF).
+        let x_special = self.s.m.cmp(c, pred::EQ, ex, k7ff);
+        let x_nan = self.s.m.cmp(c, pred::NE, x_f_any, z32);
+        let y_inf = self.s.m.cmp(c, pred::EQ, ey, k7ff);
+        let opp_inf = self.s.m.bin(c, Bin::And, y_inf, diff_sign);
+        let qnan_bit = k64(self, 0x0008_0000_0000_0000);
+        let qnan = k64(self, 0x7FF8_0000_0000_0000);
+        let quiet_x = self.s.m.bin(c, Bin::Or, x64, qnan_bit);
+        let inf_res = self.s.m.select(c, opp_inf, qnan, x64);
+        let special_res = self.s.m.select(c, x_nan, quiet_x, inf_res);
+
+        // Zero on y (|y| == 0).
+        let y_abs_hi = self.s.m.bin(c, Bin::And, y_hi, abs32);
+        let y_abs_any = self.s.m.bin(c, Bin::Or, y_abs_hi, y_lo);
+        let y_zero = self.s.m.cmp(c, pred::EQ, y_abs_any, z32);
+        let x_abs_hi = self.s.m.bin(c, Bin::And, x_hi, abs32);
+        let x_abs_any = self.s.m.bin(c, Bin::Or, x_abs_hi, x_lo);
+        let x_zero = self.s.m.cmp(c, pred::EQ, x_abs_any, z32);
+        let both_neg = self.s.m.bin(c, Bin::And, sx, sy);
+        let zero_pair = self.join64(z32, both_neg);
+        let y_zero_res = self.s.m.select(c, x_zero, zero_pair, x64);
+
+        // Finite non-zero significands with 3 GRS bits (hidden bit at 55).
+        let frac64_mask = k64(self, 0x000F_FFFF_FFFF_FFFF);
+        let hidden64 = k64(self, 1u64 << 52);
+        let z64 = k64(self, 0);
+        let k1_64 = k64(self, 1);
+        let k3_64 = k64(self, 3);
+        let x_sub = self.s.m.cmp(c, pred::EQ, ex, z32);
+        let y_sub = self.s.m.cmp(c, pred::EQ, ey, z32);
+        let eff_ex = self.s.m.select(c, x_sub, k1_32, ex);
+        let eff_ey = self.s.m.select(c, y_sub, k1_32, ey);
+
+        let fx = self.s.m.bin(c, Bin::And, x64, frac64_mask);
+        let hx = self.s.m.select(c, x_sub, z64, hidden64);
+        let mx = self.s.m.bin(c, Bin::Or, fx, hx);
+        let mx = self.s.m.bin(c, Bin::Shl, mx, k3_64);
+
+        let fy = self.s.m.bin(c, Bin::And, y64, frac64_mask);
+        let hy = self.s.m.select(c, y_sub, z64, hidden64);
+        let my = self.s.m.bin(c, Bin::Or, fy, hy);
+        let my = self.s.m.bin(c, Bin::Shl, my, k3_64);
+
+        // Align my by d = eff_ex - eff_ey >= 0 with sticky bit.
+        let d = self.s.m.bin(c, Bin::Sub, eff_ex, eff_ey);
+        let d_zero = self.s.m.cmp(c, pred::EQ, d, z32);
+        let k58 = k32(self, 58);
+        let d_huge = self.s.m.cmp(c, pred::IUGE, d, k58);
+        let d_safe = self.s.m.select(c, d_zero, k1_32, d);
+        let d_safe = self.s.m.select(c, d_huge, k58, d_safe);
+        let d64 = self.s.m.cast(c, Cast::ZExt, d_safe, i64t);
+        let k64_64 = k64(self, 64);
+        let inv64 = self.s.m.bin(c, Bin::Sub, k64_64, d64);
+        let my_shr = self.s.m.bin(c, Bin::LShr, my, d64);
+        let my_rem = self.s.m.bin(c, Bin::Shl, my, inv64);
+        let rem_nz = self.s.m.cmp(c, pred::NE, my_rem, z64);
+        let sticky = self.s.m.select(c, rem_nz, k1_64, z64);
+        let my_mid = self.s.m.bin(c, Bin::Or, my_shr, sticky);
+        let my_aligned = self.s.m.select(c, d_huge, k1_64, my_mid);
+        let my_aligned = self.s.m.select(c, d_zero, my, my_aligned);
+
+        let added = self.s.m.bin(c, Bin::Add, mx, my_aligned);
+        let subbed = self.s.m.bin(c, Bin::Sub, mx, my_aligned);
+        let raw_sum = self.s.m.select(c, diff_sign, subbed, added);
+        let sum_zero = self.s.m.cmp(c, pred::EQ, raw_sum, z64);
+
+        // Normalize raw_sum > 0: carry into bit 56 shifts right 1; else shift left up to eff_ex - 1.
+        let k56_64 = k64(self, 56);
+        let carry_bit = self.s.m.bin(c, Bin::LShr, raw_sum, k56_64);
+        let has_carry = self.s.m.cmp(c, pred::NE, carry_bit, z64);
+        let carry_lsb = self.s.m.bin(c, Bin::And, raw_sum, k1_64);
+        let carry_shr = self.s.m.bin(c, Bin::LShr, raw_sum, k1_64);
+        let carry_sum = self.s.m.bin(c, Bin::Or, carry_shr, carry_lsb);
+        let carry_exp = self.s.m.bin(c, Bin::Add, eff_ex, k1_32);
+
+        let k32_64 = k64(self, 32);
+        let raw_lo = self.s.m.cast(c, Cast::Trunc, raw_sum, i32t);
+        let raw_hi64 = self.s.m.bin(c, Bin::LShr, raw_sum, k32_64);
+        let raw_hi = self.s.m.cast(c, Cast::Trunc, raw_hi64, i32t);
+        // Safe non-zero fallback so FirstbitHi never sees 0 on the unused path.
+        let nz_hi = self.s.m.cmp(c, pred::NE, raw_hi, z32);
+        let safe_hi = self.s.m.select(c, nz_hi, raw_hi, k1_32);
+        let safe_lo = self.s.m.select(c, sum_zero, k1_32, raw_lo);
+        let lz_hi = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[safe_hi]);
+        let lz_lo = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 33, &[safe_lo]);
+        let k32_i32 = k32(self, 32);
+        let lz_lo32 = self.s.m.bin(c, Bin::Add, lz_lo, k32_i32);
+        let lz64 = self.s.m.select(c, nz_hi, lz_hi, lz_lo32);
+        let k8 = k32(self, 8);
+        let over8 = self.s.m.cmp(c, pred::IUGT, lz64, k8);
+        let need_diff = self.s.m.bin(c, Bin::Sub, lz64, k8);
+        let need_shl = self.s.m.select(c, over8, need_diff, z32);
+        let max_shl = self.s.m.bin(c, Bin::Sub, eff_ex, k1_32);
+        let clamp_shl = self.s.m.cmp(c, pred::IULT, need_shl, max_shl);
+        let shl32 = self.s.m.select(c, clamp_shl, need_shl, max_shl);
+        let shl64 = self.s.m.cast(c, Cast::ZExt, shl32, i64t);
+        let shl_sum = self.s.m.bin(c, Bin::Shl, raw_sum, shl64);
+        let shl_exp = self.s.m.bin(c, Bin::Sub, eff_ex, shl32);
+
+        let norm_sum = self.s.m.select(c, has_carry, carry_sum, shl_sum);
+        let norm_exp = self.s.m.select(c, has_carry, carry_exp, shl_exp);
+
+        // Round to nearest, ties to even, and pack ((norm_exp - 1) << 52) + mant53 + inc.
+        let mant53 = self.s.m.bin(c, Bin::LShr, norm_sum, k3_64);
+        let k7_64 = k64(self, 7);
+        let k4_64 = k64(self, 4);
+        let grs = self.s.m.bin(c, Bin::And, norm_sum, k7_64);
+        let gt_half = self.s.m.cmp(c, pred::IUGT, grs, k4_64);
+        let eq_half = self.s.m.cmp(c, pred::EQ, grs, k4_64);
+        let odd_bit = self.s.m.bin(c, Bin::And, mant53, k1_64);
+        let is_odd = self.s.m.cmp(c, pred::NE, odd_bit, z64);
+        let tie_even = self.s.m.bin(c, Bin::And, eq_half, is_odd);
+        let round_up = self.s.m.bin(c, Bin::Or, gt_half, tie_even);
+        let inc = self.s.m.select(c, round_up, k1_64, z64);
+
+        let exp_m1 = self.s.m.bin(c, Bin::Sub, norm_exp, k1_32);
+        let exp_m1_64 = self.s.m.cast(c, Cast::ZExt, exp_m1, i64t);
+        let k52_64 = k64(self, 52);
+        let base_exp = self.s.m.bin(c, Bin::Shl, exp_m1_64, k52_64);
+        let packed = self.s.m.bin(c, Bin::Add, base_exp, mant53);
+        let packed = self.s.m.bin(c, Bin::Add, packed, inc);
+
+        let inf64 = k64(self, 0x7FF0_0000_0000_0000);
+        let exp_over = self.s.m.cmp(c, pred::IUGE, norm_exp, k7ff);
+        let mag64 = self.s.m.select(c, exp_over, inf64, packed);
+        let sx64 = self.join64(z32, sx);
+        let signed = self.s.m.bin(c, Bin::Or, mag64, sx64);
+
+        let finite_res = self.s.m.select(c, sum_zero, z64, signed);
+        let non_special = self.s.m.select(c, y_zero, y_zero_res, finite_res);
+        let out64 = self.s.m.select(c, x_special, special_res, non_special);
+
+        let out_lo = self.s.m.cast(c, Cast::Trunc, out64, i32t);
+        let out_hi64 = self.s.m.bin(c, Bin::LShr, out64, k32_64);
+        let out_hi = self.s.m.cast(c, Cast::Trunc, out_hi64, i32t);
+        (out_lo, out_hi)
     }
 
     /// The sum of two 16-bit floats (the low halves of `a` and `b`) as the console's
@@ -2222,6 +2541,18 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        // A host that may run compute programs in waves narrower than 32 lanes (Intel Arc:
+        // 8 or 16) runs one using wave operations at the console's width, as every other
+        // host does by itself (AMD and NVIDIA never go below 32): the translation's lane
+        // arithmetic (the wave's first thread rounded down to 32, `console_thread`) and the
+        // title's wave-wide results assume it.
+        if self.s.wave_size.is_none()
+            && self.mask_data == MaskData::Console
+            && self.s.flags & flags::WAVE_OPS != 0
+            && pins_wave(host_min_wave(), host_max_wave())
+        {
+            self.s.wave_size = Some(32);
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -12318,5 +12649,70 @@ mod tests {
         };
         assert_eq!(lower_lds(1).wave_size, None);
         assert_eq!(lower_lds(2).wave_size, Some(32));
+    }
+
+    /// A compute program reading its wave's first lane (a wave operation, no console lane
+    /// layout) declares no wave size where the host's waves are 32 lanes or more, and
+    /// `WaveSize(32)` where they may be narrower (Intel Arc: 8 or 16).
+    #[test]
+    fn wave_operations_pin_the_wave_size_on_hosts_of_narrow_waves() {
+        let words: &[u32] = &[
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E0A_0200, // v_mov_b32 v5, s0
+            0x7E0C_0280, // v_mov_b32 v6, 0
+            0xD834_0000,
+            0x0000_0506, // ds_write_b32 v6, v5
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = crate::structure::structure(&p).expect("structure");
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = crate::io::raise(&p, &native).expect("io::raise");
+        let lowered = |min: u32, max: u32| {
+            let was = (
+                super::TEST_HOST_MIN_WAVE.replace(Some(min)),
+                super::TEST_HOST_WAVE.replace(Some(max)),
+            );
+            let l = lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .expect("lower");
+            super::TEST_HOST_MIN_WAVE.set(was.0);
+            super::TEST_HOST_WAVE.set(was.1);
+            l
+        };
+        let arc = lowered(8, 32);
+        assert!(arc.wave_ops, "the program uses a wave operation");
+        assert_eq!(arc.wave_size, Some(32), "Intel Arc A-series (8..32)");
+        assert_eq!(lowered(16, 32).wave_size, Some(32), "Intel Arc B-series (16..32)");
+        assert_eq!(lowered(32, 32).wave_size, None, "NVIDIA (32..32): as before");
+        assert_eq!(lowered(32, 64).wave_size, None, "AMD RDNA (32..64): as before");
+        assert_eq!(lowered(0, 0).wave_size, None, "host not known: as before");
+        assert!(
+            super::pins_wave(8, 32)
+                && super::pins_wave(16, 32)
+                && !super::pins_wave(32, 64)
+                && !super::pins_wave(4, 4)
+        );
     }
 }

@@ -18,6 +18,30 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// The DirectX 12 Agility SDK's symbols for this crate's test executables,
+/// which make host devices of their own (as `victory_gpu::agility` does
+/// for the program; only one of the two is ever linked into an executable).
+#[cfg(all(test, windows))]
+mod agility_tests {
+    const fn parse(text: &str) -> u32 {
+        let bytes = text.as_bytes();
+        let (mut value, mut i) = (0u32, 0);
+        while i < bytes.len() {
+            value = value * 10 + (bytes[i] - b'0') as u32;
+            i += 1;
+        }
+        value
+    }
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKVersion: u32 = parse(env!("VICTORY_AGILITY_VERSION"));
+    #[allow(non_upper_case_globals)]
+    #[unsafe(no_mangle)]
+    #[used]
+    pub static D3D12SDKPath: &[u8; 9] = b".\\D3D12\\\0";
+}
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{

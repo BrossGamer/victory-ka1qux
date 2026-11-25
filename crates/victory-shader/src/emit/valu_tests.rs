@@ -1643,80 +1643,120 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("lower");
-
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: Vec::new(),
+    let make = |doubles: bool| {
+        let was = lower::TEST_HOST_DOUBLES.replace(Some(doubles));
+        let lowered = lower::lower(&lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        });
+        lower::TEST_HOST_DOUBLES.set(was);
+        let lowered = lowered.expect("lower");
+        let shader = HostShader {
+            stage: HwStage::Cs,
+            dxil: lowered.dxil,
+            user_data: lowered.user_data,
+            samplers: lowered.samplers,
+            static_samplers: Vec::new(),
+            root_cbvs: lowered.root_cbvs,
+            root_srvs: lowered.root_srvs,
+            root_uavs: lowered.root_uavs,
+            root_indexed_views: Vec::new(),
+        };
+        if let Ok(mut v) =
+            validator::Validator::load(validator::Validator::default_path().as_deref())
+        {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy)
+                .unwrap_or_else(|e| panic!("DXIL validation failed (doubles={doubles}): {e}"));
+        }
+        shader
     };
-    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-        let mut copy = shader.dxil.clone();
-        v.validate(&mut copy).expect("DXIL validation failed");
-    }
+    let hw_f64 = make(true);
+    let soft_f64 = make(false);
 
-    let cases: &[(f64, f32)] = &[(1.25, 5.0), (-0.75, -3.0)];
+    let cases: &[(f64, f32)] = &[
+        (1.25, 5.0),
+        (-0.75, -3.0),
+        (0.0, 0.0),
+        (1e-30, 4e-30),
+        (1e30, 4e30),
+        (
+            f64::from_bits(0x3FF0_0000_0400_0000),
+            (4.0f64 * f64::from_bits(0x3FF0_0000_0400_0000)) as f32,
+        ),
+    ];
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran_any = false;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             continue;
         };
-        let (root, pso) = match host.compute_pipeline(&shader) {
-            Ok(p) => p,
-            // WARP does not support fixed WaveSize(32) on SM 6.6.
-            Err(e) if warp => {
-                eprintln!("{label}: compute_pipeline skipped ({e})");
+        let mut opts =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        let has_doubles = unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut opts).cast(),
+                    size_of_val(&opts) as u32,
+                )
+                .is_ok()
+                && opts.DoublePrecisionFloatShaderOps.as_bool()
+        };
+        for (mode, shader, need_doubles) in [("hw-f64", &hw_f64, true), ("soft-f64", &soft_f64, false)] {
+            if need_doubles && !has_doubles {
+                eprintln!("{label} ({mode}): device has no DoublePrecisionFloatShaderOps; skipped");
                 continue;
             }
-            Err(e) => panic!("{label}: compute_pipeline failed: {e}"),
-        };
-        for &(x, want) in cases {
-            let b = x.to_bits();
-            let inputs = [b as u32, (b >> 32) as u32, 0, 0];
-            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            for u in &shader.user_data {
-                ud[u.index as usize] = match (u.root, u.slot) {
-                    (RootType::Constants, 0) => inputs[u.dword as usize],
-                    (RootType::Table, 1) => 0,
-                    other => panic!("unexpected user data {other:?}"),
-                };
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(p) => p,
+                // WARP does not support fixed WaveSize(32) on SM 6.6.
+                Err(e) if warp => {
+                    eprintln!("{label} ({mode}): compute_pipeline skipped ({e})");
+                    continue;
+                }
+                Err(e) => panic!("{label} ({mode}): compute_pipeline failed: {e}"),
+            };
+            for &(x, want) in cases {
+                let b = x.to_bits();
+                let inputs = [b as u32, (b >> 32) as u32, 0, 0];
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => inputs[u.dword as usize],
+                        (RootType::Table, 1) => 0,
+                        other => panic!("unexpected user data {other:?}"),
+                    };
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &[View::RawUav(1)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label} ({mode}): dispatch failed: {e}"));
+                assert_eq!(
+                    out[0][0],
+                    want.to_bits(),
+                    "{label} ({mode}): wave f64 sum({x}) = {:#010x}, want {:#010x}",
+                    out[0][0],
+                    want.to_bits(),
+                );
             }
-            let out = host
-                .dispatch(
-                    &root,
-                    &pso,
-                    &Dispatch {
-                        roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
-                        samplers: &[],
-                        groups: [1, 1, 1],
-                    },
-                )
-                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            assert_eq!(
-                out[0][0],
-                want.to_bits(),
-                "{label}: wave f64 sum({x}) = {:#010x}, want {:#010x}",
-                out[0][0],
-                want.to_bits(),
-            );
+            ran_any = true;
         }
     }
+    assert!(ran_any, "whole_wave_f64_sum_and_cvt_f32_f64 did not run on any device");
 }

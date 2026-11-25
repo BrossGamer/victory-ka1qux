@@ -190,6 +190,21 @@ notes are in [docs/victory-fork-readme.md](docs/victory-fork-readme.md);
 [docs/asset-policy.md](docs/asset-policy.md) what may never enter the
 repository.
 
+### Intel Arc (A770 / B580)
+
+See [docs/intel-arc.md](docs/intel-arc.md) for the Intel Arc hardware
+measurements, Agility SDK setup (required on Windows 10 for shader model 6.6+
+and mesh shaders), wave-size pinning (`8..32` / `16..32` → `WaveSize(32)`),
+integer `f64` wave reductions (`doubles = false`), and ready-to-use profiles:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\fetch-agility.ps1
+cargo build --profile diag -p victory --features diagnostics
+.\target\diag\victory.exe gpu-info
+
+. .\scripts\arc-a770.ps1          # or: . .\scripts\arc-b580.ps1
+```
+
 ## Credits
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its

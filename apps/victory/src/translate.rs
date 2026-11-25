@@ -170,6 +170,9 @@ pub fn run(
     if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
         victory_shader::emit::set_host_max_wave(n);
     }
+    if let Some(n) = std::env::var("VICTORY_HOST_MIN_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_min_wave(n);
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
