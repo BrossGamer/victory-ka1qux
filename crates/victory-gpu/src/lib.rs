@@ -58,6 +58,8 @@ mod plaincopy;
 mod primitive;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod profile;
+#[cfg(all(test, windows))]
+mod unified_probe;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]

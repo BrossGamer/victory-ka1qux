@@ -173,9 +173,15 @@ impl Drop for OwnView {
 /// could not be mapped; refused by the host.
 static STRETCHES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
+/// Our views on sections mapped now ([`OwnView`]; the leak probe).
+#[cfg(test)]
+pub(crate) fn own_views_mapped() -> u64 {
+    STRETCHES[1].load(Ordering::Relaxed)
+}
+
 /// Title memory `[start, start + len)`, one stretch of `section` from
 /// byte `offset`, opened through a view of ours ([`stretch_on`]).
-fn place_stretch(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
+pub(crate) fn place_stretch(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
     if len < STRETCH_LEAST {
         STRETCHES[2].fetch_add(1, Ordering::Relaxed);
         return Err(None);
