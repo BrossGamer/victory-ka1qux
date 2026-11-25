@@ -16,7 +16,9 @@
 //! runs only once and whose pipeline takes longer is lost: while a world
 //! loads (pipelines are asked for by the hundred then) a frame may wait
 //! longer, for compute pipelines most (`LOADING_FRAME_COMPUTE`), within a
-//! total for the run (`VICTORY_PIPELINE_GATE_S`).
+//! total for the run (`VICTORY_PIPELINE_GATE_S`). Passes over the screen,
+//! which fill lighting tables once, go ahead of the others and are waited
+//! for longer (`Pending::screen_pass`).
 //!
 //! Some pipelines are never made (`left_out`): programs that only shade the
 //! hits of ray-tracing structures nothing builds, which would stand in the
@@ -44,6 +46,8 @@ pub(crate) struct Pending {
     left_out: Option<&'static str>,
     /// When a worker began it ([`slow`]).
     begun: OnceLock<Instant>,
+    /// A pass over the screen ([`Pending::screen_pass`]).
+    screen: bool,
 }
 
 /// Why a pipeline with these shaders is not made, if it is not: the
@@ -94,8 +98,27 @@ impl Pending {
         matches!(self.shaders.as_slice(), [only] if only.stage == "compute")
     }
 
+    /// Whether it draws a pass over the screen with a vertex and a pixel
+    /// program ([`GraphicsState::screen_pass`]). The title fills lighting
+    /// tables with such draws once, at a world's first frame; behind a
+    /// world's worth of pipelines to make they waited longer than any frame
+    /// does and were dropped, and a run that lost them had no diffuse light
+    /// (a grey picture, white glare indoors). They go ahead of the others
+    /// and a frame waits for them longer ([`SCREEN_FRAME`]).
+    /// `VICTORY_SCREEN_PASSES=0` treats them as the others.
+    /// (After Belobug/VIctory-Belobug-AMD 18e57db, which gives them workers
+    /// of their own.)
+    fn screen_pass(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SCREEN_PASSES").is_none_or(|v| v != "0"))
+            && graphics.is_some_and(GraphicsState::screen_pass)
+            && shaders.iter().any(|s| s.stage == "vertex")
+            && shaders.iter().all(|s| s.stage == "vertex" || s.stage == "pixel")
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let key = key(&shaders, graphics.as_deref());
+        let screen = Self::screen_pass(&shaders, graphics.as_deref());
         let left_out = left_out(&shaders);
         if let Some(why) = left_out {
             let count = LEFT_OUT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -112,6 +135,7 @@ impl Pending {
             used: AtomicBool::new(false),
             left_out,
             begun: OnceLock::new(),
+            screen,
         }
     }
 
@@ -180,7 +204,13 @@ fn wait_budget() -> Duration {
 fn slow(p: &Pending) -> bool {
     // A pass a title runs once (it unpacks a model, say) is lost if its
     // pipeline is not there; a draw comes again in the next frame.
-    let most = if p.computes() { 10 } else { 3 };
+    let most = if p.screen {
+        SCREEN_FRAME.as_secs()
+    } else if p.computes() {
+        10
+    } else {
+        3
+    };
     p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
 }
 
@@ -194,6 +224,9 @@ const LOADING_FRAME: Duration = Duration::from_secs(4);
 /// all still to be loaded 130 of them were dropped, and with them walls,
 /// floor, ceiling and faces (they never came back).
 const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
+/// What a frame may wait for passes over the screen ([`Pending::screen_pass`]),
+/// apart from the others and at any time (below the title's 30 s watchdog).
+const SCREEN_FRAME: Duration = Duration::from_secs(20);
 
 /// What is left of the bound on all the waits past the frame's budget of a
 /// run, after `spent` of them. `VICTORY_PIPELINE_GATE_S` sets it: 120 s
@@ -276,15 +309,21 @@ fn wait(p: &Pending, frame: u64) {
     }
     // What was waited past the budget since the start, in milliseconds; the
     // second of each is the compute pipelines'.
-    static LOADINGS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    // The third, passes over the screen's, is not bounded.
+    static LOADINGS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
     let compute = p.computes();
-    let past_total = &LOADINGS[usize::from(compute)];
+    let kind = if p.screen { 2 } else { usize::from(compute) };
+    let past_total = &LOADINGS[kind];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    let budget = if p.screen {
+        budget.max(SCREEN_FRAME)
+    } else {
+        budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading))
+    };
     // The frame the budget belongs to, and what was waited of it (or is
-    // taken by a thread waiting now); for each of the two kinds.
-    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
-    let frame_spent = &SPENTS[usize::from(compute)];
+    // taken by a thread waiting now); for each of the three kinds.
+    static SPENTS: [Mutex<(u64, Duration)>; 3] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 3];
+    let frame_spent = &SPENTS[kind];
     let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
@@ -360,7 +399,9 @@ impl Queue {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
+        if priority == REQUESTED && p.screen {
+            self.requested.push_front(p.clone());
+        } else if priority == REQUESTED {
             self.requested.push_back(p.clone());
         } else {
             self.early.push_back(p.clone());
