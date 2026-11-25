@@ -48,13 +48,24 @@ fn main() {
     for feature in features {
         field(&mut hash, "feature", feature.as_bytes());
     }
+    let mut switches = std::collections::BTreeSet::new();
     for (name, path) in files {
         let bytes = std::fs::read(&path).unwrap_or_else(|error| panic!("read {name}: {error}"));
         field(&mut hash, &name, &bytes);
+        if name.ends_with(".rs") {
+            read_switches(&String::from_utf8_lossy(&bytes), &mut switches);
+        }
     }
     println!(
         "cargo:rustc-env=VICTORY_SHADER_SOURCE_HASH={}",
         hash.finalize().to_hex()
+    );
+    // Every `VICTORY_*` switch the translator reads: their values join the
+    // cache key at run time (`emit::translation_fingerprint`).
+    let switches: Vec<_> = switches.into_iter().collect();
+    println!(
+        "cargo:rustc-env=VICTORY_SHADER_SWITCHES={}",
+        switches.join(",")
     );
     agility();
 }
@@ -70,6 +81,21 @@ fn agility() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKVersion,DATA");
         println!("cargo:rustc-link-arg=/EXPORT:D3D12SDKPath,DATA");
+    }
+}
+
+/// The quoted `"VICTORY_..."` names in a source file.
+fn read_switches(text: &str, out: &mut std::collections::BTreeSet<String>) {
+    let mut rest = text;
+    while let Some(at) = rest.find("\"VICTORY_") {
+        let tail = &rest[at + 1..];
+        let end = tail
+            .find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(tail.len());
+        if tail[end..].starts_with('"') {
+            out.insert(tail[..end].to_string());
+        }
+        rest = &tail[end..];
     }
 }
 

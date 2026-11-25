@@ -27,6 +27,18 @@ pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
+/// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
+/// that reads the address out of a buffer descriptor it picks from the view
+/// heap at an index it computes, and uses it as a pointer (the title's sun
+/// shadow tracing takes the address of its ray-tracing structure so): a raw
+/// buffer of 2 x [`SLOT_STRIDES_COUNT`] dwords the host keeps, dwords `2i`
+/// and `2i + 1` the title address of the view at heap slot `i` (low dword,
+/// bits from 32 up; 0 for a slot without a buffer or structure view). As
+/// [`USER_VIEW_ADDRESS`] for a table entry at a fixed place. After
+/// victory-fork pull request 994 (PiloteCode), there slot 252, which the
+/// write marks hold here.
+pub const SLOT_VIEW_ADDRESSES: u8 = 251;
+
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,
 /// descriptors and other memory (the ray-tracing structure builder and the
@@ -39,7 +51,8 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 ///   address space: the number of the host copy holding that page (0: none
 ///   yet) and the page's byte offset in that copy;
 /// - copy `n` is the raw buffer view at view-heap slot `base + n`, `base`
-///   the user-data dword of kind [`USER_MEMORY_BASE`]; slot `base` itself
+///   dword 0 of the user-data kind [`USER_MEMORY_BASE`] (dword 1: how many
+///   copies have a view for the bind; a later number reads as none); slot `base` itself
 ///   reads zeros and drops writes;
 /// - the root UAV `u<SLOT_FAULTS>` takes the page numbers of accesses that
 ///   found no copy ([`MEMORY_FAULTS`] dwords, dword 0 a sink), which the
@@ -51,6 +64,21 @@ pub const SLOT_FAULTS: u8 = 253;
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
 pub const MEMORY_FAULTS: u32 = 4096;
+/// Write marks (`emit`, "Write marks"): the root SRV `t<SLOT_VIEW_MARKS>`
+/// in [`ROOT_CBV_SPACE`] is the bound view heap's mark table, two dwords
+/// per heap slot: the first bit of the slot's unordered buffer view in the
+/// written-pages bitmap ([`VIEW_MARK_NONE`]: its writes are not marked),
+/// and that view's first byte's offset in its 64 KiB title page (bits
+/// 0-15) with, for a typed view, its element's bytes (bits 16-31).
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// The written-pages bitmap: the root UAV `u<SLOT_VIEW_WRITES>` in
+/// [`ROOT_CBV_SPACE`], [`VIEW_WRITE_BITS`] bits.
+pub const SLOT_VIEW_WRITES: u8 = 252;
+/// A mark table entry's first bit for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits of the written-pages bitmap; a mark past it goes to the last bit,
+/// which no host copy is given.
+pub const VIEW_WRITE_BITS: u32 = 1 << 20;
 /// `RootType::Other` code of a user-data dword the host computes: the view
 /// heap slot of the memory copies' views ([`SLOT_MEMORY`]).
 pub const USER_MEMORY_BASE: u32 = 0x100;
@@ -76,6 +104,19 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// in parts). Asked for by compute programs that are told the x number
 /// alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
+/// `RootType::Other` code of a user-data dword the host computes: the
+/// raw thread count along axis `dword` (0 = X, 1 = Y, 2 = Z) of a
+/// `DispatchX` call with `USE_THREAD_DIMENSIONS` (`flags & 0x20`), or 0
+/// for a normal thread-group dispatch (all threads in every group active).
+pub const USER_DISPATCH_THREADS: u32 = 0x105;
+/// `RootType::Other` code of a user-data dword the host computes, read by
+/// a program with a ray-tracing node test (`image_bvh_intersect_ray`,
+/// `image_bvh64_intersect_ray`): while 0, every node test answers no hit
+/// without reading the node (a box node enters no child, any other node
+/// is a triangle missed). The title's passes run whether or not anything
+/// built the structures, and would otherwise walk whatever bytes lie where
+/// they would be. After victory-fork pull request 994 (PiloteCode).
+pub const USER_STRUCTURES: u32 = 0x106;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -161,7 +202,22 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The root UAV slots an emitted operation other than a read uses (a
+    /// store, an atomic, anything not known to leave the buffer as it was).
+    pub written_root_uavs: Vec<u8>,
+    /// A store or atomic is emitted through title memory by address
+    /// (`SLOT_MEMORY`).
+    pub writes_guest_memory: bool,
     pub flags: u64,
+    /// Unordered buffer views taken from the view heap (write marks): each
+    /// handle's heap index, kind (10 typed, 11 raw, 12 structured) and
+    /// second property (a structured view's stride).
+    pub heap_uavs: std::collections::HashMap<V, (V, u32, u32)>,
+    /// Stores and atomics emitted through those handles, and the marks
+    /// emitted for them: a translation with write marks is whole only
+    /// where the two agree.
+    pub view_stores: u32,
+    pub view_marks: u32,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
     /// `discard` calls emitted (what the tests count).
@@ -220,7 +276,12 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             flags: 0,
+            heap_uavs: std::collections::HashMap::new(),
+            view_stores: 0,
+            view_marks: 0,
             nonuniform_handles: 0,
             discards: 0,
             threads: None,
@@ -255,6 +316,24 @@ impl Shader {
         args: &[V],
     ) -> V {
         self.discards += u32::from(name == "discard");
+        // A root UAV is also a legal input: only a read through its handle
+        // (BufferLoad 68, GetDimensions 72, RawBufferLoad 139) is known to
+        // leave it unchanged; any other use counts as a write.
+        if !matches!(opcode, 68 | 72 | 139)
+            && let Some(first) = args.first()
+            && let Some(&(slot, _)) = self.root_uavs.iter().find(|(_, h)| h == first)
+            && !self.written_root_uavs.contains(&slot)
+        {
+            self.written_root_uavs.push(slot);
+        }
+        // Every store and atomic through an unordered buffer view of the
+        // heap is counted, whatever code emitted it: the marks must match.
+        let writes = ["bufferStore", "rawBufferStore", "atomicBinOp", "atomicCompareExchange"];
+        if writes.iter().any(|w| name.strip_prefix(w).is_some_and(|rest| rest.starts_with('.')))
+            && args.first().is_some_and(|h| self.heap_uavs.contains_key(h))
+        {
+            self.view_stores += 1;
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -470,7 +549,19 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12).
+        let kind = props.0 & 0xFF;
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&kind) {
+            self.heap_uavs.insert(h, (index, kind, props.1));
+        }
+        h
+    }
+
+    /// Writes through heap handle `h` are not marked and not counted: the
+    /// views of title memory by address, which the host declares itself.
+    pub fn unmarked(&mut self, h: V) {
+        self.heap_uavs.remove(&h);
     }
 
     /// The finished container.

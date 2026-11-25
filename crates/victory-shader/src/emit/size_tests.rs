@@ -151,6 +151,8 @@ fn lowered(words: &[u32], heap: bool) -> Result<HostShader, ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        written_root_uavs: lowered.written_root_uavs,
+        writes_guest_memory: lowered.writes_guest_memory,
         root_indexed_views: Vec::new(),
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -221,11 +223,15 @@ fn the_size_of_a_larger_texture_fills_the_height_field() {
 #[test]
 fn only_an_eight_dword_descriptor_is_taken_for_an_image() {
     // The same arithmetic over four dwords (a buffer's descriptor, which
-    // has no width and height in these places) keeps the refusal.
+    // has no width and height in these places) keeps a refusal: as a
+    // descriptor read only as data, or, from the heap, as a buffer
+    // descriptor of no use whose dwords are read as numbers.
     for heap in [false, true] {
         let got = lowered(&program(heap, LOAD_X4), heap);
         assert!(
-            matches!(&got, Err(ShaderError::Unsupported { what, .. }) if *what == "a descriptor read only as data"),
+            matches!(&got, Err(ShaderError::Unsupported { what, .. })
+                if *what == "a descriptor read only as data"
+                    || *what == "a descriptor's address or format read as data"),
             "heap {heap}: {:?}",
             got.err()
         );

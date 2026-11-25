@@ -93,8 +93,16 @@ enum Command {
         #[arg(long)]
         jobs: Option<usize>,
         /// Fill the shader cache that `run` reads.
-        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        #[arg(long, conflicts_with_all = ["validate", "list", "warm"])]
         cache: bool,
+        /// Warm the run's shader cache: a file of shader hashes (the 16
+        /// hex digits a run's log names a shader by, anywhere in a line);
+        /// the containers with those hashes are translated into the
+        /// cache and nothing else is done (`all`: every container found).
+        /// Set `VICTORY_HOST_WAVE` and `VICTORY_VIEW_LIMIT` to what the
+        /// run's log says of the host.
+        #[arg(long)]
+        warm: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -176,6 +184,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            warm,
             ..
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
@@ -189,6 +198,9 @@ fn main() -> Result<()> {
             // `VICTORY_HOST_MIN_WAVE=8` (or `16`): translate as for an Intel Arc GPU
             if let Some(n) = std::env::var("VICTORY_HOST_MIN_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_min_wave(n);
+            }
+            if let Some(file) = warm {
+                return translate::warm_hashes(paths, &file, jobs);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }

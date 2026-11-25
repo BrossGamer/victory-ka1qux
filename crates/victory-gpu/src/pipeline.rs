@@ -61,8 +61,15 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// Its result gets the least indirect light ([`crate::ambient`]).
+    #[cfg(windows)]
+    pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its code walks the ray-tracing structures, once looked at
+    /// ([`Shader::walks`]).
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -119,7 +126,11 @@ impl Shader {
             hash: hash.to_hex()[..16].to_owned(),
             container: bytes.to_vec(),
             #[cfg(windows)]
+            resolves_light: crate::ambient::resolves_light(bytes),
+            #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            walks: OnceLock::new(),
         }
     }
 }
@@ -132,6 +143,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Compute thread-group dimensions `[x, y, z]` (`[0; 3]` for non-compute).
+    pub(crate) threads: [u32; 3],
 }
 
 #[cfg(windows)]
@@ -190,17 +203,23 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
-    let used = programs
-        .into_iter()
-        .find(|p| {
-            matches!(
-                p.stage,
-                HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
-            )
-        })
-        .map(|p| p.used)
-        .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    let main = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    });
+    let threads = match main.as_ref().map(|p| &p.io) {
+        Some(victory_shader::native::StageIo::Cs(cs)) => cs.threads,
+        _ => [0; 3],
+    };
+    let used = main.map(|p| p.used).unwrap_or_default();
+    Ok(Translated {
+        host,
+        used,
+        stores,
+        threads,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -239,6 +258,42 @@ static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     off: false,
 });
 
+/// The builder runs whole and is not turned off ([`Builder`]): read at
+/// every dispatch of a program that walks the structures
+/// ([`structures_walked`]), without the builder's lock.
+#[cfg(windows)]
+static BUILT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the structure builder runs whole now (its structures are
+/// built): the ray-traced light is the title's own, and the stand-in for
+/// it (`crate::ambient`) steps aside.
+#[cfg(windows)]
+pub(crate) fn structures_built() -> bool {
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the programs that walk the title's ray-tracing structures may
+/// read their nodes (`victory_shader::emit::USER_STRUCTURES`); while not,
+/// every node test of theirs answers no hit without reading memory: no box
+/// is entered and no triangle hit, so their rays see an empty scene instead
+/// of whatever bytes lie where the structures would be (victory-fork pull
+/// request 994 saw screen-aligned dark tiles on sunlit hair, lit squares in
+/// shadow, and light changing from run to run). True while the builder
+/// runs whole. Otherwise: with the builder asked for ([`builder_allowed`]),
+/// false (before its first dispatch, or once turned off); without it, true,
+/// as before. `VICTORY_BVH_NO_HIT=1` makes it false without the builder,
+/// `=0` true always.
+#[cfg(windows)]
+pub(crate) fn structures_walked() -> bool {
+    static WALK: OnceLock<bool> = OnceLock::new();
+    BUILT.load(std::sync::atomic::Ordering::Relaxed)
+        || *WALK.get_or_init(|| match std::env::var("VICTORY_BVH_NO_HIT").as_deref() {
+            Ok("0") => true,
+            Ok("1") => false,
+            _ => !builder_allowed(),
+        })
+}
+
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
 fn of_builder(shaders: &[Arc<Shader>]) -> bool {
@@ -269,6 +324,87 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+#[cfg(windows)]
+impl Shader {
+    /// Whether the program walks the ray-tracing structures: its code has
+    /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
+    /// at once, when a dispatch first asks.
+    fn walks(&self) -> bool {
+        *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+/// Whether a console container's code tests rays against the nodes of a
+/// ray-tracing structure.
+#[cfg(windows)]
+fn container_walks(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+}
+
+/// Whether native code has a ray-tracing node test.
+#[cfg(windows)]
+fn code_walks(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
+/// Dispatches held back by [`walk_held`] since the last frame line.
+#[cfg(windows)]
+pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a dispatch with the title's pipeline `this` is held back
+/// because its program walks ray-tracing structures nothing has built
+/// (`VICTORY_BVH_HOLD=1`; off by default).
+///
+/// The structure builder does not run (see [`Builder`]: only with
+/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
+/// waves does not manage yet). The title's ray-traced passes run all the
+/// same: 64 programs of its shader pack test rays against structure nodes
+/// (ray-traced shadows, screen probes, reflections, the irradiance cache;
+/// one of them, the irradiance cache's shadow trace, f607780aa8e502d0,
+/// from the first world frame on in every run). Each walks, in a loop the
+/// title bounds at 65,535 steps a wave, whatever bytes lie where the
+/// structure would be: what it returns is not a picture of the scene, and
+/// how long it runs depends on those bytes. Upstream's pull request 2311
+/// measured a card hung in exactly that dispatch on an NVIDIA card, every
+/// run, and both card losses of ours since the draw windows' own fault was
+/// fixed (runs 208 and 224) came within a second of the first use of the
+/// programs that shade those rays' hits (the ray-tracing resolves).
+///
+/// With the switch such a dispatch is dropped until the builder has run
+/// whole. What the passes would have written stays as the title left it
+/// (their targets are not cleared by us): the picture has to be looked at.
+#[cfg(windows)]
+pub(crate) fn walk_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    // (Asked only for the few programs that walk: the lock is the builder's.)
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+        return false;
+    }
+    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                shaders = ?p.shaders,
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+            );
+        });
+    }
+    true
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -281,16 +417,57 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILT.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
+}
+
+/// Whether the run has the ray-tracing structure builder, the programs
+/// that shade ray hits and what makes the builder's writes safe: on by
+/// default (three runs of 5 to 11 minutes on an RX 7800 XT with no crash
+/// and no device removal); `VICTORY_RAYS=0` (or `VICTORY_BVH_BUILDER=0`)
+/// turns them off. The crate's own unit tests keep them off unless one of
+/// the two is `1`, as they were written against.
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        let is = |name: &str, value: &str| std::env::var_os(name).is_some_and(|v| v == value);
+        if is("VICTORY_RAYS", "0") || is("VICTORY_BVH_BUILDER", "0") {
+            return false;
+        }
+        is("VICTORY_BVH_BUILDER", "1") || is("VICTORY_RAYS", "1") || !cfg!(test)
+    })
+}
+
+/// Whether a shader that reads title memory by address declares the
+/// copies it reaches written only when its code stores through title
+/// memory, and a root UAV written only when its code stores through that
+/// view (the translation says: `HostShader::writes_guest_memory`,
+/// `written_root_uavs`). Without it any such shader whose code can store
+/// at all (a walk of the structures writes its result to a texture or
+/// buffer) declares every numbered copy written: each such dispatch
+/// snapshots, compares and copies back all of them, and one stage's
+/// copy-back carries the bytes every other stage left in those copies.
+/// After DexNom/VIctory, which measured 3.4 s a frame before and 0.97 s
+/// after, with 12.8 GB of title memory compared a frame before and 2.7 GB
+/// after. On with the builder ([`builder_allowed`]);
+/// `VICTORY_RAY_WRITES=precise` turns it on without, `=all` off.
+#[cfg(windows)]
+pub(crate) fn precise_ray_writes() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_RAY_WRITES").as_deref() {
+        Ok("precise") => true,
+        Ok("all") => false,
+        _ => builder_allowed(),
+    })
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -315,6 +492,7 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     true
 }
 
@@ -728,6 +906,14 @@ pub(crate) mod host;
 mod left_out;
 #[cfg(windows)]
 mod library;
+
+/// Host pipelines created and loaded from the library since the start
+/// (`crate::framelog`).
+#[cfg(windows)]
+pub(crate) fn frame_log_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
 #[cfg(windows)]
 mod make;
 

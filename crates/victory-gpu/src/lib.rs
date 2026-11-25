@@ -25,16 +25,28 @@ mod bake_probe;
 mod capture;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
+#[cfg(windows)]
+mod cardmeter;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
+mod drvwatch;
+#[cfg(windows)]
+mod fpsbox;
+#[cfg(windows)]
+mod spread;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod framelog;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
@@ -45,9 +57,15 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod plaincopy;
+#[cfg(windows)]
 mod primitive;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 pub mod query;
 pub mod queue;
+#[cfg(windows)]
+mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -55,9 +73,13 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod marks;
+#[cfg(windows)]
 mod memory;
 #[cfg(windows)]
 mod shadow;
+#[cfg(windows)]
+mod tiles;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
@@ -66,11 +88,16 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use bake_probe::{
+    Writer as BakeProbeWriter, dstorage_tag as bake_probe_dstorage_tag, note as bake_probe_note,
+    note_signal as bake_probe_dstorage_signal, probe_on as bake_probe_on,
+};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    Writing, physical_written, title_memory_reading, title_memory_reading_now, title_memory_reading_range,
-    title_memory_remapped, title_memory_remapping,
-    title_memory_remapping_range, writing_held as kernel_will_write,
+    Writing, title_memory_reading, title_memory_reading_now, title_memory_reading_range,
+    title_memory_remapped, title_memory_remapping, title_memory_remapping_range, title_memory_written,
+    title_pages_changed, title_pages_told, writing_async as kernel_will_write_async, writing_held as kernel_will_write,
 };

@@ -79,9 +79,29 @@
 //!   geometry shader of ours between the translated vertex and pixel
 //!   shaders and draws triangle lists with the title's own vertex counts.
 //!   It binds nothing.
+//! * **Write marks** ([`view_marks`]; added 2026-11-25, after upstream
+//!   VIctory's `cd94d35`): every store or atomic through an unordered
+//!   buffer view taken from the view heap (tables, the heap itself) also
+//!   sets bits in a bitmap, the root UAV `u`[`SLOT_VIEW_WRITES`], so that
+//!   the host compares and copies back only the 64 KiB title pages shaders
+//!   wrote. The root SRV `t`[`SLOT_VIEW_MARKS`] is the bound heap's mark
+//!   table, two dwords per slot: a first bit and, in bits 0-15, the view's
+//!   first byte's offset in its title page (bits 16-31: a typed view's
+//!   element size). A write at byte `x` of the view sets bit `first +
+//!   ((offset + x) >> 16)` for its first and its last byte, at most
+//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. Both
+//!   root views exist only in programs that write through such views:
+//!   others are as without marks. Root UAVs and title memory by address
+//!   are not marked (the host declares what they write). Every such
+//!   store and atomic is counted where its DXIL operation is emitted, and
+//!   every mark where it is made; a lowering whose counts differ (a path
+//!   that writes without marking) is done again without marks, as is a
+//!   program whose root signature would grow past what the host takes.
 
 mod bitcode;
 mod container;
+#[cfg(all(test, windows))]
+mod cube_lod_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
@@ -89,6 +109,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod marks_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -124,9 +146,36 @@ pub use lower::{
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_DISPATCH_THREADS,
+    USER_GROUP_BASE, USER_MEMORY_BASE, USER_STRUCTURES, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE,
+    VIEW_WRITE_BITS,
+    set_view_heap_limit, view_heap_limit,
 };
+
+/// Whether translations carry write marks (module notes, "Write marks"):
+/// on unless `VICTORY_VIEW_MARKS=0`. Part of the translation: the shader
+/// cache keys on it (`victory-gpu`'s does). Off in this crate's own tests,
+/// whose rig binds no mark table or bitmap (`marks_tests` asks for them).
+pub fn view_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    !cfg!(test) && *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"))
+}
+
+/// Whether `shader` marks the pages it writes through views: the host
+/// binds the mark table and the bitmap for it.
+pub fn marks_writes(shader: &HostShader) -> bool {
+    shader.root_uavs.contains(&SLOT_VIEW_WRITES)
+}
+
+/// Whether the root signature of a program with write marks still fits
+/// the host's 64 dwords, counted as the host builds it (user data as
+/// constants, every root view as a descriptor, two dwords) with room left
+/// for a pipeline's other stage: all of it for compute, half otherwise.
+fn marks_fit(shader: &HostShader) -> bool {
+    let views = shader.root_cbvs.len() + shader.root_srvs.len() + shader.root_uavs.len();
+    let dwords = shader.user_data_dwords() + 2 * views as u32;
+    dwords <= if shader.stage == HwStage::Cs { 64 } else { 32 }
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -198,6 +247,37 @@ pub fn shader_opt() -> u32 {
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
 }
 
+/// Everything a translation depends on besides the container: the
+/// translator's own source (hashed at build time), the value of every
+/// `VICTORY_*` switch it reads, the host facts the device hands it (widest
+/// wave, view heap limit) and the settings above. The shader cache keys on
+/// this instead of on the whole executable, so a rebuild that leaves the
+/// translator alone keeps its translations. Call it after the device is made.
+pub fn translation_fingerprint() -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes());
+    out.push(u8::from(cfg!(feature = "diagnostics")));
+    out.push(u8::from(cfg!(debug_assertions)));
+    for name in env!("VICTORY_SHADER_SWITCHES").split(',').filter(|n| !n.is_empty()) {
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'=');
+        if let Some(value) = std::env::var_os(name) {
+            out.extend_from_slice(value.as_encoded_bytes());
+        }
+        out.push(0);
+    }
+    out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+    out.extend_from_slice(&lower::host_min_wave().to_le_bytes());
+    out.push(u8::from(lower::host_doubles()));
+    out.push(u8::from(lower::host_barycentrics()));
+    out.push(u8::from(lower::host_atomic64_typed()));
+    out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+    out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.push(group_sync());
+    out.extend_from_slice(&shader_opt().to_le_bytes());
+    out
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -247,6 +327,15 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The root UAVs the shader may write through: those an emitted
+    /// operation other than a read uses. A root UAV the title binds for a
+    /// program that only reads it need not be copied back.
+    pub written_root_uavs: Vec<u8>,
+    /// Whether a store or atomic goes through title memory by address
+    /// ([`SLOT_MEMORY`]). A program that walks ray-tracing structures reads
+    /// title memory by address and writes its result elsewhere: the copies
+    /// its directory names need not be copied back.
+    pub writes_guest_memory: bool,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
 }
@@ -280,7 +369,23 @@ pub struct UserData {
 
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
+///
+/// A program refused because the first half of an interpolation is read as
+/// data is translated once more with first halves evaluated as the pair
+/// they start (`lower::with_first_half_pairs`), and only such a program:
+/// with that on for every program, 8,551 pixel programs of the title that
+/// already translated came out changed (an extra evaluation in each), for
+/// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+    match translate_plain(container) {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
+            lower::with_first_half_pairs(|| translate_plain(container))
+        }
+        other => other,
+    }
+}
+
+fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -307,8 +412,31 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, with write marks
+/// where [`view_marks`] asks for them and they are whole (module notes,
+/// "Write marks").
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if !view_marks() {
+        return emit_unmarked(c, native, p, st, io, res);
+    }
+    let (marked, whole) = lower::with_view_marks(|| emit_unmarked(c, native, p, st, io, res));
+    match marked {
+        Ok(shader) if !marks_writes(&shader) || whole && marks_fit(&shader) => Ok(shader),
+        // Short of marks, too big, or refused with them: as without.
+        _ => emit_unmarked(c, native, p, st, io, res),
+    }
+}
+
+/// [`emit`] without write marks (unless the caller runs it inside
+/// `lower::with_view_marks`).
+fn emit_unmarked(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -667,6 +795,8 @@ fn emit_program(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
+        writes_guest_memory: l.writes_guest_memory,
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
@@ -1068,6 +1198,8 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         let file = |var: &str, stage| {
@@ -1080,6 +1212,8 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
+                writes_guest_memory: false,
                 root_indexed_views: Vec::new(),
             })
         };
@@ -1547,6 +1681,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -1707,6 +1843,8 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
+                writes_guest_memory: l.writes_guest_memory,
                 root_indexed_views: Vec::new(),
             };
             // 32 dwords = 128 bytes = 8 elements of stride 16.
@@ -1831,6 +1969,9 @@ mod atomic_tests {
         let was = lower::TEST_HOST_ATOMIC64_TYPED.replace(Some(false));
         for &(opcode, mask) in &[(0x17u32, 3u32), (0x10, 15)] {
             let words = [
+                0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
+                0xF40C_0200,
+                0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
                 0x7E00_0280,
                 0x7E02_0280,
                 0x7E04_0281,
@@ -2150,6 +2291,8 @@ mod barycentric_tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
+            writes_guest_memory: false,
             root_indexed_views: Vec::new(),
         };
         validate(&vs);
@@ -2501,6 +2644,8 @@ fn raw_buffer_get_dimensions_compiles_on_host() {
         root_cbvs: vec![],
         root_srvs: vec![],
         root_uavs: vec![],
+        written_root_uavs: Vec::new(),
+        writes_guest_memory: false,
         root_indexed_views: vec![],
     };
     host.compute_pipeline(&shader)

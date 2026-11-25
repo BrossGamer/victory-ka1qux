@@ -1,4 +1,4 @@
-# victory-ka1qux
+# BRVIctory-ka1qux
 
 Runs an Xbox Series title natively on Windows, from files the user supplies.
 A fork of [victory-fork](https://github.com/fxceless/victory-fork) by fxceless,
@@ -24,19 +24,24 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 |---|---|---|
 | Boot, menus, saves | ✅ | work (as upstream) |
 | Getting into the world | ✅ | about 3 minutes from launch, with the caches warm and the movies skipped |
-| The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts |
-| Light in shadow | ❌ | whatever the sun or a lamp does not reach directly is dark: the ray-traced light does not run |
-| Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch |
-| Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3.5 with victory-fork's speed defaults (median 0.29 s, one run, on an earlier build) |
-| Stability | ✅ | no crash and no device removal in the last twenty-four runs (4 to 25 minutes each) |
-| Memory | ✅ | about 11 GB of the card's 16 and 6 GB of the PC's memory shared with it (13.7 and 14.9 GB before the texture fix below) |
-| Tests | ✅ | `cargo test --workspace` runs 646 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
+| Light in shadow | 🟡 | the title's own ray-traced light runs, on by default (`VICTORY_RAYS=0` turns it off): its structures are built and traced, and shaded faces of buildings, trees and characters get bounced light, where without it they are near black. Four runs on the street, 5 to 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 to 0.1 s more |
+| Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
+| Frame rate | 🟡 | with the switches below, in the open world on a street with about 6,100 draws a frame: a median of 0.42 s a frame (about 2.4 frames a second), 0.33 s at best; the same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main and 0.53 s before the write marks (below). An earlier build, in a lighter view of about 2,000 draws, took 0.32 s. With victory-fork's speed defaults a frame took 144 to 150 ms in steady open-world views on an earlier build, but the picture is not right with them yet (below) |
+| Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
+| Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
+| Tests | ✅ | `cargo test --workspace` runs 739 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
-- Whatever the sun or a lamp does not reach directly is dark. The title fills
-  shadow with ray-traced light, and its ray-tracing structures are not built
-  here (the builder is off).
+- The title's ray-traced light is on by default (below) but has been measured
+  on one street of the open world only; interiors, night and other scenes are
+  not checked yet. With `VICTORY_RAYS=0` a constant stands in for that light,
+  so shaded places are lit, but flat.
+- In a cutscene at the start of the save used for testing, the main
+  character's torso shows the clothes of an earlier scene while the sleeves
+  are right: the title bakes the outfit before the new outfit's textures have
+  reached its memory. Under investigation.
 - Loading is slower than the title's clock. A scene starts before all of it
   has streamed in: the shell of the first room (walls and ceiling) arrives 10
   to 25 seconds into the opening shot, in every launch looked at. An earlier
@@ -47,10 +52,20 @@ Known problems:
   and its pull requests #606 and #632 went in (below). That is still a small
   count; `VICTORY_BAKE_PROBE=1` reads the bake's result back, and its
   sequence of hashes was the same in the launches it was on.
+- In the open world the card fills up. Textures it has no room for are now
+  made without their largest mips (below); before, thousands waited and walls,
+  cupboards and some objects showed black with light speckles. Such a texture
+  stays at the lower resolution until it is let go.
+- With victory-fork's speed defaults the frame rate doubles, but baked hair
+  and skin come out too light (they came out black on an earlier build): the
+  bake reads data the card has not received yet while submissions run ahead.
+  They stay off in the recommended settings.
 - Two of the title's compute programs do not translate, and the programs that
   only shade ray-tracing hits are left out on purpose.
-- About 2 frames a second. Roughly a third of a frame is the card; the rest is
-  preparing the frame and copying title memory to and from the card.
+- About 2.4 frames a second on a busy street. Of a 0.42 s frame, about 0.17 s
+  is the card, 0.09 s preparing it, 0.17 s the pass over the descriptor heap
+  (most of it remaking the buffer views the title copies in as bytes, about
+  60,000 a frame) and 0.05 s copying title memory back.
 - Tested on one machine only. The switches under "Running it" are the ones the
   state above was measured with.
 
@@ -100,6 +115,11 @@ missing in some launches and not in others):
 - Texture views are told apart by the memory their mips really take, uploads
   start at the first mip that is there, and views the queue lost are put back
   (ported from [myokex/victory-amd](https://github.com/myokex/victory-amd)).
+- Textures the card has no room for are made without their mips larger than
+  256 texels a side, up to 97 % of the card's budget, instead of being
+  refused (`VICTORY_TEXTURE_SHORT=0` goes back; `VICTORY_TEXTURE_DROP_MIPS=N`
+  is victory-fork's pull request #610). A bake's own sources are made first,
+  past the line, so characters keep their skin when the card is full.
 - The title bakes its characters' skin and clothes while it loads, from
   textures it picks by index. Before each bake the texture pass runs until
   nothing more is due (it took at most 4,096 slots, once). That alone did not
@@ -112,6 +132,13 @@ missing in some launches and not in others):
   uploaded texture uploads it again; this path marked a source of a bake in
   each launch measured) and #632 by ryotdev (a late mapping check no longer
   clears the view that replaced the one it looked at).
+- In the open world the card fills up, and late bakes found the textures
+  they read still waiting for room (13,000 due, none made): characters came
+  out with black skin and white eyes. A bake's own sources now go first and
+  may be made past the card's usual line, up to 96 % of its budget
+  (`VICTORY_BAKE_SOURCES_FIRST=0` turns it off, `VICTORY_BAKE_ROOM_PERCENT`
+  sets the line). In an A/B on the same save, skin and clothes came out right
+  with it and black-speckled without it.
 - The texture ring of the intro movie no longer shows its frames out of order.
 - A descriptor read only for its texture's size is answered by the host.
 
@@ -137,9 +164,71 @@ missing in some launches and not in others):
   again for a moment before its request fails.
 - `VICTORY_SKIP_MOVIES=1` ends the title's non-looping movies on their first
   playback tick (`all`: looping ones too).
+- `VICTORY_PATCH=<rva>=<bytes>[:<expected>],...` writes bytes into the title's
+  code in memory before it starts, only where the original bytes match; the
+  title's files are not changed. Used here, with
+  [LilBigJP/ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import),
+  to load a story save converted from another console and test the open world.
+
+**Frame time** (the street of the open world, ~6,100 draws a frame, 0.83 s a
+frame after the merge of victory-fork's main, 0.42 s with these):
+
+- Views' own copies of title memory are let go a few at a time and their
+  buffers reused (each new copy used to look at all 12,000 kept ones and make
+  a buffer of its own; the pass over the heap took about 850 ms a frame, now
+  about 170).
+- A copy-back writes the GPU's bytes back under one hold of the write guards
+  per stretch instead of one per run of bytes (1.3 million runs a frame):
+  275 ms a frame down to about 100.
+- **Write marks**: shaders mark the 64 KiB pages they write through views,
+  and copies go back by the marked pages instead of comparing snapshots
+  (`VICTORY_VIEW_MARKS=0` goes back; with relay and late waits off). Measured
+  on the same street, the same build with and without: 0.42 against 0.53 s a
+  frame, copy-back 53 against 101 ms, preparing 92 against 137 ms. After
+  VIctory's own write marks (`cd94d35`, `940d32f`) and its open pull requests
+  #2455, #2437, #2409 and #2474, with two guard fixes of
+  [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD).
+- The pass over textures takes at most 50 ms a frame while the card is at
+  its line (it could spend 750 ms making 1,500 textures in one frame when a
+  little memory was let go), and does not look again at slots it just made.
+
+**Ray tracing** (on by default; `VICTORY_RAYS=0` turns it off):
+
+- The title's ray-tracing structure builder runs whole on the card without
+  corrupting the title's memory, and the programs that shade ray hits are
+  made. The cause of the crashes was the layer's: the builder dispatches by
+  thread counts (`DispatchX` with `USE_THREAD_DIMENSIONS`), which were taken
+  for group counts, so its stages ran up to 64 times the work and wrote empty
+  nodes over the title's objects. Now the counts make groups and the threads
+  past them leave (after victory-fork's pull request #646).
+- Writes are declared only where shaders store by address; the address
+  directory follows the buffers the title releases or replaces; list upload
+  memory sits where shaders can reach it; only the copies a list names are kept
+  current; node tests count an absent child or an unmapped page as no hit, and
+  nothing hits while no structure is built; sun-shadow traces read structure
+  addresses from a per-slot table. After victory-fork's pull request #994 (by
+  PiloteCode) and [DexNom/VIctory](https://github.com/DexNom/VIctory), which
+  first ran the title's ray tracing on an AMD card.
+- While the builder runs, the constant stand-in for indirect light steps
+  aside (`VICTORY_AMBIENT_WITH_RAYS=1` keeps it, to compare).
+
+**Light**
+
+- While the ray-traced light does not run, the output of the program that
+  resolves the indirect diffuse light is replaced by a constant
+  (`VICTORY_AMBIENT=<level>`, 0.6 by default; `off` keeps the program's
+  output, which here is magenta on leaves and cloth and blocks of colour
+  indoors). After [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD).
+- The constant has a colour (`VICTORY_AMBIENT_TINT=r,g,b`) and less of it
+  reaches creases and the underside of things, worked out from the scene's
+  depth (`VICTORY_AMBIENT_SHADE`, on by default; `=0` off). Also after Belobug.
 
 **Translator**
 
+- A pixel shader reads the other pixels of its 2x2 quad through quad reads,
+  helper pixels included: wave reads give 0 from helper pixels on AMD, so a
+  derivative a shader took by hand was wrong along every triangle's edge
+  (lines on paint, glass and skin). After Belobug/VIctory-Belobug-AMD.
 - Mesh primitive exports take 9-bit vertex indices (ported from upstream).
 - The valid-mask bit of a pixel export decides which pixels survive.
 - A heap buffer asked only for its size gets a non-uniform handle
@@ -176,7 +265,8 @@ out because its tests fail on this card.
 #135 (alexdeliu), #154 (BitWuehler), #169 (HailLucifer666), #186 (Vyacheslav
 Venglovsky), #191 (gdawid94), #196 (JaumeMarRib), #237 (fffluffy-dev), #282
 (t4l03), #362 (renzowit35), #438 (sennecools), #452 (MalfoyDraco99), #571
-(arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev).
+(arminkhaleghirod), #575 (Cuebert), #606 (laptopnotebook), #632 (ryotdev),
+#987 (several authors), #1023 and #1031 (Lkxex / NetherySiloX).
 
 ## Running it
 
@@ -204,6 +294,7 @@ $env:VICTORY_SKIP_MOVIES    = "1"
 $env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "16"; $env:VICTORY_CARD_BUFFERS_MB = "512"
 $env:VICTORY_LATE_WAIT_LISTS = "128"
+# $env:VICTORY_RAYS = "0"            # without the title's ray-traced light (on by default)
 
 target\diag\victory.exe run "$g\<the title's exe>" --execute
 ```
@@ -211,9 +302,13 @@ target\diag\victory.exe run "$g\<the title's exe>" --execute
 The last three lines of switches turn off victory-fork's newer speed defaults
 (sending submissions ahead of the card). Measured on this card with this build,
 they bring a frame from a median of 0.50 s down to 0.29 s (0.17 s at best),
-with no failure in the one run made with them. An earlier version of them cost
-characters their skin here, so they are off in the recommended settings until
-more runs say they are safe.
+and in the open world from 0.33 s to 0.144 to 0.150 s in steady views (about
+7 frames a second), with no failure in a 17-minute session. Baked hair and skin
+still come out wrong with them (too light now, black on an earlier build), so
+they are off in the recommended settings until that is fixed.
+
+The frame rate is drawn in the top left corner of the window
+(`VICTORY_FPS_COUNTER=0` turns it off; victory-fork's main).
 
 Input: XInput pads; with none connected the keyboard is a pad while the
 title's window has focus. Commands, the full list of switches and debugging
@@ -249,6 +344,13 @@ cargo build --profile diag -p victory --features diagnostics
   and most of what is merged here.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: fixes found
   on the same graphics card, some ported here.
+- **[LilBigJP/ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import)**:
+  the code-patch option and the save converter used to test the open world.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
+  a fork of upstream VIctory on another AMD card; the quad reads of pixel
+  shaders and the stand-in for indirect light are ported from it.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)** and victory-fork's
+  pull request #994 by PiloteCode: the ray-tracing work ported here.
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.

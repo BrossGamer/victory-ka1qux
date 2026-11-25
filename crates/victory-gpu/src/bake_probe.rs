@@ -44,8 +44,34 @@
 //!   calls, the staged textures they marked for a new upload, how many of
 //!   those had been found unchanged, and how many lie in a bake target or
 //!   in the sources of an earlier bake.
+//! - **Who writes the sources, and when** (`bake probe: who wrote a source
+//!   before the bake`, `... a source changed after the bake`): every writer
+//!   of title memory the runtime knows of is noted with its range, frame
+//!   and time ([`note`]): DirectStorage requests (to an address or to
+//!   physical pages, with the frame their status entry was written, which
+//!   is when the title can see them complete), mappings by the CPU and by a
+//!   queue's page-mapping batch (and whether that queue still held earlier
+//!   submissions), copy-backs of what shaders wrote, read-backs, ranges a
+//!   submission's shaders were given to write, textures the host copies
+//!   into, and writes the guards catch. At a bake the writers of each
+//!   placed source (and of the other views that show its pages) are summed
+//!   up; then the sources are looked at every frame, and the first change
+//!   is told with the writers since the bake. The sources' blocks are also
+//!   made read-only for 30 s after the bake (`VICTORY_BAKE_PROBE_GUARD=0`:
+//!   not), so a store by the title's CPU faults once and is noted with the
+//!   address of the instruction.
+//! - **Where a bake's result goes** (`bake probe: a draw reads a bake's
+//!   result`, `... a copy reads a bake's result`): the bake's targets and
+//!   the texture its compute pass writes are scratch, used again by the
+//!   next bake; what keeps a character's result is a later step. Every
+//!   draw or dispatch that samples one of them through a table, and every
+//!   copy from one, is told (once per pipeline and texture, then at each
+//!   power of two) with what it writes (unordered access views, render
+//!   targets, a copy's destination). Those written textures are followed
+//!   one step further: the draws that sample them are told the same way,
+//!   which names the textures the characters' materials read.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -56,6 +82,303 @@ use crate::object::This;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_PROBE").is_some_and(|v| v != "0"))
+}
+
+/// Whether the probe is on, for the runtime's other crates (DirectStorage).
+pub fn probe_on() -> bool {
+    on()
+}
+
+/// A writer of title memory ([`note`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writer {
+    /// A DirectStorage request wrote its destination address (tag: the
+    /// request's queue and number, [`dstorage_tag`]).
+    DstorageToAddress = 0,
+    /// A DirectStorage request wrote physical pages, shown here (tag: as
+    /// above).
+    DstorageToPages,
+    /// The runtime mapped or unmapped title memory here.
+    Remap,
+    /// A queue's page-mapping batch mapped pages here (tag: 1 if the queue
+    /// still held earlier submissions behind a fence: on the console those
+    /// run before the mapping).
+    PageBatch,
+    /// A copy-back put what shaders wrote into title memory.
+    CopyBack,
+    /// A read-back landed in title memory.
+    ReadBack,
+    /// A submission's shaders were given this range of a host copy to write
+    /// (it reaches title memory at the copy-back).
+    ShaderWrites,
+    /// The host copied or resolved into the texture here: the bytes stay on
+    /// the host, title memory keeps what it had.
+    HostTexture,
+    /// The runtime wrote here through the kernel or a view of its own, into
+    /// blocks the probe guarded.
+    RuntimeIntoGuarded,
+    /// A store faulted on a block the copies guard (tag: the instruction).
+    GuardFault,
+    /// A store faulted on a block the probe guarded (tag: the instruction):
+    /// the title's CPU.
+    ProbeFault,
+}
+
+const WRITER_NAMES: [&str; 11] = [
+    "dstorage_to_address",
+    "dstorage_to_pages",
+    "remap",
+    "page_mapping_batch",
+    "copy_back",
+    "read_back",
+    "shaders_given_to_write",
+    "host_texture_copy",
+    "runtime_into_guarded",
+    "guard_fault",
+    "probe_fault",
+];
+
+/// The tag of a DirectStorage request: its queue and its number there.
+pub fn dstorage_tag(queue: u64, seq: u64) -> u64 {
+    queue << 40 | (seq & ((1 << 40) - 1))
+}
+
+/// One write to title memory.
+#[derive(Clone, Copy, Debug)]
+struct Event {
+    kind: Writer,
+    at: u64,
+    len: u64,
+    frame: u64,
+    ms: u64,
+    tag: u64,
+}
+
+/// The latest writes, oldest first.
+static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
+const EVENTS_KEPT: usize = 1 << 19;
+
+/// A writer wrote (or will write, for [`Writer::ShaderWrites`]) `[at, at +
+/// len)` of title memory.
+pub fn note(kind: Writer, at: usize, len: usize, tag: u64) {
+    if !on() || len == 0 {
+        return;
+    }
+    record(Event {
+        kind,
+        at: at as u64,
+        len: len as u64,
+        frame: crate::frame::current(),
+        ms: crate::host::now_ms(),
+        tag,
+    });
+}
+
+fn record(event: Event) {
+    let mut events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    if events.capacity() == 0 {
+        events.reserve(EVENTS_KEPT);
+    }
+    if events.len() >= EVENTS_KEPT {
+        events.pop_front();
+    }
+    events.push_back(event);
+}
+
+/// Status entries DirectStorage wrote: queue → (number of the entry, frame,
+/// time), the latest.
+type Signals = HashMap<u64, VecDeque<(u64, u64, u64)>>;
+static SIGNALS: Mutex<Option<Signals>> = Mutex::new(None);
+
+/// DirectStorage wrote the status entry numbered `seq` of queue `queue`:
+/// the title sees every request before it complete.
+pub fn note_signal(queue: u64, seq: u64) {
+    if !on() {
+        return;
+    }
+    record_signal(queue, seq, crate::frame::current(), crate::host::now_ms());
+}
+
+fn record_signal(queue: u64, seq: u64, frame: u64, ms: u64) {
+    let mut signals = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+    let lane = signals.get_or_insert_with(HashMap::new).entry(queue).or_default();
+    if lane.len() >= 4096 {
+        lane.pop_front();
+    }
+    lane.push_back((seq, frame, ms));
+}
+
+/// When the title could first see the DirectStorage request `tag` complete:
+/// the frame and time of the first status entry after it on its queue.
+fn signalled(tag: u64) -> Option<(u64, u64)> {
+    let (queue, seq) = (tag >> 40, tag & ((1 << 40) - 1));
+    let signals = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
+    let lane = signals.as_ref()?.get(&queue)?;
+    lane.iter().find(|s| s.0 > seq).map(|s| (s.1, s.2))
+}
+
+/// The writers of `ranges` noted from `since_ms` on, by kind: how many,
+/// the first and last frame, the last one's time and tag.
+fn writers(ranges: &[(u64, u64)], since_ms: u64) -> Vec<(Writer, u64, u64, Event)> {
+    let events = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut by: Vec<(Writer, u64, u64, Event)> = Vec::new();
+    for e in events.iter().filter(|e| e.ms >= since_ms) {
+        let end = e.at.saturating_add(e.len);
+        if !ranges.iter().any(|&(from, to)| e.at < to && from < end) {
+            continue;
+        }
+        match by.iter_mut().find(|b| b.0 == e.kind) {
+            Some(b) => {
+                b.1 += 1;
+                b.3 = *e;
+            }
+            None => by.push((e.kind, 1, e.frame, *e)),
+        }
+    }
+    by
+}
+
+/// [`writers`] as text: `kind x count frames first..last (last: N ms
+/// before|after <moment>, ...)`, with the frame DirectStorage told the
+/// title of its last request, the instruction of a fault, and whether a
+/// page-mapping batch ran ahead of submissions its queue held.
+fn writers_text(by: &[(Writer, u64, u64, Event)], moment_ms: u64) -> String {
+    if by.is_empty() {
+        return String::from("none seen");
+    }
+    let mut parts = Vec::new();
+    for &(kind, count, first, last) in by {
+        let when = if last.ms <= moment_ms {
+            format!("{} ms before", moment_ms - last.ms)
+        } else {
+            format!("{} ms after", last.ms - moment_ms)
+        };
+        let mut text = format!(
+            "{} x{count} frames {first}..{} (last {when}, at {:#x}+{:#x}",
+            WRITER_NAMES[kind as usize], last.frame, last.at, last.len
+        );
+        match kind {
+            Writer::DstorageToAddress | Writer::DstorageToPages => match signalled(last.tag) {
+                Some((frame, ms)) => text += &format!(", its status written at frame {frame}, {} ms after it", ms.saturating_sub(last.ms)),
+                None => text += ", its status not written yet",
+            },
+            Writer::GuardFault | Writer::ProbeFault => text += &format!(", instruction {:#x}", last.tag),
+            Writer::PageBatch if last.tag != 0 => text += ", its queue still held earlier submissions",
+            _ => {}
+        }
+        text.push(')');
+        parts.push(text);
+    }
+    parts.join("; ")
+}
+
+/// The memory of a source: its range and, page by page, the other views
+/// that show its pages (a store through one of those changes it too).
+fn source_ranges(address: u64, bytes: u64) -> Vec<(u64, u64)> {
+    let mut ranges = vec![(address, address + bytes)];
+    for (_, there) in crate::inplace::aliases(address as usize, bytes as usize) {
+        let there = there as u64;
+        match ranges.last_mut() {
+            Some(last) if last.1 == there => last.1 += 64 << 10,
+            _ => ranges.push((there, there + (64 << 10))),
+        }
+    }
+    ranges
+}
+
+/// Whether the probe guards the sources' blocks after a bake
+/// (`VICTORY_BAKE_PROBE_GUARD=0`: not).
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_PROBE_GUARD").is_none_or(|v| v != "0"))
+}
+
+/// A placed source of one of the first bakes, looked at every frame after
+/// it ([`watch_sources`]).
+struct Watched {
+    bake: u64,
+    slot: u32,
+    address: u64,
+    bytes: u64,
+    ranges: Vec<(u64, u64)>,
+    print: u64,
+    at_ms: u64,
+    frame: u64,
+    /// The frame it was first found changed.
+    changed: Option<u64>,
+    /// Its guards were given back.
+    released: bool,
+    /// A later bake read its memory after it changed (told once).
+    read_again: bool,
+}
+
+static WATCHED: Mutex<Vec<Watched>> = Mutex::new(Vec::new());
+
+/// How long the sources are watched (and guarded) after a bake.
+const WATCH_MS: u64 = 30_000;
+/// At most this many sources watched at once, and told in a run.
+const WATCHED_MAX: usize = 512;
+const TOLD_MAX: u64 = 1500;
+
+/// Each frame: the watched sources whose memory changed for the first time
+/// since their bake, told with the writers seen since; and the guards of
+/// those watched long enough given back.
+fn watch_sources(frame: u64) {
+    let now = crate::host::now_ms();
+    let mut found = Vec::new();
+    let mut expired = Vec::new();
+    {
+        let mut watched = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        for w in watched.iter_mut() {
+            if now.saturating_sub(w.at_ms) > WATCH_MS {
+                if !w.released {
+                    w.released = true;
+                    expired.push(w.bake);
+                }
+                continue;
+            }
+            if w.changed.is_some() {
+                continue;
+            }
+            if crate::texture::fingerprint(w.address, w.bytes) != w.print {
+                w.changed = Some(frame);
+                found.push((w.bake, w.slot, w.address, w.bytes, w.ranges.clone(), w.at_ms, w.frame));
+            }
+        }
+        watched.retain(|w| now.saturating_sub(w.at_ms) <= WATCH_MS || w.changed.is_some());
+        // Kept past the watch only to tell a later bake that reads them.
+        let changed_kept = watched.iter().filter(|w| w.changed.is_some()).count();
+        if changed_kept > WATCHED_MAX / 2 {
+            watched.retain(|w| w.changed.is_none());
+        }
+    }
+    expired.sort_unstable();
+    expired.dedup();
+    for bake in expired {
+        crate::watch::probe_release(bake);
+    }
+    static CHANGED_TOLD: AtomicU64 = AtomicU64::new(0);
+    for (bake, slot, address, bytes, ranges, at_ms, bake_frame) in found {
+        if CHANGED_TOLD.fetch_add(1, Relaxed) >= TOLD_MAX {
+            break;
+        }
+        let by = writers(&ranges, at_ms);
+        let cpu = by.iter().any(|b| b.0 == Writer::ProbeFault);
+        tracing::info!(
+            bake,
+            slot,
+            address = format_args!("{address:#x}"),
+            bytes,
+            bake_frame,
+            frame,
+            frames_after = frame.saturating_sub(bake_frame),
+            ms_after = now.saturating_sub(at_ms),
+            other_views = ranges.len() - 1,
+            the_title_cpu_wrote_it = cpu,
+            writers_since_the_bake = writers_text(&by, at_ms),
+            "bake probe: a source changed after the bake"
+        );
+    }
 }
 
 /// The ways a texture a bake names can stand at the draw, in the order
@@ -212,6 +535,8 @@ struct Source {
     bytes: u64,
     print: u64,
     bits: u8,
+    /// A texture the title placed in memory (not one of its objects).
+    placed: bool,
 }
 
 /// A bake draw whose sources are looked at again later.
@@ -270,9 +595,9 @@ pub(crate) fn bake(d: &BakeDraw) {
     let n = BAKE_COUNT.fetch_add(1, Relaxed) + 1;
     BAKED_THIS_FRAME.store(true, Relaxed);
     note_targets(n, d);
-    if n > 12 && !n.is_power_of_two() {
-        return;
-    }
+    // Every bake's sources are found (for [`writers_of_sources`]); the
+    // first twelve and then every power of two are told.
+    let told = n <= 12 || n.is_power_of_two();
     let mut slots: Vec<u32> = Vec::new();
     let mut dwords = 0u64;
     for (_, bytes) in &d.buffers {
@@ -298,6 +623,7 @@ pub(crate) fn bake(d: &BakeDraw) {
     let now = crate::frame::current();
     let mut counts = [0u64; 9];
     let mut sources = Vec::new();
+    let mut classes: Vec<(u32, usize)> = Vec::new();
     let mut lines = Vec::new();
     for &slot in slots.iter().take(400) {
         let Some(handle) = d.heap.handle(slot) else {
@@ -332,7 +658,11 @@ pub(crate) fn bake(d: &BakeDraw) {
         let class = classify(&facts);
         counts[class] += 1;
         counts[0] += 1;
-        sources.push(Source { slot, address, bytes, print: print_now, bits: bits_now });
+        let placed = matches!(view, View::Placed(..));
+        sources.push(Source { slot, address, bytes, print: print_now, bits: bits_now, placed });
+        if placed {
+            classes.push((slot, class));
+        }
         if n <= 2 {
             let size = match &view {
                 View::Placed(_, r, _) => format!("{}x{} f{} lv{:#x}", r[4], r[6], r[8], r[7]),
@@ -340,6 +670,10 @@ pub(crate) fn bake(d: &BakeDraw) {
             };
             lines.push((class, slot, address, bytes, mapped, size, probe, up, bits_now, facts));
         }
+    }
+    writers_of_sources(n, d.frame, &sources, &classes);
+    if !told {
+        return;
     }
     for (c, total) in counts.iter().zip(&CLASS_TOTALS) {
         total.fetch_add(*c, Relaxed);
@@ -409,6 +743,94 @@ pub(crate) fn bake(d: &BakeDraw) {
     }
 }
 
+/// The writers of a bake's placed sources: for the first eight bakes, who
+/// wrote each before the bake (and the sources are watched and guarded
+/// from now on, [`watch_sources`]); for every bake, the sources of an
+/// earlier one that changed after it and that this one reads again.
+fn writers_of_sources(n: u64, frame: u64, sources: &[Source], classes: &[(u32, usize)]) {
+    static AGAIN_TOLD: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    {
+        let mut watched = WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+        for w in watched.iter_mut().filter(|w| w.changed.is_some() && w.bake < n && !w.read_again) {
+            let Some(s) = sources
+                .iter()
+                .find(|s| s.placed && s.address < w.address + w.bytes && w.address < s.address + s.bytes)
+            else {
+                continue;
+            };
+            w.read_again = true;
+            if AGAIN_TOLD.fetch_add(1, Relaxed) < 256 {
+                tracing::info!(
+                    bake = n,
+                    frame,
+                    earlier_bake = w.bake,
+                    earlier_bake_frame = w.frame,
+                    changed_at_frame = w.changed.unwrap_or(0),
+                    slot = s.slot,
+                    earlier_slot = w.slot,
+                    address = format_args!("{:#x}", s.address),
+                    same_bytes_now = crate::texture::fingerprint(w.address, w.bytes) == s.print,
+                    "bake probe: a later bake reads memory that changed after an earlier bake"
+                );
+            }
+        }
+    }
+    // Every bake's sources are watched, each memory once while it holds
+    // the same bytes (the title bakes many characters, and the one a
+    // cutscene needs may be the hundredth bake), up to a bound.
+    static TOLD: AtomicU64 = AtomicU64::new(0);
+    let guard = guard_on();
+    let mut guarded = 0usize;
+    for s in sources.iter().filter(|s| s.placed) {
+        let known = WATCHED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|w| w.address == s.address && w.bytes == s.bytes && w.print == s.print && w.changed.is_none() && !w.released);
+        if known || WATCHED.lock().unwrap_or_else(|e| e.into_inner()).len() >= WATCHED_MAX {
+            continue;
+        }
+        if TOLD.fetch_add(1, Relaxed) >= TOLD_MAX {
+            return;
+        }
+        let ranges = source_ranges(s.address, s.bytes);
+        let by = writers(&ranges, 0);
+        let class = classes.iter().find(|c| c.0 == s.slot).map_or("?", |c| CLASSES[c.1]);
+        tracing::info!(
+            bake = n,
+            frame,
+            slot = s.slot,
+            class,
+            address = format_args!("{:#x}", s.address),
+            bytes = s.bytes,
+            other_views = ranges.len() - 1,
+            writers_before_the_bake = writers_text(&by, now),
+            "bake probe: who wrote a source before the bake"
+        );
+        if guard {
+            let blocks: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (a as usize, b as usize)).collect();
+            guarded += crate::watch::probe_guard(&blocks, n);
+        }
+        WATCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Watched {
+            bake: n,
+            slot: s.slot,
+            address: s.address,
+            bytes: s.bytes,
+            ranges,
+            print: s.print,
+            at_ms: now,
+            frame,
+            changed: None,
+            released: false,
+            read_again: false,
+        });
+    }
+    if guarded > 0 {
+        tracing::info!(bake = n, frame, blocks = guarded, "bake probe: blocks of the bake's sources made read-only until a store or 30 s");
+    }
+}
+
 /// Notes the textures a bake draws into: their memory (for [`sampled`]),
 /// their host copies (for the read-back at the present), and, for the first
 /// bakes and each new target, their description.
@@ -429,6 +851,7 @@ fn note_targets(n: u64, d: &BakeDraw) {
                 shapes.push(shape);
             }
         }
+        follow(t, 0);
         let new = map.insert(info.start, (info.start + info.bytes, t)).is_none_or(|(_, was)| was != t);
         if new || n <= 2 {
             tracing::info!(
@@ -464,9 +887,14 @@ fn note_targets(n: u64, d: &BakeDraw) {
 /// bake leaves (the compute pass that follows a bake draw reads a target and
 /// writes such a texture), and its description is logged once.
 pub(crate) fn written(resource: This) {
-    if !on() || BAKE_COUNT.load(Relaxed) == 0 || READ_FRAMES.load(Relaxed) >= 12 {
+    if !on() || BAKE_COUNT.load(Relaxed) == 0 {
         return;
     }
+    DRAW.with_borrow_mut(|d| {
+        if d.writes.len() < 16 && !d.writes.contains(&(resource as usize)) {
+            d.writes.push(resource as usize);
+        }
+    });
     let Some(t) = crate::resource::probe_texture(resource, false) else {
         return;
     };
@@ -480,6 +908,11 @@ pub(crate) fn written(resource: This) {
         .as_ref()
         .is_some_and(|m| m.values().any(|&(_, r)| r == resource as usize))
     {
+        return;
+    }
+    // The bake's compute pass writes it: a result of the bake.
+    follow(resource as usize, 0);
+    if READ_FRAMES.load(Relaxed) >= 12 {
         return;
     }
     let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
@@ -513,6 +946,13 @@ static SAMPLES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(crate) fn sampled(resource: This, placed: bool) {
     if !on() {
         return;
+    }
+    if let Some(level) = followed(resource as usize) {
+        DRAW.with_borrow_mut(|d| {
+            if d.read.is_none_or(|(_, l)| level < l) {
+                d.read = Some((resource as usize, level));
+            }
+        });
     }
     let targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = targets.as_ref().filter(|m| !m.is_empty()) else {
@@ -561,6 +1001,142 @@ pub(crate) fn sampled(resource: This, placed: bool) {
             "bake probe: a draw samples memory of a bake target through another title texture"
         );
     }
+}
+
+/// Textures followed from the bakes: a bake's target or the texture its
+/// compute pass writes (level 0), and a texture a draw, dispatch or copy
+/// writes while it reads a level 0 one (level 1).
+static FOLLOWED: Mutex<Option<HashMap<usize, u8>>> = Mutex::new(None);
+
+fn follow(resource: usize, level: u8) {
+    let mut followed = FOLLOWED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = followed.get_or_insert_with(HashMap::new);
+    if map.len() < 4096 {
+        let at = map.entry(resource).or_insert(level);
+        *at = (*at).min(level);
+    }
+}
+
+fn followed(resource: usize) -> Option<u8> {
+    FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&resource).copied()
+}
+
+/// What the draw or dispatch being bound reads of the followed textures
+/// (the lowest level) and the textures it writes through unordered access
+/// views.
+#[derive(Default)]
+struct DrawNote {
+    read: Option<(usize, u8)>,
+    writes: Vec<usize>,
+}
+
+thread_local! {
+    static DRAW: std::cell::RefCell<DrawNote> = std::cell::RefCell::new(DrawNote::default());
+}
+
+/// A draw or dispatch starts to be bound.
+pub(crate) fn draw_begin() {
+    if !on() {
+        return;
+    }
+    DRAW.with_borrow_mut(|d| {
+        d.read = None;
+        d.writes.clear();
+    });
+}
+
+/// A texture in words: address, size and format.
+fn texture_text(resource: usize) -> String {
+    match crate::resource::probe_texture(resource as This, false) {
+        Some(t) => format!("{resource:#x} at {:#x} {}x{} f{} mips {}", t.start, t.width, t.height, t.format, t.mips),
+        None => format!("{resource:#x} (no texture)"),
+    }
+}
+
+/// How often each (pipeline or copy, read texture, written textures) was
+/// seen: told the first time and at each power of two.
+type Step = (String, usize, Vec<usize>);
+static STEPS: Mutex<Option<HashMap<Step, u64>>> = Mutex::new(None);
+const STEPS_MAX: usize = 1024;
+
+/// Counts one step that reads a followed texture; whether to tell it.
+fn step_seen(what: &str, read: usize, writes: &[usize]) -> Option<u64> {
+    let mut steps = STEPS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = steps.get_or_insert_with(HashMap::new);
+    let key = (what.to_string(), read, writes.to_vec());
+    if !map.contains_key(&key) && map.len() >= STEPS_MAX {
+        return None;
+    }
+    let n = map.entry(key).or_insert(0);
+    *n += 1;
+    (n.is_power_of_two()).then_some(*n)
+}
+
+/// The draw or dispatch is bound: if it read a followed texture, it is
+/// told with what it writes (`targets`: its render targets), and what a
+/// level 0 reader writes is followed.
+pub(crate) fn draw_end(pipeline: impl FnOnce() -> String, compute: bool, targets: &[usize]) {
+    if !on() {
+        return;
+    }
+    let Some(((read, level), mut writes)) = DRAW.with_borrow_mut(|d| d.read.take().map(|r| (r, std::mem::take(&mut d.writes))))
+    else {
+        return;
+    };
+    if !compute {
+        writes.extend(targets.iter().copied().filter(|&t| t != 0));
+    }
+    writes.retain(|&w| w != read);
+    if level == 0 {
+        for &w in &writes {
+            if followed(w).is_none() {
+                follow(w, 1);
+            }
+        }
+    }
+    let pipeline = pipeline();
+    let Some(n) = step_seen(&pipeline, read, &writes) else {
+        return;
+    };
+    let written: Vec<String> = writes.iter().map(|&w| texture_text(w)).collect();
+    tracing::info!(
+        frame = crate::frame::current(),
+        bakes_so_far = BAKE_COUNT.load(Relaxed),
+        n,
+        level,
+        compute,
+        pipeline,
+        read = texture_text(read),
+        ?written,
+        "bake probe: a draw reads a bake's result (level 0: a bake's own texture; 1: one written from it)"
+    );
+}
+
+/// A copy or resolve from `src` into `dst` (a texture, or with `buffer`
+/// a buffer the texels go to, read back into title memory).
+pub(crate) fn copied(src: This, dst: This, what: &str) {
+    if !on() {
+        return;
+    }
+    let Some(level) = followed(src as usize) else {
+        return;
+    };
+    if level == 0 && followed(dst as usize).is_none() {
+        follow(dst as usize, 1);
+    }
+    let Some(n) = step_seen(what, src as usize, &[dst as usize]) else {
+        return;
+    };
+    tracing::info!(
+        frame = crate::frame::current(),
+        bakes_so_far = BAKE_COUNT.load(Relaxed),
+        n,
+        level,
+        what,
+        read = texture_text(src as usize),
+        written = texture_text(dst as usize),
+        "bake probe: a copy reads a bake's result"
+    );
 }
 
 /// Counts of the remaps `texture::remapped` took (calls, staged textures
@@ -615,6 +1191,7 @@ pub(crate) fn present(frame: u64) {
         return;
     }
     second_looks();
+    watch_sources(frame);
     if BAKED_THIS_FRAME.swap(false, Relaxed) {
         let read = READ_FRAMES.fetch_add(1, Relaxed) + 1;
         if read <= 12 || read.is_power_of_two() {
@@ -830,6 +1407,34 @@ mod tests {
             bits_now: 0b111,
             print_now: 7,
         }
+    }
+
+    #[test]
+    fn writers_are_found_by_range_and_told_with_their_status() {
+        // Addresses no other test uses.
+        let base = 0x7777_0000_0000u64;
+        let tag = dstorage_tag(9, 41);
+        let event = |kind, at, len, frame, ms, tag| Event { kind, at, len, frame, ms, tag };
+        record(event(Writer::DstorageToPages, base, 0x1000, 10, 1_000, tag));
+        record(event(Writer::CopyBack, base + 0x800, 0x100, 12, 1_200, 0));
+        record(event(Writer::CopyBack, base + 0x900, 0x100, 13, 1_300, 0));
+        // Outside the range.
+        record(event(Writer::Remap, base + 0x10_0000, 0x1000, 14, 1_400, 0));
+        record_signal(9, 40, 9, 900);
+        record_signal(9, 42, 11, 1_100);
+        let by = writers(&[(base, base + 0x1000)], 0);
+        assert_eq!(by.len(), 2);
+        assert_eq!((by[0].0, by[0].1, by[0].2), (Writer::DstorageToPages, 1, 10));
+        assert_eq!((by[1].0, by[1].1, by[1].2, by[1].3.frame), (Writer::CopyBack, 2, 12, 13));
+        // The status after request 41 of queue 9 is entry 42.
+        assert_eq!(signalled(tag), Some((11, 1_100)));
+        let text = writers_text(&by, 1_250);
+        assert!(text.contains("dstorage_to_pages x1 frames 10..10 (last 250 ms before"), "{text}");
+        assert!(text.contains("its status written at frame 11, 100 ms after it"), "{text}");
+        assert!(text.contains("copy_back x2 frames 12..13 (last 50 ms after"), "{text}");
+        // Only from a moment on.
+        assert_eq!(writers(&[(base, base + 0x1000)], 1_250).len(), 1);
+        assert_eq!(writers_text(&[], 0), "none seen");
     }
 
     #[test]
