@@ -316,6 +316,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_how(start, end, guarded).map(|(now, written, _)| (now, written))
+}
+
+/// [`writes`], and whether the guards answered (the memory is view
+/// memory, which the write watch does not know).
+pub(crate) fn writes_how(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>, bool)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -329,6 +335,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
+            false,
         ));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -347,6 +354,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    let by_guards = failed;
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -380,7 +388,57 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             .range(first..last)
             .map(|(&p, &w)| (p, w))
             .collect(),
+        by_guards,
     ))
+}
+
+/// [`writes`] with `guarded`, for memory a last asking found to be view
+/// memory ([`writes_how`]): the write watch, which fails for views, is
+/// not asked first. `None` if the memory is no view now; the caller then
+/// asks [`writes`].
+///
+/// A copy or a texture in view memory asked the write watch at every
+/// refresh, and a submission's one asking ([`ask_once`], [`ask_ahead`])
+/// asked it again for each such range, halving runs that held one:
+/// system calls that fail, thousands a frame. `VICTORY_GUARD_KNOWN=0`
+/// asks the write watch first every time, as before.
+pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Held across the guards' answer, as `writes` holds it: another asker
+    // must not find the blocks clean before their writes are in the
+    // journal.
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let written = guard(first * PAGE, last * PAGE)?;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let us = started.elapsed().as_micros() as u64;
+        add(C::GuardUs, us);
+        add(C::Watches, 1);
+        add(C::WatchUs, us);
+        slow(us);
+    }
+    j.asked += 1;
+    let now = j.asked;
+    for page in written {
+        j.written.insert(page, now);
+    }
+    Some((
+        now,
+        j.written
+            .range(first..last)
+            .map(|(&p, &w)| (p, w))
+            .collect(),
+    ))
+}
+
+/// Whether memory found to be view memory is asked of the guards alone
+/// from then on ([`writes_guarded`]); `VICTORY_GUARD_KNOWN=0`: no.
+pub(crate) fn guards_known() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_KNOWN").is_none_or(|v| v != "0"))
 }
 
 /// Guarded blocks of view memory.

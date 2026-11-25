@@ -35,7 +35,8 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
-    /// Whether the memory is write-watched: unknown, yes, no.
+    /// Whether the memory is write-watched: unknown, yes, no, or view
+    /// memory, which the guards answer for ([`GUARDED`]).
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
@@ -856,6 +857,9 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+/// [`Shadow::watched`]: view memory, asked of the guards alone
+/// (`crate::watch::writes_guarded`).
+const GUARDED: u8 = 3;
 
 /// Where `a` and `b` (of one length) first differ, compared eight bytes at
 /// a time.
@@ -1690,6 +1694,13 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether the memory behind the copy turned out to be view memory,
+    /// which the write watch does not know (a submission's asking leaves
+    /// it out).
+    pub(crate) fn guarded(&self) -> bool {
+        self.watched.load(Ordering::Relaxed) == GUARDED
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -2423,9 +2434,17 @@ impl Shadow {
             self.copy(from, to);
             return to - from;
         }
-        if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
-                self.watched.store(1, Ordering::Relaxed);
+        let watched = self.watched.load(Ordering::Relaxed);
+        if watched != NOT_WATCHED {
+            // View memory found so before: the guards alone (unless it is
+            // no view now; then asked as the first time).
+            let known = (watched == GUARDED)
+                .then(|| crate::watch::writes_guarded(from, to))
+                .flatten()
+                .map(|(now, written)| (now, written, true));
+            if let Some((now, written, by_guards)) = known.or_else(|| crate::watch::writes_how(from, to, true)) {
+                let guarded = by_guards && crate::watch::guards_known();
+                self.watched.store(if guarded { GUARDED } else { 1 }, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]

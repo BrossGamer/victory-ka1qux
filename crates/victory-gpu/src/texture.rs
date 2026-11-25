@@ -56,6 +56,10 @@ pub(crate) struct Staging {
     uploaded: std::sync::atomic::AtomicBool,
     /// When a list last recorded a use of it (`crate::host::moment`).
     used: std::sync::atomic::AtomicU64,
+    /// The memory was found to be view memory, which the guards answer
+    /// for: the write watch is not asked about it
+    /// (`crate::watch::writes_guarded`).
+    guarded: std::sync::atomic::AtomicBool,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -768,7 +772,18 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // View memory found so before: asked of the guards alone, below.
+        // What it is no view any more is asked as the first time.
+        let mut by_guards = None;
+        if self.guarded.load(std::sync::atomic::Ordering::Relaxed) {
+            by_guards = waited(1, || crate::watch::writes_guarded(start, start + size));
+            if by_guards.is_none() {
+                self.guarded.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        if by_guards.is_none()
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false))
+        {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -798,7 +813,13 @@ impl Staging {
         // Whether the guard saw no write since the texture was last read.
         let mut blind = false;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = by_guards.or_else(|| {
+                let (now, written, guarded) = waited(1, || crate::watch::writes_how(start, start + size, true))?;
+                if guarded && crate::watch::guards_known() {
+                    self.guarded.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some((now, written))
+            })
         {
             const HASH_EVERY: u64 = 8;
             // A texture found changed where the guard saw no write is one
@@ -1300,6 +1321,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         dirty: std::sync::atomic::AtomicBool::new(true),
         uploaded: std::sync::atomic::AtomicBool::new(false),
         used: std::sync::atomic::AtomicU64::new(crate::host::moment()),
+        guarded: std::sync::atomic::AtomicBool::new(false),
     });
     map.insert(resource as usize, s.clone());
     add_to_address_index(&s);
