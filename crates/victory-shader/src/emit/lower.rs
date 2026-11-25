@@ -4463,28 +4463,58 @@ impl<'a> Lower<'a> {
             bits.push(self.s.m.select(c, over, cap, n));
         }
         let outer = self.begin_guarded(Some(valid));
-        for (i, &n) in bits.iter().enumerate() {
-            let c = self.cur;
-            let (k5, k2, k31, one, zero) = (k(self, 5), k(self, 2), k(self, 31), k(self, 1), k(self, 0));
-            let word = self.s.m.bin(c, Bin::LShr, n, k5);
-            let word = self.s.m.bin(c, Bin::Shl, word, k2);
-            let bit = self.s.m.bin(c, Bin::And, n, k31);
-            let bit = self.s.m.bin(c, Bin::Shl, one, bit);
-            let old = self.raw_word(bitmap, word);
-            let set = self.s.m.bin(c, Bin::And, old, bit);
-            let mut clear = self.s.m.cmp(c, pred::EQ, set, zero);
-            if i == 1 {
-                let other = self.s.m.cmp(c, pred::NE, n, bits[0]);
-                clear = self.s.m.bin(c, Bin::And, clear, other);
-            }
-            let inner = self.begin_guarded(Some(clear));
-            let iu = self.s.m.undef(self.s.t.i32);
-            let i32t = self.s.t.i32;
-            // Operation 2 is OR.
-            self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, k2, word, iu, iu, bit]);
-            self.end_guarded(inner, &[]);
-        }
+        self.mark_page(bitmap, bits[0]);
+        // The last byte's page, where it is another than the first's.
+        let other = self.s.m.cmp(self.cur, pred::NE, bits[1], bits[0]);
+        let crossing = self.begin_guarded(Some(other));
+        self.mark_page(bitmap, bits[1]);
+        self.end_guarded(crossing, &[]);
         self.end_guarded(outer, &[]);
+    }
+
+    /// Sets bit `n` of the write bitmap for every lane that runs it (inside
+    /// [`Self::mark_store`]'s guards: the lanes that wrote). Lanes that set
+    /// bits of the same bitmap dword do it with one OR of all their bits,
+    /// made by the first of them; lanes of different dwords each with their
+    /// own (any set of lanes can share a dword, whatever the wave's size).
+    /// The dword is loaded first and the atomic skipped where all the bits
+    /// are already set: bits only accumulate until the host reads them
+    /// after the submission, so a stale load only costs an extra OR. Helper
+    /// lanes of a pixel shader take no part in the wave operations and set
+    /// nothing (their stores are dropped). (After upstream VIctory's pull
+    /// request #2755: lanes writing the same page serialised on one atomic.)
+    fn mark_page(&mut self, bitmap: V, n: V) {
+        let c = self.cur;
+        let [k5, k2, k31, one] = [5, 2, 31, 1].map(|v| self.s.m.i32(v));
+        let word = self.s.m.bin(c, Bin::LShr, n, k5);
+        let at = self.s.m.bin(c, Bin::Shl, word, k2);
+        let shift = self.s.m.bin(c, Bin::And, n, k31);
+        let bit = self.s.m.bin(c, Bin::Shl, one, shift);
+        self.s.flags |= flags::WAVE_OPS;
+        let (i1, i32t) = (self.s.t.i1, self.s.t.i32);
+        let same = self.s.op(c, "waveActiveAllEqual.i32", Attr::NoUnwind, i1, 115, &[word]);
+        let or = self.s.m.i8(1);
+        let all = self.s.op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[bit, or]);
+        let first = self.s.op(c, "waveIsFirstLane", Attr::NoUnwind, i1, 110, &[]);
+        let mask = self.s.m.select(c, same, all, bit);
+        let yes = self.s.m.bool(true);
+        let mut writer = self.s.m.select(c, same, first, yes);
+        if self.s.pixel {
+            let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, i1, 221, &[]);
+            let no = self.s.m.bool(false);
+            writer = self.s.m.select(c, helper, no, writer);
+        }
+        let elected = self.begin_guarded(Some(writer));
+        let c = self.cur;
+        let old = self.raw_word(bitmap, at);
+        let set = self.s.m.bin(c, Bin::And, old, mask);
+        let missing = self.s.m.cmp(c, pred::NE, set, mask);
+        let update = self.begin_guarded(Some(missing));
+        let iu = self.s.m.undef(i32t);
+        // Operation 2 is OR.
+        self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[bitmap, k2, at, iu, iu, mask]);
+        self.end_guarded(update, &[]);
+        self.end_guarded(elected, &[]);
     }
 
     /// Starts code only the lanes where `guard` holds run (a store under a

@@ -89,7 +89,9 @@
 //!   first byte's offset in its title page (bits 16-31: a typed view's
 //!   element size). A write at byte `x` of the view sets bit `first +
 //!   ((offset + x) >> 16)` for its first and its last byte, at most
-//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. Both
+//!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. The
+//!   lanes of a wave that set bits of one bitmap dword do it with one
+//!   atomic, skipped where the bits are already set. Both
 //!   root views exist only in programs that write through such views:
 //!   others are as without marks. Root UAVs and title memory by address
 //!   are not marked (the host declares what they write). Every such
