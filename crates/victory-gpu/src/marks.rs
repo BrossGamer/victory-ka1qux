@@ -310,6 +310,11 @@ pub(crate) fn copy_back(m: &Marking) {
     let bits = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, words) };
     let mut marked: Vec<u32> = Vec::new();
     for (w, word) in bits.iter_mut().enumerate() {
+        // Most words are zero: read only, not written back (after
+        // upstream VIctory #2409).
+        if *word == 0 {
+            continue;
+        }
         let mut x = std::mem::take(word);
         while x != 0 {
             marked.push((w * 32) as u32 + x.trailing_zeros());
@@ -322,8 +327,9 @@ pub(crate) fn copy_back(m: &Marking) {
     if m.copies.is_empty() {
         return;
     }
-    // Per copy of `m`, the title pages marked.
+    // Per copy of `m`, the title pages marked; and per page, the copies.
     let mut pages: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
+    let mut holders: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
     {
         let r = runs();
         for &n in marked.iter().filter(|&&n| n >= RESERVED) {
@@ -339,42 +345,45 @@ pub(crate) fn copy_back(m: &Marking) {
                 continue;
             }
             let page = (((start >> 16) + u64::from(k)) << 16) as usize;
-            match pages.iter_mut().find(|(c, _)| Arc::ptr_eq(c, &copy)) {
-                Some((_, list)) => list.push(page),
-                None => pages.push((copy, vec![page])),
-            }
+            let at = match pages.iter().position(|(c, _)| Arc::ptr_eq(c, &copy)) {
+                Some(at) => at,
+                None => {
+                    pages.push((copy, Vec::new()));
+                    pages.len() - 1
+                }
+            };
+            pages[at].1.push(page);
+            holders.entry(page).or_default().push(at);
         }
     }
-    // A page's bytes before the submission, once per page however many
+    // Page by page, its bytes before the submission once however many
     // copies hold it: what the title's first write kept, else title memory
-    // as it is now (none written since the copies took it); None for a
-    // page whose bytes from before are not known.
-    let mut before: std::collections::HashMap<usize, Option<Arc<[u8]>>> = std::collections::HashMap::new();
-    for (copy, list) in &pages {
-        for &page in list {
-            // A page of a range that kept its snapshot: compared there.
-            if !copy.marks_cover(page) {
+    // as it is now (none written since the copies took it), read into one
+    // buffer reused for every page; nothing for a page whose bytes from
+    // before are not known.
+    let mut now = vec![0u8; PAGE];
+    for (page, copies) in holders {
+        // Pages of ranges that kept their snapshots are compared there.
+        let copies: Vec<&Arc<Shadow>> =
+            copies.iter().map(|&at| &pages[at].0).filter(|c| c.marks_cover(page)).collect();
+        if copies.is_empty() {
+            continue;
+        }
+        let saved;
+        let bytes: &[u8] = match crate::watch::armed_take(page) {
+            Some(crate::watch::Armed::Untouched) if crate::host::read_into(page as *const u8, &mut now) => &now,
+            Some(crate::watch::Armed::Saved(bytes)) => {
+                count(SAVED, 1);
+                saved = bytes;
+                &saved
+            }
+            _ => {
+                count(LOST, copies.len() as u64);
                 continue;
             }
-            let bytes = before
-                .entry(page)
-                .or_insert_with(|| match crate::watch::armed_take(page) {
-                    Some(crate::watch::Armed::Untouched) => {
-                        let mut now = vec![0u8; PAGE];
-                        crate::host::read_into(page as *const u8, &mut now).then(|| Arc::from(now))
-                    }
-                    Some(crate::watch::Armed::Saved(bytes)) => {
-                        count(SAVED, 1);
-                        Some(Arc::from(bytes))
-                    }
-                    Some(crate::watch::Armed::Lost) | None => None,
-                })
-                .clone();
-            let Some(bytes) = bytes else {
-                count(LOST, 1);
-                continue;
-            };
-            let written = copy.copy_back_marked(page, &bytes);
+        };
+        for copy in copies {
+            let written = copy.copy_back_marked(page, bytes);
             count(PAGES, 1);
             count(BYTES, written as u64);
         }
