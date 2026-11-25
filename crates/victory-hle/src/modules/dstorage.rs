@@ -1160,10 +1160,10 @@ fn into_destination(
     Err(E_INVALIDARG)
 }
 
-/// The bake probe's tag of the request a worker runs (its queue and
-/// number), for the writes it notes.
 #[cfg(feature = "diagnostics")]
 thread_local! {
+    /// The bake probe's tag of the request a worker runs (its queue and
+    /// number), for the writes it notes.
     static PROBE_TAG: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
