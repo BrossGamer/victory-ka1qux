@@ -24,10 +24,10 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 |---|---|---|
 | Boot, menus, saves | ✅ | work (as upstream) |
 | Getting into the world | ✅ | about 3 minutes from launch, with the caches warm and the movies skipped |
-| The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts |
+| The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
 | Light in shadow | 🟡 | the ray-traced indirect light does not run; a constant stands in for it, so shaded places are lit but flat |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch |
-| Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3.5 with victory-fork's speed defaults (median 0.29 s, one run, on an earlier build) |
+| Frame rate | 🟡 | about 2 frames a second with the switches below: 0.40 s a frame at best, a median of 0.50 s over a ten-minute run and of 0.67 to 0.77 s over the first four minutes in the world, while it still streams in; about 3 in the open world (median 0.32 s, best 0.27 s, same switches); about 3.5 with victory-fork's speed defaults (median 0.29 s, one run, on an earlier build) |
 | Stability | ✅ | no crash and no device removal in the last twenty-four runs (4 to 25 minutes each) |
 | Memory | ✅ | about 11 GB of the card's 16 and 6 GB of the PC's memory shared with it (13.7 and 14.9 GB before the texture fix below) |
 | Tests | ✅ | `cargo test --workspace` runs 646 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
@@ -116,6 +116,13 @@ missing in some launches and not in others):
   uploaded texture uploads it again; this path marked a source of a bake in
   each launch measured) and #632 by ryotdev (a late mapping check no longer
   clears the view that replaced the one it looked at).
+- In the open world the card fills up, and late bakes found the textures
+  they read still waiting for room (13,000 due, none made): characters came
+  out with black skin and white eyes. A bake's own sources now go first and
+  may be made past the card's usual line, up to 96 % of its budget
+  (`VICTORY_BAKE_SOURCES_FIRST=0` turns it off, `VICTORY_BAKE_ROOM_PERCENT`
+  sets the line). In an A/B on the same save, skin and clothes came out right
+  with it and black-speckled without it.
 - The texture ring of the intro movie no longer shows its frames out of order.
 - A descriptor read only for its texture's size is answered by the host.
 
@@ -141,6 +148,11 @@ missing in some launches and not in others):
   again for a moment before its request fails.
 - `VICTORY_SKIP_MOVIES=1` ends the title's non-looping movies on their first
   playback tick (`all`: looping ones too).
+- `VICTORY_PATCH=<rva>=<bytes>[:<expected>],...` writes bytes into the title's
+  code in memory before it starts, only where the original bytes match; the
+  title's files are not changed. Used here, with
+  [LilBigJP/ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import),
+  to load a story save converted from another console and test the open world.
 
 **Light**
 
@@ -248,6 +260,8 @@ repository.
   and most of what is merged here.
 - **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: fixes found
   on the same graphics card, some ported here.
+- **[LilBigJP/ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import)**:
+  the code-patch option and the save converter used to test the open world.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
   a fork of upstream VIctory on another AMD card; the quad reads of pixel
   shaders and the stand-in for indirect light are ported from it.
