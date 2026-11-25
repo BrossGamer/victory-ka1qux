@@ -58,7 +58,9 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| {
         let translated = victory_shader::emit::view_marks();
         let (late, relay, keeps) = (crate::host::late(), crate::shadow::relay(), crate::shadow::keeps());
-        let on = translated && !late && !relay && !keeps;
+        // One flight at a time (`crate::host::one_flight`): the bitmap is
+        // read when that flight is settled, before the next is prepared.
+        let on = translated && (!late || crate::host::one_flight()) && !relay && !keeps;
         tracing::info!(
             on,
             translated,
@@ -277,6 +279,20 @@ pub(crate) struct Marking {
 impl Marking {
     pub(crate) fn has(&self, copy: &Arc<Shadow>) -> bool {
         self.copies.iter().any(|c| Arc::ptr_eq(c, copy))
+    }
+
+    /// No copies (`crate::host`'s settle gathers its flights' into one).
+    pub(crate) fn none() -> Marking {
+        Marking { copies: Vec::new() }
+    }
+
+    /// Takes in `other`'s copies too.
+    pub(crate) fn absorb(&mut self, other: &Marking) {
+        for copy in &other.copies {
+            if !self.has(copy) {
+                self.copies.push(copy.clone());
+            }
+        }
     }
 }
 
