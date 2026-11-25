@@ -2551,8 +2551,8 @@ impl State {
         }
         add(split::RELOOK_US, micros(part));
         let part = std::time::Instant::now();
-        // Levels on demand: the slots of textures whose first level with
-        // memory changed since the last pass are made again from it.
+        // Levels on demand: the slots of textures whose levels with memory
+        // changed since the last pass are made again from them.
         host.texture_views_remade();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.

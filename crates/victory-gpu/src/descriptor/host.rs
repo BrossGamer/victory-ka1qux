@@ -828,9 +828,20 @@ impl TextureQueue {
     ///   first: every slot never uploaded goes ahead of them, a slot
     ///   uploaded whole is not in this list at all until a look finds it
     ///   changed (the looks themselves are [`TextureQueue::relooks_due`]).
+    ///
+    /// Only what the pass can take is sorted (PR #1031 of victory-fork): of
+    /// a queue of 25,000-40,000 slots the pass takes at most 4,096, so each
+    /// class is first cut to the entries that can make the list (a
+    /// selection, which keeps the order the full sorts gave: write numbers
+    /// are unique).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+        if max == 0 {
+            return Vec::new();
+        }
+        // (slot, write number) for the first two classes; (frame found
+        // changed, slot, write number) for the last.
+        let mut again: Vec<(u32, u64)> = Vec::new();
+        let mut fresh: Vec<(u32, u64)> = Vec::new();
         let mut stale: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame && w.relook.is_none()) {
             if w.stale {
@@ -838,27 +849,50 @@ impl TextureQueue {
                 continue;
             }
             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
-            class.push((w.written, index, w.write));
+            class.push((index, w.write));
         }
         // By the number of the write, counted over the run.
-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
-        // The first found changed first (the frame of the look, then the
-        // slot's write).
-        stale.sort_unstable_by_key(|&(found, _, write)| (found, write));
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let mut order = again;
+        // The fresh ones: the newest and the oldest in turns, the newest
+        // first, as many as there is room for.
+        let take = (max - order.len()).min(fresh.len());
+        if take > 0 {
+            let (new_count, old_count) = (take.div_ceil(2), take / 2);
+            if new_count < fresh.len() {
+                fresh.select_nth_unstable_by(new_count, newest_first);
+            }
+            let (newest, rest) = fresh.split_at_mut(new_count);
+            newest.sort_unstable_by(newest_first);
+            let oldest_at = rest.len() - old_count;
+            if old_count > 0 && oldest_at > 0 {
+                rest.select_nth_unstable_by(oldest_at, newest_first);
+            }
+            let oldest = &mut rest[oldest_at..];
+            oldest.sort_unstable_by(|a, b| newest_first(b, a));
+            order.reserve(take);
+            for (position, &entry) in newest.iter().enumerate() {
+                order.push(entry);
+                order.extend(oldest.get(position).copied());
             }
         }
-        order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
-        order.truncate(max);
+        // The first found changed first (the frame of the look, then the
+        // slot's write).
+        let room = max - order.len();
+        if room > 0 && !stale.is_empty() {
+            let key = |&(found, _, write): &(u64, u32, u64)| (found, write);
+            if stale.len() > room {
+                stale.select_nth_unstable_by_key(room, key);
+                stale.truncate(room);
+            }
+            stale.sort_unstable_by_key(key);
+            order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
+        }
         order
     }
 
@@ -3915,15 +3949,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     return None;
                 }
                 // Levels on demand (`crate::tiles`): a texture made level by
-                // level is shown from the first level that is the title's
-                // and has memory, if the title's view starts before it (a
-                // level without memory reads zeros: a black texture). The
-                // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
-                    && first > 0
-                {
-                    // SAFETY: a live resource.
-                    let own = unsafe { texture.GetDesc() };
+                // level is shown only through a run of levels that are the
+                // title's and have memory, one after the other (a level
+                // without memory reads zeros: a black texture; a finer level
+                // and the packed tail can arrive before one between them,
+                // and a view from the first level alone reached that hole).
+                // A texture whose every level has memory keeps the title's
+                // view as it is (with none, the default view).
+                let resident = crate::resource::shown_levels(resource);
+                // SAFETY: a live resource.
+                let own = (resident != 0).then(|| unsafe { texture.GetDesc() });
+                if let Some(own) = own.filter(|own| {
+                    let every = u32::MAX >> (32 - u32::from(own.MipLevels).clamp(1, 32));
+                    desc.is_some() || resident & every != every
+                }) {
                     // The texture's own view (the title gave none): all of it.
                     let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
                         Format: own.Format,
@@ -3938,7 +3977,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                             },
                         },
                     };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                    crate::tiles::show_resident(desc.get_or_insert(whole), resident, u32::from(own.MipLevels));
                 }
                 // A host copy without the title's largest mips: the view's
                 // mips are its own, that many lower.
@@ -4749,6 +4788,104 @@ mod tests {
         q.written(98, 14, 16, false);
         assert!(!q.due(15, 100).iter().any(|d| d.0 == 98));
         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+    }
+
+    /// [`TextureQueue::due`] as it was before it selected what it sorts:
+    /// every class sorted whole, the list cut at `max` at the end.
+    fn due_full_sort(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut again = Vec::new();
+        let mut fresh = Vec::new();
+        let mut stale = Vec::new();
+        for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame && w.relook.is_none()) {
+            if w.stale {
+                stale.push((w.due, index, w.write));
+                continue;
+            }
+            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            class.push((w.written, index, w.write));
+        }
+        again.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
+        fresh.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
+        stale.sort_unstable_by_key(|&(found, _, write)| (found, write));
+        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let (mut new, mut old) = (0, fresh.len());
+        while new < old && order.len() < max {
+            order.push((fresh[new].1, fresh[new].2));
+            new += 1;
+            if new < old && order.len() < max {
+                old -= 1;
+                order.push((fresh[old].1, fresh[old].2));
+            }
+        }
+        order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
+        order.truncate(max);
+        order
+    }
+
+    /// A queue of `slots` slots written in turn, their slot numbers out of
+    /// the order of their writes as in a streamed heap; every
+    /// `repeat_every`th looked at before, every fifth of the others found
+    /// changed after an upload (in frames 0 to 2), every thirteenth waiting
+    /// for a look and every eleventh due from frame 1.
+    fn due_fixture(slots: u32, repeat_every: u32) -> TextureQueue {
+        let mut q = TextureQueue::default();
+        for i in 0..slots {
+            // An odd multiplier gives unique slots in the 64K table.
+            let index = i.wrapping_mul(32749) & 0xffff;
+            q.written(index, u64::from(i), u64::from(i % 11 == 0), false);
+            let w = q.slots.get_mut(&index).unwrap();
+            if i.is_multiple_of(repeat_every) {
+                w.looks = 1;
+            } else if i % 5 == 0 {
+                w.stale = true;
+                w.due = u64::from(i % 3);
+            } else if i % 13 == 0 {
+                w.relook = Some(Relook { at: (0, 4096), print: 1, looks: 0, uploaded: 0 });
+            }
+        }
+        q
+    }
+
+    /// The selection hands out the same slots, in the same order, as the
+    /// full sorts: retries of every mix, slots due later, changed ones,
+    /// limits from none to more than the queue holds.
+    #[test]
+    fn bounded_texture_selection_matches_full_sort() {
+        for repeat_every in [1, 3, 17] {
+            let q = due_fixture(73, repeat_every);
+            for frame in [0, 1, 2, 3] {
+                for max in 0..=80 {
+                    assert_eq!(q.due(frame, max), due_full_sort(&q, frame, max), "every {repeat_every}th a retry, frame {frame}, at most {max}");
+                }
+            }
+        }
+    }
+
+    /// The two over a full streaming queue: 40,000 slots, 4,096 taken
+    /// (`cargo test ... -- --ignored --nocapture`).
+    #[test]
+    #[ignore = "benchmark of a full streaming queue"]
+    fn bench_bounded_texture_selection() {
+        use std::hint::black_box;
+        use std::time::Instant;
+        for repeat_every in [2, 17] {
+            let q = due_fixture(40_000, repeat_every);
+            assert_eq!(q.due(3, 4096), due_full_sort(&q, 3, 4096));
+            let mut samples = [Vec::new(), Vec::new()];
+            for _ in 0..15 {
+                for (i, elapsed) in samples.iter_mut().enumerate() {
+                    let began = Instant::now();
+                    let order = if i == 0 { due_full_sort(black_box(&q), 3, 4096) } else { black_box(&q).due(3, 4096) };
+                    black_box(order);
+                    elapsed.push(began.elapsed());
+                }
+            }
+            samples.iter_mut().for_each(|v| v.sort_unstable());
+            eprintln!(
+                "40,000 slots, every {repeat_every}th a retry, 4,096 taken: full sort {:?}, selection {:?}",
+                samples[0][7], samples[1][7],
+            );
+        }
     }
 
     /// Slot `index` uploaded whole in `frame` from its own memory
