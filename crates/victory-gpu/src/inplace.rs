@@ -112,6 +112,133 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// The view of ours the heap was opened on ([`place_stretch`]); it is
+    /// unmapped after the heap goes.
+    pub(crate) view: Option<OwnView>,
+}
+
+/// Whether title view memory that is one stretch of one section is used
+/// in place through a view of ours on that stretch (`VICTORY_STRETCH=1`;
+/// off by default; after Belobug's VIctory `0434b3a`).
+///
+/// The title maps its streaming heaps one 64 KiB view at a time, each its
+/// own allocation, and a heap can be opened on neither a run of such
+/// views nor the section's handle (that one, on this PC, keeps the whole
+/// section committed until a reboot): the stretch is mapped once more,
+/// whole, at an address of ours, and the heap is opened there
+/// (`OpenExistingHeapFromAddress1`, which lets everything go when the
+/// heap goes). The same physical pages, so a window of such memory has
+/// nothing to refresh or copy back; Belobug measured the copy-back of a
+/// frame from 36 to 12 ms with it.
+///
+/// What the shaders write there is told to the guards when the submission
+/// is done (`crate::watch::gpu_wrote`): every other host copy of those
+/// pages, at this address or another view of them, takes them again.
+/// Windows only (asks outside title buffers), at least [`STRETCH_LEAST`]
+/// bytes, all of them committed.
+fn stretch_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STRETCH").is_some_and(|v| v == "1"))
+}
+
+/// Windows shorter than this stay copies: each one is a host heap.
+const STRETCH_LEAST: u64 = 1 << 20;
+
+/// A view of ours on a section ([`place_stretch`]), unmapped when dropped:
+/// after the heap opened on it, which the copy holding both drops first.
+/// One the kernel will not unmap yet (a heap on it still stands) is tried
+/// again at the next drop.
+pub(crate) struct OwnView(usize);
+
+/// Views of ours not unmapped yet ([`OwnView`]).
+static LEFT_VIEWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+impl Drop for OwnView {
+    fn drop(&mut self) {
+        let mut left = LEFT_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        left.push(self.0);
+        left.retain(|&at| {
+            // SAFETY: a view of ours that nothing reads any more.
+            let unmapped = unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) } != 0;
+            if unmapped {
+                STRETCHES[1].fetch_sub(1, Ordering::Relaxed);
+            }
+            !unmapped
+        });
+    }
+}
+
+/// Since the start: stretches in place; views of ours mapped now; asks
+/// turned down because the stretch was too short, not all committed, or
+/// could not be mapped; refused by the host.
+static STRETCHES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// Title memory `[start, start + len)`, one stretch of `section` from
+/// byte `offset`, opened through a view of ours ([`stretch_on`]).
+fn place_stretch(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
+    if len < STRETCH_LEAST {
+        STRETCHES[2].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    }
+    let at = start & !(K64 as u64 - 1);
+    let bias = start - at;
+    let bytes = (start + len).next_multiple_of(K64 as u64) - at;
+    let Some(from) = offset.checked_sub(bias).filter(|from| from.is_multiple_of(K64 as u64)) else {
+        STRETCHES[4].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    };
+    // SAFETY: a section the runtime told us of, alive while the title has
+    // views of it (it has one over this stretch now); inside it.
+    let view = unsafe {
+        mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize)
+    };
+    if view.Value.is_null() {
+        if STRETCHES[4].fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), start = format_args!("{start:#x}"), bytes, "a stretch of title memory could not be mapped again");
+        }
+        return Err(None);
+    }
+    STRETCHES[1].fetch_add(1, Ordering::Relaxed);
+    let own = OwnView(view.Value as usize);
+    // Every page committed (the section is made reserved: a page is
+    // committed when the title first maps or writes it), or the host refuses.
+    if !committed_whole(own.0, bytes as usize) {
+        STRETCHES[3].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    }
+    let heap = open(device, From::Part(own.0, bytes as usize)).map_err(|e| {
+        STRETCHES[5].fetch_add(1, Ordering::Relaxed);
+        Some(e)
+    })?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    let count = STRETCHES[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if count <= 16 || count.is_power_of_two() {
+        tracing::info!(count, start = format_args!("{start:#x}"), bytes, "title memory in place through a view of ours on its section (VICTORY_STRETCH=1)");
+    }
+    Ok(Placed { buffer, heap, gpu, bias, view: Some(own) })
+}
+
+/// Whether `[at, at + len)` (a view of ours) is committed throughout.
+fn committed_whole(at: usize, len: usize) -> bool {
+    let end = at + len;
+    let mut here = at;
+    while here < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != mem::MEM_COMMIT {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= here {
+            return false;
+        }
+        here = next;
+    }
+    true
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -128,13 +255,34 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, view: None })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
+    // View memory that is one stretch of a section, through a view of ours.
+    if window
+        && stretch_on()
+        && let Cover::Run(section, offset) = cover(start as usize, len as usize)
+        && STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len <= most()
+        && let Some(host) = crate::host::host()
+    {
+        match place_stretch(&host.device, start, len, section, offset) {
+            Ok(placed) => {
+                STATS[0].fetch_add(1, Ordering::Relaxed);
+                STATS[1].fetch_add(len, Ordering::Relaxed);
+                return Some(placed);
+            }
+            Err(Some(e)) => {
+                if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a stretch of title memory not opened in place: a copy instead");
+                }
+            }
+            Err(None) => {}
+        }
+    }
     if level() < if window { 1 } else { 2 } {
         return None;
     }
@@ -189,7 +337,30 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     STATS[7].fetch_add(gone, Ordering::Relaxed);
 }
 
-/// The line of what is in place, every ten seconds while [`level`] is on.
+/// With [`stretch_on`]: the line of the stretches, with [`say`]'s.
+fn say_stretches() {
+    if !stretch_on() {
+        return;
+    }
+    let s: Vec<u64> = STRETCHES.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+    tracing::info!(
+        "title view memory in place through views of ours (VICTORY_STRETCH=1), since the start: {} stretches; {} views of ours \
+         mapped now; turned down: {} shorter than {} KiB, {} not all committed, {} not mapped; {} refused by the host; \
+         windows in place now {} ({} MB, with any of VICTORY_INPLACE)",
+        s[0],
+        s[1],
+        s[2],
+        STRETCH_LEAST >> 10,
+        s[3],
+        s[4],
+        s[5],
+        STATS[0].load(Ordering::Relaxed),
+        STATS[1].load(Ordering::Relaxed) >> 20,
+    );
+}
+
+/// The line of what is in place, every ten seconds while [`level`] or
+/// [`stretch_on`] is on.
 fn say() {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let now = crate::host::now_ms();
@@ -210,6 +381,7 @@ fn say() {
         s[6],
         s[7]
     );
+    say_stretches();
 }
 
 /// What a heap is opened on.
@@ -1235,7 +1407,7 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
+    if level() > 0 || stretch_on() {
         say();
     }
     if probe_level() == 0 {
@@ -1456,6 +1628,51 @@ mod tests {
             assert_ne!(freed, 0, "the memory is decommitted once the heap on it is gone");
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A stretch of a section made reserved, as the page pool is, shown to
+    /// the title by a view of its own: opened through a view of ours on the
+    /// same stretch, the GPU reads what the title wrote and its write is
+    /// seen at the title's address. Not all committed: turned down.
+    #[test]
+    fn warp_a_stretch_of_a_section_in_place_through_a_view_of_ours() {
+        let Some(device) = warp() else { return };
+        if device.cast::<ID3D12Device13>().is_err() {
+            return;
+        }
+        const PAGES: usize = 32;
+        // SAFETY: a section and views of the test's own.
+        unsafe {
+            let section = mem::CreateFileMappingW(
+                windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE | mem::SEC_RESERVE,
+                0,
+                (PAGES * K64) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let title = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, PAGES * K64).Value.cast::<u8>();
+            assert!(!title.is_null());
+            // Half committed: refused without asking the host.
+            mem::VirtualAlloc(title.cast(), PAGES / 2 * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            let (start, len) = (title as u64 + 0x1230, (PAGES - 2) as u64 * K64 as u64);
+            assert!(matches!(place_stretch(&device, start, len, section as usize, 0x1230), Err(None)));
+            mem::VirtualAlloc(title.cast(), PAGES * K64, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            let placed = place_stretch(&device, start, len, section as usize, 0x1230).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert_eq!(placed.bias, 0x1230);
+            assert!(placed.view.is_some());
+            let mut rig = Rig::new(&device).unwrap();
+            fill(start as *mut u8, 4096, 9);
+            let got = rig.fetch(&placed.buffer, placed.bias, 4096).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads what the title wrote at its own view");
+            rig.store(&placed.buffer, placed.bias + 64, &[0x5a; 64]).unwrap();
+            assert!(same((start + 64) as *const u8, &[0x5a; 64]), "the GPU's write is seen at the title's view");
+            drop(rig);
+            drop(placed);
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: title.cast() });
+            windows_sys::Win32::Foundation::CloseHandle(section);
         }
     }
 

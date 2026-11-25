@@ -101,6 +101,9 @@ pub(crate) struct Shadow {
     /// kept a snapshot all the same (not all guarded and clean).
     marked: Mutex<Vec<(usize, usize)>>,
     fallback: Mutex<Vec<(usize, usize)>>,
+    /// In place through a view of ours (`crate::inplace`'s stretches): the
+    /// view, unmapped after `place`'s heap goes (fields drop in order).
+    own_view: Option<crate::inplace::OwnView>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -753,7 +756,12 @@ pub(crate) fn relay() -> bool {
     // The crate's own tests run without it unless they ask: several of
     // them look at title memory right after a submission, which the
     // relay's landing thread may still be writing.
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2") && !keeps())
+    // `VICTORY_ONE_FLIGHT=1` turns it off (`crate::host::one_flight`).
+    *ON.get_or_init(|| {
+        std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v == "1" || v == "2")
+            && !keeps()
+            && !crate::host::one_flight_asked()
+    })
 }
 
 /// The submission being prepared (its number among those started): what
@@ -2608,6 +2616,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.own_view = placed.view;
         shadow
     }
 
@@ -2649,6 +2658,7 @@ impl Shadow {
             marked_now: std::sync::atomic::AtomicBool::new(false),
             marked: Mutex::default(),
             fallback: Mutex::default(),
+            own_view: None,
         }
     }
 
@@ -2857,6 +2867,13 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // Through a view of ours on the title's section: declared all
+            // the same, so that when the submission is done the guards are
+            // told ([`Shadow::copy_back_with`]).
+            if self.own_view.is_some() {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize, false);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -3014,6 +3031,14 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            // The shaders wrote the title's pages themselves: through a
+            // view of ours no guard saw it, so the guards are told now,
+            // the submission done (every other copy of those pages takes
+            // them again).
+            if self.own_view.is_some() {
+                let (from, to) = self.inside(address, len);
+                crate::watch::gpu_wrote(self.start as usize + from, to - from);
+            }
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
