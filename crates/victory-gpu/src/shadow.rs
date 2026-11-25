@@ -2635,10 +2635,10 @@ impl Shadow {
                 // Only the GPU's bytes (upstream #2009): the rest of the
                 // stretch is the title's as read, and a title write landing
                 // there since stays.
-                for &(off, len) in &runs {
-                    crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
-                    written += len;
-                }
+                // Under one hold of the stretch's guards
+                // (`VICTORY_BACK_RUNS_HELD`).
+                crate::host::write_mapped_runs(start + at, title.as_ptr(), &runs);
+                written += runs.iter().map(|&(_, len)| len).sum::<usize>();
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a

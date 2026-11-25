@@ -901,6 +901,40 @@ mod tests {
         }
     }
 
+    /// The runs of a copy-back are written and the bytes between them are
+    /// left as the title has them, across an unmapped page too.
+    #[test]
+    fn write_mapped_runs_writes_only_the_runs() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: a private test allocation freed before returning.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            let p2 = base.add(2 * PAGE);
+            assert_eq!(VirtualAlloc(p2.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), p2.cast());
+            base.write_bytes(0x11, PAGE);
+            p2.write_bytes(0x11, PAGE);
+            let src = vec![0x77u8; 3 * PAGE];
+            // One byte, a word, a run across the unmapped page, the last byte.
+            let runs = [(3, 1), (100, 4), (PAGE - 8, PAGE + 16), (3 * PAGE - 1, 1)];
+            super::write_mapped_runs(base as usize, src.as_ptr(), &runs);
+            let first = std::slice::from_raw_parts(base, PAGE);
+            let third = std::slice::from_raw_parts(p2, PAGE);
+            let expect = |at: usize| if runs.iter().any(|&(o, n)| (o..o + n).contains(&at)) { 0x77 } else { 0x11 };
+            for (i, &b) in first.iter().enumerate() {
+                assert_eq!(b, expect(i), "byte {i}");
+            }
+            for (i, &b) in third.iter().enumerate() {
+                assert_eq!(b, expect(2 * PAGE + i), "byte {}", 2 * PAGE + i);
+            }
+            // No runs: nothing written, nothing held.
+            super::write_mapped_runs(base as usize, src.as_ptr(), &[]);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     #[ignore = "benchmark"]
@@ -7991,8 +8025,6 @@ fn direct_writes() -> bool {
 /// wrote), leaving pages that are not mapped alone. The destination's
 /// guards are opened, and held open until the write is done.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     if len == 0 {
         return;
     }
@@ -8001,6 +8033,72 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     // The kernel writes nothing read-only, and a guard taken meanwhile on
     // another thread (a texture showing these pages) would make it so.
     let _writing = crate::watch::writing_held(dst as usize, len);
+    write_unheld(dst, src, len);
+}
+
+/// Whether the runs of bytes a copy-back writes into one stretch of title
+/// memory are written under one hold of the stretch's guards
+/// ([`write_mapped_runs`]; `VICTORY_BACK_RUNS_HELD=0`: each run takes its
+/// own, as before).
+fn back_runs_held() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_RUNS_HELD").is_none_or(|v| v != "0"))
+}
+
+/// Since the last frame line, of copy-backs' runs of bytes: runs written,
+/// holds of guards taken for them, the microseconds taking and giving back
+/// those holds, and the microseconds writing.
+pub(crate) static BACK_RUNS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// [`write_mapped`] for the runs `(offset, bytes)` of a stretch of title
+/// memory at `dst`, whose bytes are at `src` (the same offsets): only the
+/// runs are written, the bytes between them stay the title's.
+///
+/// A copy-back writes only the GPU's bytes, in runs as short as a byte
+/// where a shader left some bytes of a word as they were. Each run took a
+/// hold of its guards (the guards' lock, the blocks under it opened, the
+/// textures there told, the lock again to give it back), and that was most
+/// of a copy-back of 23 MB: 275 ms a frame. The stretch is held once here
+/// and its runs written under it: the blocks between the runs are opened
+/// too, which only makes their copies take them again.
+pub(crate) fn write_mapped_runs(dst: usize, src: *const u8, runs: &[(usize, usize)]) {
+    let (Some(&(first, _)), Some(&(last, last_len))) = (runs.first(), runs.last()) else {
+        return;
+    };
+    let held = back_runs_held();
+    let holding = std::time::Instant::now();
+    let hold = held.then(|| {
+        #[cfg(feature = "diagnostics")]
+        crate::bake_probe::note(crate::bake_probe::Writer::CopyBack, dst + first, last + last_len - first, 0);
+        crate::watch::writing_held(dst + first, last + last_len - first)
+    });
+    let mut hold_us = holding.elapsed().as_micros() as u64;
+    let writing = std::time::Instant::now();
+    for &(off, len) in runs {
+        if held {
+            write_unheld((dst + off) as *mut u8, src.wrapping_add(off), len);
+        } else {
+            write_mapped((dst + off) as *mut u8, src.wrapping_add(off), len);
+        }
+    }
+    let write_us = writing.elapsed().as_micros() as u64;
+    let giving = std::time::Instant::now();
+    drop(hold);
+    hold_us += giving.elapsed().as_micros() as u64;
+    BACK_RUNS[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    BACK_RUNS[1].fetch_add(if held { 1 } else { runs.len() as u64 }, Ordering::Relaxed);
+    BACK_RUNS[2].fetch_add(hold_us, Ordering::Relaxed);
+    BACK_RUNS[3].fetch_add(write_us, Ordering::Relaxed);
+}
+
+/// [`write_mapped`] without its hold of the guards: the caller holds them
+/// (`crate::watch::writing_held`) over `[dst, dst + len)`.
+fn write_unheld(dst: *mut u8, src: *const u8, len: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if len == 0 {
+        return;
+    }
     let direct = direct_writes();
     #[cfg(target_arch = "x86_64")]
     let in_process = direct && direct_copy_enabled();
@@ -8258,6 +8356,20 @@ impl Meter {
                 texture_us as f64 / 1e3 / frames,
                 slots as f64 / frames
             );
+        }
+        {
+            let [runs, holds, hold_us, write_us] = [0, 1, 2, 3].map(|i| BACK_RUNS[i].swap(0, Ordering::Relaxed));
+            if runs > 0 {
+                tracing::info!(
+                    "copy-backs' runs of the GPU's bytes per frame: {:.0} runs under {:.0} holds of their guards \
+                     (VICTORY_BACK_RUNS_HELD=0: one a run), {:.1} ms taking and giving back the holds, {:.1} ms writing \
+                     (with the switch off, the holds are in it)",
+                    runs as f64 / frames,
+                    holds as f64 / frames,
+                    hold_us as f64 / 1e3 / frames,
+                    write_us as f64 / 1e3 / frames
+                );
+            }
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
