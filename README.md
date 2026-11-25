@@ -27,10 +27,10 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
 | Light in shadow | 🟡 | the title's own ray-traced light runs, on by default (`VICTORY_RAYS=0` turns it off): its structures are built and traced, and shaded faces of buildings, trees and characters get bounced light, where without it they are near black. Four runs on the street, 5 to 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 to 0.1 s more |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
-| Frame rate | 🟡 | in the open world on a street with about 6,000 draws a frame, with ray-traced light: a median of 0.33 to 0.35 s a frame (about 3 frames a second), 0.26 s at best, with victory-fork's speed defaults (submissions sent ahead of the card), measured in three launches with the picture right; without them 0.53 to 0.56 s. The same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main |
+| Frame rate | 🟡 | in the open world on a street with about 5,600 to 6,100 draws a frame, with ray-traced light: a median of 0.28 to 0.31 s a frame (about 3.2 to 3.6 frames a second), 0.24 s at best, with victory-fork's speed defaults and the switches below, picture right; 0.53 to 0.56 s without the speed defaults. The same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
-| Tests | ✅ | `cargo test --workspace` runs 803 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
+| Tests | ✅ | `cargo test --workspace` runs 805 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
@@ -309,6 +309,7 @@ $env:VICTORY_INDIRECT_CLAMP = "0"   # the clamp of indirect arguments has droppe
 $env:VICTORY_SKIP_MOVIES    = "1"
 $env:VICTORY_COMMIT_RESERVE_MB = "6144"  # stop filling the card with texture copies when the
                                          # PC has less than this left to commit (see above)
+$env:VICTORY_COPY_PLAIN = "1"; $env:VICTORY_JOIN_PARTS = "1"; $env:VICTORY_BACK_OWN_VIEW = "1"  # victory-fork's, off there
 # $env:VICTORY_RAYS = "0"            # without the title's ray-traced light (on by default)
 # The slower, older settings (no submissions sent ahead of the card):
 # $env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
@@ -326,6 +327,14 @@ the texture queue). `VICTORY_BAKE_SETTLE=1` makes the two seconds after each
 character bake run with every submission waited for, and
 `VICTORY_STALE_AFTER_FLIGHTS=1` keeps a slot's old view until the submissions in
 the air are done; both are off, as the picture came out right without them.
+
+Three of victory-fork's switches that only act with its speed defaults
+(`VICTORY_COPY_PLAIN`, `VICTORY_JOIN_PARTS`, `VICTORY_BACK_OWN_VIEW`) cut the
+preparing from about 123 to 86 to 102 ms a frame and the copy-back from 65 to
+44 to 52 ms in two launches here (0.28 and 0.31 s a frame against 0.30 s
+without them). The recording threads no longer take the descriptor heap's lock
+for a slot already made from the record it holds (victory-fork #1117 and #1146,
+VIctory #2821; `VICTORY_HEAP_LOCKS=0` takes it every time): 0.345 → 0.303 s.
 
 The frame rate is drawn in the top left corner of the window
 (`VICTORY_FPS_COUNTER=0` turns it off; victory-fork's main).
