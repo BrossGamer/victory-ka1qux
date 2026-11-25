@@ -1393,6 +1393,10 @@ pub(crate) fn room_for_short() -> bool {
     if percent == 0 {
         return false;
     }
+    if commit_short(50) {
+        COMMIT_SHORT[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => {
             used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * percent
@@ -1814,6 +1818,10 @@ pub(crate) fn room() -> bool {
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    if filled >= FLOOR && commit_short(100) {
+        COMMIT_SHORT[0].fetch_add(1, Relaxed);
+        return false;
+    }
     if let Some(limit) = limit {
         return filled < limit;
     }
@@ -1852,13 +1860,93 @@ pub(crate) fn room_for_bake() -> bool {
             None => 96u64.max(room_percent()),
         }
     });
-    if percent == 0 {
+    if percent == 0 || commit_short(25) {
         return false;
     }
     match crate::host::host().and_then(|h| h.video_memory()) {
         Some([budget, used, ..]) => used < budget / 100 * percent,
         None => false,
     }
+}
+
+/// The PC's commit the texture queue leaves free, in bytes:
+/// `VICTORY_COMMIT_RESERVE_MB` (0, the default: none, as before; at most
+/// 32,768). Every byte of the card's own memory costs a byte of the PC's
+/// commit: the driver backs it with write-combined private memory of the
+/// process, in blocks of 32 MB for small resources, whether or not the
+/// resource is resident, and keeps about 250 MB of freed blocks
+/// (`card_commit_probe`: 1 GB of textures of 64 KB to 16 MB, of render
+/// targets, a buffer, a heap, and textures made not resident each took
+/// 1.02 to 1.04 GB of the system's commit; evicting gave none of it back).
+/// In runs in the world, 351 to 388 such blocks held 10.9 to 11.3 GB with
+/// 9.6 to 9.7 GB of host textures alive, and the process's 29 to 31 GB
+/// left 1.5 to 7 GB of the PC's 57 GB to commit. With a reserve, [`room`]
+/// says no once the PC has less than it left to commit (past the first
+/// 2 GB of texture copies), copies without their largest mips are made down
+/// to half of it ([`room_for_short`]), a bake's sources down to a quarter
+/// ([`room_for_bake`]), and [`let_go_idle`] lets copies go after a second
+/// idle, as when the card is full.
+#[cfg(windows)]
+fn commit_reserve() -> u64 {
+    static RESERVE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *RESERVE.get_or_init(|| {
+        let reserve = std::env::var("VICTORY_COMMIT_RESERVE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb.min(32_768) << 20);
+        if reserve > 0 {
+            tracing::info!(
+                reserve_mb = reserve >> 20,
+                "VICTORY_COMMIT_RESERVE_MB: no more host copies of textures picked by index while the PC has less than this left to commit"
+            );
+        }
+        reserve
+    })
+}
+
+/// Whether `left` bytes of the PC's commit are under `percent` percent of
+/// a reserve of `reserve` bytes (never with no reserve).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn short_of_commit(left: u64, reserve: u64, percent: u64) -> bool {
+    reserve > 0 && left < reserve / 100 * percent
+}
+
+/// Times the PC's commit stood under the reserve ([`commit_reserve`]) when
+/// asked: [`room`] said no for it; [`room_for_short`] said no for it;
+/// [`let_go_idle`] ran with the short idle time for it.
+pub(crate) static COMMIT_SHORT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether the PC has less left to commit than `percent` percent of
+/// [`commit_reserve`], as it had at most a tenth of a second ago (the
+/// question is asked of many textures a frame). Never with no reserve.
+#[cfg(windows)]
+fn commit_short(percent: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let reserve = commit_reserve();
+    if reserve == 0 {
+        return false;
+    }
+    // The tenth of a second of the last asking, counted from 1, and the
+    // bytes left to commit then.
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tenth = crate::host::now_ms() / 100 + 1;
+    let left = if LAST.load(Relaxed) == tenth {
+        LEFT.load(Relaxed)
+    } else {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: plain data the call fills in.
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a sized structure; on failure nothing is said short.
+        if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+            return false;
+        }
+        LEFT.store(m.ullAvailPageFile, Relaxed);
+        LAST.store(tenth, Relaxed);
+        m.ullAvailPageFile
+    };
+    short_of_commit(left, reserve, percent)
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2177,7 +2265,12 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let mut idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    // Short of the PC's commit: as short a wait as when the card is full.
+    if commit_short(100) {
+        COMMIT_SHORT[2].fetch_add(1, Relaxed);
+        idle_ms = idle_ms.min(1_000);
+    }
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -3406,6 +3499,21 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// No reserve is never short; with one, the share of it asked for is
+    /// the line.
+    #[test]
+    fn commit_reserve_lines() {
+        let gb = 1u64 << 30;
+        assert!(!short_of_commit(0, 0, 100));
+        assert!(!short_of_commit(gb, 0, 25));
+        assert!(short_of_commit(5 * gb, 6 * gb, 100));
+        assert!(!short_of_commit(6 * gb, 6 * gb, 100));
+        assert!(!short_of_commit(5 * gb, 6 * gb, 50));
+        assert!(short_of_commit(2 * gb, 6 * gb, 50));
+        assert!(!short_of_commit(2 * gb, 6 * gb, 25));
+        assert!(short_of_commit(gb, 6 * gb, 25));
+    }
 
     /// A host copy leaves out at most all mips but one, and only while the
     /// sides of what is left stay whole blocks of 4 texels.

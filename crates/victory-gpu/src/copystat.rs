@@ -560,7 +560,7 @@ fn log_memory_map() {
         "the title's page pool (mapped, 1 GB and more)",
         "process heap segments (private, 15.8 MB each)",
         "windows of title memory and other 4 MiB allocations",
-        "write-combined (buffers shared with the card)",
+        "write-combined (the card's own memory as committed for it, upload buffers)",
         "other private allocations of 1 MB and more",
         "other private allocations under 1 MB",
         "files and other mappings at host addresses",
@@ -661,7 +661,10 @@ fn log_memory_map() {
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer
-    // of a title heap's size, the driver's blocks). Committed bytes by
+    // of a title heap's size, the driver's blocks). The write-combined
+    // blocks of 32 MB are the driver's backing of the card's own memory
+    // for small resources (textures above all), a byte of commit for each
+    // byte on the card (`card_commit_probe`; `resource::commit_reserve`). Committed bytes by
     // allocation first, then allocations by (kind, whole size).
     let mut by_allocation: HashMap<usize, (usize, u64)> = HashMap::new();
     for r in regions.iter().filter(|r| r.3) {
@@ -752,7 +755,9 @@ fn log_memory() {
          {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
          room: {}, slots refused for it {}, slots made without their largest mips for it {} ({} \
          such host copies, {:.0} MB; uploads of textures made level by level given only their small \
-         levels for it {}); the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
+         levels for it {}); with the PC's commit under VICTORY_COMMIT_RESERVE_MB, room refused {} \
+         times, copies without their largest mips refused {} times, {} sweeps with the short idle time; \
+         the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
          shared with it in use",
         census[2],
         mb(census[3]),
@@ -772,6 +777,9 @@ fn log_memory() {
         crate::resource::SHORT_MADE[0].load(Relaxed),
         mb(crate::resource::SHORT_MADE[1].load(Relaxed)),
         crate::resource::SHORT_MADE[2].load(Relaxed),
+        crate::resource::COMMIT_SHORT[0].load(Relaxed),
+        crate::resource::COMMIT_SHORT[1].load(Relaxed),
+        crate::resource::COMMIT_SHORT[2].load(Relaxed),
         mb(card[1]),
         mb(card[0]),
         mb(card[3]),

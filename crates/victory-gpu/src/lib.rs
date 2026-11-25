@@ -62,6 +62,8 @@ mod primitive;
 mod profile;
 #[cfg(all(test, windows))]
 mod unified_probe;
+#[cfg(all(test, windows))]
+mod card_commit_probe;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
