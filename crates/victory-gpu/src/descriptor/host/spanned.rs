@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// for every write, as before).
 pub(crate) fn quick() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_some_and(|v| v == "1"))
+    // (With `VICTORY_MIRROR_FAST` mirroring the short way too: the mirroring of changed records
+    // wrote a slot of no span some 20,000 times a frame with the lock.)
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_some_and(|v| v == "1")) || super::mirror_fast::short()
 }
 
 /// Since the last frame line: writes that left the spans alone, and writes

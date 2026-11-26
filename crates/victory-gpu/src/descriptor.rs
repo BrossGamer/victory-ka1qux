@@ -199,6 +199,7 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    let mut together: Vec<host::mirror_fast::Work> = Vec::new();
     // With `VICTORY_SYNC_IN_PLACE=1`: the fingerprints of a page's records.
     let mut prints: Vec<u64> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
@@ -230,6 +231,18 @@ pub(crate) fn sync_heaps() {
         if host::batched::on() && page_at_once() {
             let ranges = written.take(start as usize, end as usize);
             let changed = host::batched::pages_of(&ranges);
+            // The heaps' batches together, after the walk
+            // (`VICTORY_MIRROR_FAST`).
+            if host::mirror_fast::heaps() {
+                together.push(host::mirror_fast::Work {
+                    host: std::ptr::from_ref(host),
+                    pages: changed,
+                    at: (start, step),
+                    mirrored_count,
+                    in_place,
+                });
+                continue;
+            }
             let (read, seen, made) = host.mirror_copied_batch(&changed, (start, step), mirrored_count, in_place);
             pages += read;
             looked += seen;
@@ -303,6 +316,12 @@ pub(crate) fn sync_heaps() {
                 page += crate::watch::PAGE;
             }
         }
+    }
+    if !together.is_empty() {
+        let (read, seen, made) = host::mirror_fast::mirror_heaps(together);
+        pages += read;
+        looked += seen;
+        mirrored += made;
     }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
@@ -378,6 +397,7 @@ pub(crate) fn sync_line(frames: f64) {
     }
     crate::heapprint::line(frames);
     host::batched::line(frames);
+    host::mirror_fast::line(frames);
     if pages == 0 && looked == 0 {
         return;
     }
