@@ -385,6 +385,28 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+With `VICTORY_MOUSE=1` (off by default; the keys above stay as they are
+without it) the mouse is part of that stand-in pad and the keys are laid out
+for a keyboard and mouse. The mouse is held in the middle of the title's
+window and hidden over its picture while the window has focus and no pad is
+connected (F8 lets it go and takes it again; so does losing focus):
+
+| Input | Pad |
+|-------|-----|
+| mouse travel | right stick (`VICTORY_MOUSE_SPEED`: pixels a second that are a full stick, 1400; `VICTORY_MOUSE_DEAD`: the share of the stick the title ignores, 0.12) |
+| right / left mouse button | left / right trigger (Z is the left trigger too) |
+| W A S D | left stick |
+| Left Shift, Enter | A |
+| Space, X | X |
+| F, Y | Y |
+| R, Backspace | B |
+| Tab / Q | left / right shoulder |
+| Left Ctrl, G / C, H | left / right stick click |
+| V | View |
+| Esc, P | Menu |
+| arrows, E | D-pad (E: right) |
+| Caps Lock | driving layout and back: W and S are the right and left trigger, Space the right shoulder (A and D still steer) |
+
 ## Commands
 
 ```
