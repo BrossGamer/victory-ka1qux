@@ -3033,7 +3033,17 @@ impl Shadow {
     /// from the first to the last with `VICTORY_MARKED_RUNS=0`). Returns the
     /// bytes written.
     pub(crate) fn copy_back_marked(&self, page: usize, before: &[u8]) -> usize {
-        let marked = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let mut marked = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // Each byte once (after upstream VIctory #3031, whose fix is of the
+        // same kind): armed ranges overlap (the world arms several views of
+        // one heap), and a byte met a second time was compared with `before`
+        // again after the first pass put the title's bytes into the copy,
+        // where they differ from it: taken for the card's, and put back over
+        // a title write made since. `VICTORY_MARKED_ONCE=0`: each range as
+        // armed.
+        if marked_once() {
+            marked = joined(marked);
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut written = 0;
         let mut title = Vec::new();
@@ -5221,6 +5231,14 @@ fn marked_runs() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MARKED_RUNS").is_none_or(|v| v != "0"))
 }
 
+/// Whether a marked copy-back goes over each byte of the armed ranges once,
+/// however many of them overlap it (`joined`). On by default;
+/// `VICTORY_MARKED_ONCE=0` goes over each range as armed.
+fn marked_once() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MARKED_ONCE").is_none_or(|v| v != "0"))
+}
+
 /// Tests only: run between a marked copy-back's read of title memory and its
 /// write, where a title write can land.
 #[cfg(test)]
@@ -5781,6 +5799,64 @@ mod marked_tests {
             (read(10), read(11), read(2000), read(4000)),
             (0xaa, 0xab, 0x77, 0xbb),
             "the card's bytes, and the title's write between them"
+        );
+        copy.marked.lock().unwrap().clear();
+        drop(copy);
+        super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
+        drop(memory);
+    }
+
+    /// Two armed ranges overlap in a marked page, and the title writes a byte
+    /// of both after the first pass read title memory: the second pass must
+    /// not take the title's bytes the first put into the copy for the card's
+    /// and put them back over that write. After upstream VIctory #3031.
+    #[test]
+    fn overlapping_armed_ranges_do_not_put_back_older_title_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        if !super::marked_once() || !super::marked_runs() {
+            return; // turned off for this run
+        }
+        let memory = vec![0u8; 3 * PAGE];
+        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let title = |at: usize| (page + at) as *mut u8;
+        let copy = exact(page as u64, 2 * PAGE as u64).unwrap();
+        assert!(copy.update(page, 2 * PAGE) > 0);
+        let before = vec![0u8; PAGE];
+        // Armed twice over bytes 0..4096 (the second range holds the first).
+        copy.marked.lock().unwrap().push((page, page + 4096));
+        copy.marked.lock().unwrap().push((page, page + PAGE));
+        // The card writes bytes 10 and 30. The title wrote byte 20 between
+        // them after the copy was brought up, and writes it again once the
+        // first read is done.
+        // SAFETY: the copy's mapping, 2 pages; our memory.
+        unsafe {
+            copy.data.add(10).write(0xaa);
+            copy.data.add(30).write(0xbb);
+            title(20).write(0x22);
+        }
+        let address = title(20) as usize;
+        let mut times = 0;
+        *super::AFTER_TITLE_READ.lock().unwrap() = Some((
+            std::thread::current().id(),
+            Box::new(move || {
+                times += 1;
+                if times == 1 {
+                    // SAFETY: a byte of our memory, alive for the test.
+                    unsafe { (address as *mut u8).write(0x33) };
+                }
+            }),
+        ));
+        let written = copy.copy_back_marked(page, &before);
+        *super::AFTER_TITLE_READ.lock().unwrap() = None;
+        assert_eq!(written, 2, "the card's two bytes");
+        // SAFETY: bytes of our memory.
+        let read = |at: usize| unsafe { title(at).read() };
+        assert_eq!(
+            (read(10), read(20), read(30)),
+            (0xaa, 0x33, 0xbb),
+            "the card's bytes, and the title's newest write between them"
         );
         copy.marked.lock().unwrap().clear();
         drop(copy);
