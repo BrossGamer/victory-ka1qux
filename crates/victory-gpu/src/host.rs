@@ -241,6 +241,72 @@ fn bury(finished: u64) {
     drop(done);
 }
 
+/// Objects [`bury_aside`] handed to its thread, since the last frame line.
+static BURIED_ASIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`bury`] for the thread that lands flights (`Host::relay_land`), with
+/// `VICTORY_BURY_ASIDE=1` (off by default: [`bury`], as before): what is
+/// done with is taken out of [`RETIRED`] where it lies, the others staying
+/// in place (the partition in [`bury`] moves every one of them at each
+/// landing), and dropped on a thread of its own (`victory-bury`), not in
+/// the landing. Dropping later is always allowed: these objects only wait
+/// for the card. In the tree this comes from the partition was 0.9 ms a
+/// frame of the landing thread and releasing the objects 2 ms.
+fn bury_aside(finished: u64) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    static TO: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    if !*ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_BURY_ASIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "host objects that waited for a flight are released on a thread of their own, not in the landing                  (VICTORY_BURY_ASIDE=1)"
+            );
+        }
+        on
+    }) {
+        bury(finished);
+        return;
+    }
+    let done = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut done = Vec::new();
+        let mut i = 0;
+        while i < retired.len() {
+            if retired[i].0 <= finished {
+                done.push(retired.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        done
+    };
+    if done.is_empty() {
+        return;
+    }
+    BURIED_ASIDE.fetch_add(done.len() as u64, Ordering::Relaxed);
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            // (No thread to take them: dropped here.)
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
+    }
+}
+
 /// Objects [`retire`] dropped at once (no submission was running) and
 /// kept until a running submission finished, since the start.
 static RETIREMENTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -6117,7 +6183,7 @@ impl Host {
         }
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
-            bury(last);
+            bury_aside(last);
         }
         self.log_messages();
         fill_ahead::landing(0);
@@ -9627,6 +9693,14 @@ impl Meter {
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
                     if join_copies() { "on" } else { "off" }
+                );
+            }
+        }
+        {
+            let buried = BURIED_ASIDE.swap(0, Ordering::Relaxed) as f64 / frames;
+            if buried > 0.0 {
+                tracing::info!(
+                    "host objects released on the thread of their own per frame (VICTORY_BURY_ASIDE=1): {buried:.0}"
                 );
             }
         }
