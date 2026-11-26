@@ -606,6 +606,7 @@ pub fn on_failure(report: fn(&str) -> !) {
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
 pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
+    crate::awake::halt();
     let mut text = what.to_string();
     if let Some(host) = host() {
         // SAFETY: a plain query.
@@ -4992,6 +4993,7 @@ impl Host {
     /// behind them, and an idle stretch of the card, if one was under way,
     /// ends here ([`CARD_CLOCK_US`]).
     fn card_sent(&self) {
+        crate::awake::sent(&self.device);
         let Some(clock) = self.card_clock() else {
             return;
         };
@@ -9462,6 +9464,7 @@ impl Meter {
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
         crate::lazy::line(frames);
+        crate::awake::line(frames);
         if let Some(host) = host() {
             host.drain_messages();
         }
