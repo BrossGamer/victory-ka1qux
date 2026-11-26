@@ -293,6 +293,17 @@ fn committed() -> u64 {
     info.CommitTotal as u64 * info.PageSize as u64
 }
 
+/// This process's own commit charge, in bytes: what it alone holds
+/// committed, free of the other processes' noise in [`committed`].
+fn process_committed() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+    // SAFETY: a writable structure of the size given.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut info, info.cb) };
+    info.PagefileUsage as u64
+}
+
 /// A probe, run by hand: what the system keeps committed after a heap over
 /// memory the process has was opened, released, and the memory freed. One
 /// case at a time (`VICTORY_PROBE_MB` each): a committed section opened
@@ -908,27 +919,35 @@ fn unified_windows_probe() {
         }
         let c1 = committed() as i64;
         let first = (base as usize).next_multiple_of(CELL);
+        let own1 = process_committed() as i64;
         let started = std::time::Instant::now();
+        let mut planning = std::time::Duration::ZERO;
         let mut made = Vec::new();
         let mut at = first;
         while at + CELL <= base as usize + size.min(total) {
+            let planned = std::time::Instant::now();
+            let _ = crate::unified::plan(at as u64 + 0x100, at as u64 + 0x101, true);
+            planning += planned.elapsed();
             if let Some(m) = crate::unified::make(at as u64 + 0x100, at as u64 + 0x101, true) {
                 made.push(m);
             }
             at += CELL;
         }
-        let took = started.elapsed();
+        let took = started.elapsed().saturating_sub(planning);
         let c2 = committed() as i64;
+        let own2 = process_committed() as i64;
         let bytes: u64 = made.iter().map(|m| m.len).sum();
         let refused = made.first().map(|m| VirtualFree(m.start as *mut _, PAGE, MEM_DECOMMIT) == 0);
         println!(
-            "private memory, {} windows of {} MiB in all, {:.1} ms each: +{} MiB when the memory was made and touched; {:+} MiB with the windows open; \
-             a decommit under an open window refused: {refused:?}",
+            "private memory, {} windows of {} MiB in all, {:.1} ms each (of which {:.1} ms working the plan out): +{} MiB when the memory was made and touched; {:+} MiB with the windows open; \
+             (this process alone: {:+} MiB); a decommit under an open window refused: {refused:?}",
             made.len(),
             bytes >> 20,
             took.as_secs_f64() * 1000.0 / made.len().max(1) as f64,
+            planning.as_secs_f64() * 1000.0 / made.len().max(1) as f64,
             mib(c1 - c0),
-            mib(c2 - c1)
+            mib(c2 - c1),
+            mib(own2 - own1)
         );
         drop(made);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -951,6 +970,7 @@ fn unified_windows_probe() {
         }
         let c1 = committed() as i64;
         let first = (base as usize).next_multiple_of(CELL);
+        let own1 = process_committed() as i64;
         let started = std::time::Instant::now();
         let mut made = Vec::new();
         let mut at = first;
@@ -962,14 +982,16 @@ fn unified_windows_probe() {
         }
         let took = started.elapsed();
         let c2 = committed() as i64;
+        let own2 = process_committed() as i64;
         let bytes: u64 = made.iter().map(|m| m.len).sum();
         println!(
-            "view memory, {} windows of {} MiB in all, {:.1} ms each: +{} MiB when the title's views were made; {:+} MiB with the windows open",
+            "view memory, {} windows of {} MiB in all, {:.1} ms each: +{} MiB when the title's views were made; {:+} MiB with the windows open (this process alone: {:+} MiB)",
             made.len(),
             bytes >> 20,
             took.as_secs_f64() * 1000.0 / made.len().max(1) as f64,
             mib(c1 - c0),
-            mib(c2 - c1)
+            mib(c2 - c1),
+            mib(own2 - own1)
         );
         drop(made);
         std::thread::sleep(std::time::Duration::from_millis(500));

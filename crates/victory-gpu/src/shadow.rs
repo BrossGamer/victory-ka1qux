@@ -2555,6 +2555,7 @@ pub(crate) fn windows() -> [u64; 3] {
         let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
+            .filter(|s| s.place.is_none())
             .map(|s| {
                 let low = s.asked[0].load(Ordering::Relaxed);
                 let high = s.asked[1].load(Ordering::Relaxed);
@@ -2577,7 +2578,8 @@ pub(crate) fn windows() -> [u64; 3] {
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-    for s in loose.values() {
+    // The copies only: a window in place holds no host memory.
+    for s in loose.values().filter(|s| s.place.is_none()) {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
@@ -2608,7 +2610,7 @@ pub(crate) fn window_root_kinds() -> [[u64; 3]; 4] {
     let mut out = [[0u64; 3]; 4];
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
-        if s.unsized_asks.load(Ordering::Relaxed) == 0 {
+        if s.place.is_some() || s.unsized_asks.load(Ordering::Relaxed) == 0 {
             continue;
         }
         let kinds = s.ask_kinds.load(Ordering::Relaxed);
@@ -2719,9 +2721,10 @@ pub(crate) fn memory() -> [u64; 6] {
         let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
+        // The copies only: a window in place holds no host memory.
         let bytes: u64 = loose
             .values()
-            .filter(|s| seen.insert(Arc::as_ptr(s) as usize))
+            .filter(|s| s.place.is_none() && seen.insert(Arc::as_ptr(s) as usize))
             .map(|s| s.len)
             .sum();
         (seen.len() as u64, bytes)
@@ -5002,7 +5005,7 @@ fn fine() -> bool {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-    cover(loose.keys().copied())
+    cover(loose.iter().filter(|(_, s)| s.place.is_none()).map(|(key, _)| *key))
 }
 
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
