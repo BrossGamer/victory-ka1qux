@@ -776,6 +776,7 @@ mod tests {
     /// arena size is a window of the ask's cells.
     #[test]
     fn private_memory_in_place_needs_a_big_committed_run() {
+        let _one = crate::address_space();
         use mem::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         // SAFETY: allocations of the test's own, released below.
         unsafe {
@@ -800,11 +801,18 @@ mod tests {
             let part = VirtualAlloc(std::ptr::null(), (SMALLEST_RUN + (16 << 20)) as usize, MEM_RESERVE, PAGE_READWRITE) as u64;
             assert_ne!(part, 0);
             forget_runs(0, 0);
-            VirtualAlloc(part as *const _, SMALLEST_RUN as usize, MEM_COMMIT, PAGE_READWRITE);
-            let ask = part + SMALLEST_RUN - 0x3000;
-            let p = plan(ask, ask + 1, true).expect("to the end of the committed part");
+            // The committed part ends 1 MiB past a cell's start, wherever the
+            // system put the reservation: a part that ended within `LEAST` of
+            // it would leave the last cell's window too short (a refusal that
+            // came with 6 % of the addresses).
+            let end = (part + SMALLEST_RUN).next_multiple_of(CELL) + (1 << 20);
+            let run = end - part;
+            assert!(run <= SMALLEST_RUN + (16 << 20));
+            VirtualAlloc(part as *const _, run as usize, MEM_COMMIT, PAGE_READWRITE);
+            let ask = end - 0x3000;
+            let p = plan(ask, ask + 1, true).unwrap_or_else(|why| panic!("to the end of the committed part: {why:?} (ask {ask:#x}, part {part:#x})"));
             let cell_hi = (ask + 1).next_multiple_of(CELL);
-            assert_eq!(p.start + p.len, ((part + SMALLEST_RUN) & !(GRAIN - 1)).min(cell_hi));
+            assert_eq!(p.start + p.len, (end & !(GRAIN - 1)).min(cell_hi));
             // A sized ask that runs past it is not held.
             assert_eq!(plan(ask, ask + 0x10000, false), Err(Reason::NotWhole));
             VirtualFree(part as *mut _, 0, mem::MEM_RELEASE);
@@ -820,6 +828,7 @@ mod tests {
     /// title's free of the arena goes through once the window is let go.
     #[test]
     fn warp_a_window_in_private_memory_is_placed_and_the_title_can_free_it() {
+        let _one = crate::address_space();
         use crate::shadow::{RootKind, find, find_root};
         use mem::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
@@ -864,6 +873,7 @@ mod tests {
     /// ask in them, and let go when the runtime says the view changed.
     #[test]
     fn warp_a_window_over_physical_pages_is_placed_through_a_view_of_ours() {
+        let _one = crate::address_space();
         use crate::shadow::{RootKind, find_root};
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         const SIZE: usize = 16 << 20;

@@ -106,7 +106,7 @@ fn blocks(from: usize, len: usize) -> (usize, usize) {
 }
 
 /// Whether a copy from there faulted lately.
-fn faulted_lately(from: usize, len: usize) -> bool {
+pub(crate) fn faulted_lately(from: usize, len: usize) -> bool {
     let now = now_ms();
     let emptied = EMPTIED.load(Relaxed);
     if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
@@ -120,7 +120,7 @@ fn faulted_lately(from: usize, len: usize) -> bool {
 }
 
 /// A copy from there faulted.
-fn note_fault(from: usize, len: usize) {
+pub(crate) fn note_fault(from: usize, len: usize) {
     let (first, last) = blocks(from, len);
     RECENT[first & 1023].store(first, Relaxed);
     RECENT[last & 1023].store(last, Relaxed);
@@ -253,6 +253,7 @@ mod tests {
     /// the bytes before the hole copied, and the thread goes on.
     #[test]
     fn a_page_that_is_not_there_ends_the_copy_without_a_fault() {
+        let _one = crate::address_space();
         // SAFETY: memory of the test's own.
         let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
         assert!(!base.is_null());
@@ -301,6 +302,7 @@ mod tests {
     /// Many threads at once, half of them faulting: each gets its own answer.
     #[test]
     fn threads_fault_and_copy_side_by_side() {
+        let _one = crate::address_space();
         // SAFETY: memory of the test's own.
         let base = unsafe { VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
         assert_ne!(base, 0);

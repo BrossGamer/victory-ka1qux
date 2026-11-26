@@ -88,6 +88,7 @@ fn fill_pool() -> Option<&'static std::sync::mpsc::Sender<Box<dyn FnOnce() + Sen
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-fills-{i}"))
                 .spawn(move || {
+                    crate::cores::prefer(&format!("victory-fills-{i}"), crate::cores::Kind::Pool, false);
                     loop {
                         let job = receive.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         match job {
