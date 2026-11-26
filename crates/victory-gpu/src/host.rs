@@ -2347,6 +2347,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The last card-written source copied into each aliased host texture
+    /// in this list ([`HostList::alias_source_changed`]).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Title-written textures whose staging buffer is copied into the host
     /// texture in this list's prelude if refreshed or not uploaded yet.
     texture_uploads: Vec<(
@@ -2406,6 +2409,7 @@ impl Deferred {
             kept,
             refreshed,
             textures,
+            texture_aliases,
             texture_uploads,
             filled_root_cbvs,
             writes,
@@ -2422,6 +2426,7 @@ impl Deferred {
         kept.clear();
         refreshed.clear();
         textures.clear();
+        texture_aliases.clear();
         texture_uploads.clear();
         filled_root_cbvs.clear();
         writes.clear();
@@ -8588,6 +8593,18 @@ impl HostList {
 
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    /// Whether `source` is not the last card-written texture the list
+    /// copied into the aliased host texture `view` (nor was any copied into
+    /// it yet): the copy is owed. An upload of the same view from title
+    /// memory earlier in the list uses up its first use, and the shader then
+    /// read the uploaded bytes instead of the card's (fork pull request
+    /// #1241).
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` when the list is submitted, in order with its copies.
