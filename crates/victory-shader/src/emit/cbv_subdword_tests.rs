@@ -55,7 +55,7 @@ fn program(mubuf_op: u32, step_shift: u32, table_cbv: bool) -> Vec<u32> {
     w
 }
 
-fn native(mubuf_op: u32, step_shift: u32, table_cbv: bool, threads: u32) -> NativeProgram {
+pub(super) fn native(mubuf_op: u32, step_shift: u32, table_cbv: bool, threads: u32) -> NativeProgram {
     let cbv_param = RootParam {
         root: if table_cbv { RootType::Table } else { RootType::Descriptor },
         table_offset_dwords: 0,

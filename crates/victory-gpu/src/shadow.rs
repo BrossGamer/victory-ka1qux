@@ -3004,6 +3004,12 @@ impl Shadow {
         address - self.start + self.base + self.place.as_ref().map_or(0, |place| place.1)
     }
 
+    /// Whether the copy is the title's own memory in place (renderer port 1,
+    /// `crate::unified`): the card reads the bytes where the title wrote them.
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The range of a slab the copy is, if it is ([`sub`]).
     pub(crate) fn sub(&self) -> Option<&Arc<sub::Sub>> {
         self.sub.as_ref()
@@ -5086,6 +5092,24 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false, false)
+}
+
+/// The copy of the title memory `[address, address + len)` if one is there
+/// already and is in place ([`Shadow::in_place`]); `None` otherwise, and
+/// nothing is made: [`find`] makes a copy where there is none, and for memory
+/// that is not in place that copy is the PC's memory, which a caller that
+/// only wants to know whether the card can read the title's bytes where they
+/// are does not want taken. For renderer port 5 (`crate::port_cbv`).
+pub(crate) fn find_placed(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    {
+        let map = buffers_shared();
+        if let Some((_, entry)) = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
+            return entry.shadow.as_ref().filter(|s| s.in_place()).cloned();
+        }
+    }
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    in_place_holder(&map, address, end, false).cloned()
 }
 
 /// What a root view of the title is (it has an address and no size).
