@@ -13,6 +13,11 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod listed;
+#[cfg(feature = "diagnostics")]
+pub(crate) use listed::line as list_views_line;
+pub(crate) use listed::{WordsHash, list_views};
+
 pub(crate) struct BufferRanges<T> {
     passes: u64,
     pub(crate) by_slot: std::collections::HashMap<u32, (T, u64, u64)>,

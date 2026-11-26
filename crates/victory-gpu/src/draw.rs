@@ -374,6 +374,10 @@ pub(crate) struct State {
     /// list: a draw's pipeline is one for them
     /// (`crate::pipeline::host_pipeline_for`).
     target_formats: crate::pipeline::host::TargetFormats,
+    /// The render target views and the depth view the host list has, once
+    /// it has any ([`State::set_targets`]): per view the host texture (0:
+    /// a null view) and what its descriptor says.
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -405,6 +409,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// This recording of the list, for
+    /// [`crate::descriptor::host::HostHeap::make_listed`] (0: it has none
+    /// yet).
+    recording: u64,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -451,6 +459,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.root_generations.clear();
@@ -865,6 +874,35 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether the key of a table made afresh (what its records hold) is hashed
+/// with a cheaper hash (`VICTORY_RECORD_HASH=1`; off by default). After
+/// avatarmanz/VIctory-7900XTX a1bdba4 and 4e77a879 (`RecordHash`; there on
+/// without a switch).
+fn record_hash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_HASH").is_some_and(|v| v == "1"))
+}
+
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
+/// Whether the render targets are not set on a host list again when it has
+/// the same views ([`State::set_targets`]; `VICTORY_BIND_CACHE=1`, off by
+/// default). After avatarmanz/VIctory-7900XTX ca1d519f (after ZJOU acf478b8);
+/// there the switch is on by default and `=0` turns it off. Theirs compares
+/// the handles; here the views themselves are compared.
+fn bind_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BIND_CACHE").is_some_and(|v| v == "1"))
+}
+
+/// With `VICTORY_BIND_CACHE=1`, since the last frame-rate line: calls that
+/// set the render targets on a host list, and those left out for the host
+/// list having the same views ([`State::set_targets`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) static TARGETS_SET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -1016,7 +1054,11 @@ impl State {
         self.index = view.copied().unwrap_or_default();
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already (`VICTORY_BIND_CACHE=1`; off by default): the
+    /// title sets the same targets again and again, each time a host view
+    /// per target and a call of the driver (25,662 times in a frame of
+    /// another fork).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let Some(host) = crate::host::host() else {
             return;
@@ -1028,7 +1070,8 @@ impl State {
         self.targets.clear();
         // The formats of the host views, for the draws' pipelines.
         let mut formats = [0; 9];
-        let mut rtvs = Vec::new();
+        let mut views = Vec::with_capacity(handles.len());
+        let mut keys = Vec::with_capacity(handles.len());
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1048,10 +1091,11 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
-                    if rtvs.len() < 8 {
-                        formats[rtvs.len()] = desc.Format.0 as u32;
+                    if views.len() < 8 {
+                        formats[views.len()] = desc.Format.0 as u32;
                     }
-                    rtvs.push(host.rtv(None, Some(&desc)));
+                    views.push((None, Some(desc)));
+                    keys.push((0, record.key()));
                 }
                 continue;
             };
@@ -1059,10 +1103,11 @@ impl State {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             let desc = record.desc();
-            if rtvs.len() < 8 {
-                formats[rtvs.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            if views.len() < 8 {
+                formats[views.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             }
-            rtvs.push(host.rtv(Some(texture), desc.as_ref()));
+            views.push((Some(texture), desc));
+            keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -1077,9 +1122,23 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, desc.as_ref()))
+            Some((texture, record))
         });
         self.target_formats = formats;
+        // The views themselves are compared (the host texture and the
+        // description), not the handles: a title may write other views
+        // behind the same handles.
+        let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
+        if bind_cache() && self.host_targets.as_ref() == Some(&now) {
+            #[cfg(feature = "diagnostics")]
+            TARGETS_SET[1].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        #[cfg(feature = "diagnostics")]
+        TARGETS_SET[0].fetch_add(1, Ordering::Relaxed);
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
+        let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -1139,6 +1198,7 @@ impl State {
     pub(crate) fn host_state_lost(&mut self) {
         // No title heaps (0) differ from what the host list has, too.
         (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+        self.host_targets = None;
     }
 
     /// `list` is a new host list that continues the title's list (it was
@@ -1157,6 +1217,8 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        // A new host list has no targets set.
+        self.host_targets = None;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1347,7 +1409,7 @@ impl State {
             if v.address == 0 || v.size == 0 {
                 continue;
             }
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any_reading(v.address, u64::from(v.size)) else {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -1365,7 +1427,7 @@ impl State {
         }
         if indexed {
             let v = self.index;
-            let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
+            let Some(shadow) = crate::shadow::find_any_reading(v.address, u64::from(v.size)) else {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
@@ -3804,17 +3866,29 @@ impl State {
             }
             // The table and what its entries hold (record words).
             let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    half.contains(&(slot, k * 8)).hash(&mut h);
-                }
-                (table, n, h.finish())
+                // (A cheaper hash with `VICTORY_RECORD_HASH=1`: the standard
+                // library's took 3 % of the recording threads' time.)
+                let hashed = |mut h: &mut dyn std::hash::Hasher| {
+                    use std::hash::Hash;
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                        // (Another table than the same slots made for a shader
+                        // that reads them in the title's formats.)
+                        half.contains(&(slot, k * 8)).hash(&mut h);
+                    }
+                };
+                let hash = if record_hash() {
+                    let mut h = crate::descriptor::host::WordsHash::default();
+                    hashed(&mut h);
+                    std::hash::Hasher::finish(&h)
+                } else {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    hashed(&mut h);
+                    std::hash::Hasher::finish(&h)
+                };
+                (table, n, hash)
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -3849,12 +3923,30 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // With `VICTORY_LIST_VIEWS=1` a view this list made before has
+            // its descriptor copied.
+            let list_views = crate::descriptor::host::list_views();
+            if list_views && self.recording == 0 {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let handle = table + u64::from(k) * 32;
+                // Not a view of the half-float kind (those are shown another
+                // way: below) and not a constant buffer's: made as the title's
+                // record names it, once in the list.
+                let listed = if list_views && halved(self, slot, k * 8).is_none() {
+                    crate::descriptor::record_at(handle).and_then(|words| host.make_listed(recording, words, index))
+                } else {
+                    None
+                };
+                let made_already = listed.is_some();
+                match listed.or_else(|| crate::descriptor::view(handle)) {
                     Some(View::Constant(address, size)) => {
                         let size = crate::descriptor::constant_staging_bytes(size);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -3865,9 +3957,11 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                        if !made_already {
+                            match halved(self, slot, k * 8) {
+                                Some(shown) => host.make_at(index, &shown),
+                                None => host.make_at(index, &view),
+                            }
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))

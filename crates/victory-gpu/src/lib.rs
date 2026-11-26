@@ -95,6 +95,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod window_upload;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 #[cfg(windows)]
@@ -103,7 +105,7 @@ mod texture;
 mod watch;
 
 #[cfg(windows)]
-pub use host::on_failure;
+pub use host::{add_frame_line_source, on_failure};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use bake_probe::{
     Writer as BakeProbeWriter, dstorage_tag as bake_probe_dstorage_tag, note as bake_probe_note,

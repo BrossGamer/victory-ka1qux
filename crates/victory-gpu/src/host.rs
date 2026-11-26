@@ -98,7 +98,80 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let ms = if coarse_clock() { coarse_ms() } else { now_ms() };
+    (crate::frame::current() << 32) | ((ms / 100) & 0xffff_ffff)
+}
+
+/// Whether what is noted tens of thousands of times a frame by the recording
+/// threads is cheaper (`VICTORY_COARSE_CLOCK=1`; off by default): the time of
+/// a note comes from the system's tick (16 ms; [`coarse_ms`]) where the
+/// performance counter's is about 25 ns a read, and a note that would write
+/// what is there already ([`touch`]) writes nothing, so that the line it is
+/// in is not taken from the other threads that read it. After
+/// avatarmanz/VIctory-7900XTX a1bdba4 (`coarse_ms`, "read first"), where
+/// they are on without a switch.
+pub(crate) fn coarse_clock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COARSE_CLOCK").is_some_and(|v| v == "1"))
+}
+
+/// [`now_ms`] to the system's tick (16 ms): a few nanoseconds where the
+/// performance counter's are 25. For what is noted and read in tenths of a
+/// second ([`moment`]).
+pub(crate) fn coarse_ms() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    // The same beginning as `now_ms`.
+    static BEGAN: OnceLock<u64> = OnceLock::new();
+    // SAFETY: a plain query.
+    let now = unsafe { GetTickCount64() };
+    now.saturating_sub(*BEGAN.get_or_init(|| now.saturating_sub(now_ms())))
+}
+
+/// Notes in `used` that it was used this [`moment`]: with
+/// `VICTORY_COARSE_CLOCK=1` only if it says another (the same moment is most
+/// asks of a frame, from five threads).
+pub(crate) fn touch(used: &std::sync::atomic::AtomicU64) {
+    touch_at(used, moment(), coarse_clock());
+}
+
+/// [`touch`] at `now`, reading first if `read_first`; whether it stored.
+fn touch_at(used: &std::sync::atomic::AtomicU64, now: u64, read_first: bool) -> bool {
+    if read_first && used.load(Ordering::Relaxed) == now {
+        return false;
+    }
+    used.store(now, Ordering::Relaxed);
+    true
+}
+
+#[cfg(test)]
+mod coarse_tests {
+    use super::{coarse_ms, now_ms, touch_at};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The system's tick reads as `now_ms` does, to within its resolution.
+    #[test]
+    fn the_coarse_clock_reads_as_the_fine_one_to_the_tick() {
+        for _ in 0..3 {
+            let (coarse, fine) = (coarse_ms(), now_ms());
+            assert!(coarse.abs_diff(fine) <= 100, "coarse {coarse} ms, fine {fine} ms");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let before = coarse_ms();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(coarse_ms() >= before, "the coarse clock goes on");
+    }
+
+    /// A note of use stores when it says another moment, and, reading first,
+    /// leaves the line alone when it says the same.
+    #[test]
+    fn a_note_of_the_same_moment_stores_nothing_when_reading_first() {
+        let used = AtomicU64::new(7);
+        assert!(!touch_at(&used, 7, true), "the same moment: nothing stored");
+        assert!(touch_at(&used, 8, true) && used.load(Ordering::Relaxed) == 8);
+        // Not reading first: stored every time, as before.
+        assert!(touch_at(&used, 8, false) && used.load(Ordering::Relaxed) == 8);
+        assert!(touch_at(&used, 9, false) && used.load(Ordering::Relaxed) == 9);
+    }
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -801,6 +874,8 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // GPU upload heaps (`VICTORY_WINDOW_UPLOAD=1`, `crate::window_upload`)
+        crate::window_upload::note_device(&device);
         // native 16-bit operations: translated shaders then do the console's f16 arithmetic in
         // `half` (`VICTORY_F16_IN_F32=1` keeps it in f32; after upstream VIctory's pull
         // request 2825)
@@ -2345,6 +2420,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes, whether through marked views):
+    /// with `VICTORY_DECLARE_ONCE=1` declaring one again changes nothing
+    /// and is not recorded again ([`declare_once`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The last card-written source copied into each aliased host texture
@@ -2390,6 +2470,21 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// The steps recorded last write title memory: what was brought up to
+    /// date before them is not any more, and what was declared written
+    /// before them is to be declared again.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+    }
+
+    /// Whether the declaration of `key` (host copy, address, bytes, marked)
+    /// is to be recorded: always, unless `once` and it was declared since
+    /// the list last wrote title memory ([`Deferred::title_written`]).
+    fn declare(&mut self, key: (usize, usize, usize, bool), once: bool) -> bool {
+        !once || self.gpu_written.insert(key)
+    }
+
     /// Clears all recorded entries while retaining container capacities so
     /// list resets do not free and reallocate `Vec`/`HashSet` storage every
     /// frame.
@@ -2408,6 +2503,7 @@ impl Deferred {
             upload_bytes,
             kept,
             refreshed,
+            gpu_written,
             textures,
             texture_aliases,
             texture_uploads,
@@ -2425,6 +2521,7 @@ impl Deferred {
         uploads.clear();
         kept.clear();
         refreshed.clear();
+        gpu_written.clear();
         textures.clear();
         texture_aliases.clear();
         texture_uploads.clear();
@@ -4783,6 +4880,33 @@ fn join_copies() -> bool {
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a range shaders write is declared once until the list next
+/// writes title memory (`VICTORY_DECLARE_ONCE=1`; off by default: every
+/// dispatch's declaration is a step of its own). After avatarmanz/VIctory-7900XTX
+/// b32fb997 (from Belobug dd799aad, romainhedouin); there the switch is on by
+/// default and `=0` turns it off. The ranges, and their order, stay what they
+/// were: a declaration that follows a write of title memory is recorded again.
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// Lines other crates add to the frame lines: each is given the frames since
+/// the last one and says its line, or nothing.
+static LINE_SOURCES: Mutex<Vec<fn(f64) -> Option<String>>> = Mutex::new(Vec::new());
+
+/// Adds a source of a frame line (called once a second with the frames since
+/// the last, as the other counters are).
+pub fn add_frame_line_source(source: fn(f64) -> Option<String>) {
+    LINE_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).push(source);
+}
+
+/// With `VICTORY_DECLARE_ONCE=1`, since the last frame-rate line: ranges
+/// declared written and recorded, and those left out for being declared
+/// already ([`HostList::defer_gpu_write`]).
+#[cfg(feature = "diagnostics")]
+static DECLARED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line: the microseconds the submitting thread
 /// spent deciding and recording the lists' preludes (`HostList::prelude`),
@@ -8166,7 +8290,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         deferred.filled_root_cbvs.clear();
     }
 
@@ -8290,6 +8414,10 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// With `VICTORY_DECLARE_ONCE=1` a range is declared once until the list
+    /// next writes title memory: the dispatches of a frame declared the same
+    /// few ranges thousands of times, each a step of its own (a flush of its
+    /// copy's pending refreshes and two locks on the thread that submits).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -8297,9 +8425,14 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len, marked);
+        let new = deferred.declare(key, declare_once());
+        #[cfg(feature = "diagnostics")]
+        DECLARED[usize::from(!new)].fetch_add(1, Ordering::Relaxed);
+        if new {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8612,7 +8745,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
+        deferred.title_written();
         deferred.filled_root_cbvs.clear();
     }
 
@@ -9947,6 +10080,33 @@ impl Meter {
                 );
             }
         }
+        for source in LINE_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if let Some(line) = source(frames) {
+                tracing::info!("{line}");
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let [recorded, left_out] = [0, 1].map(|i| DECLARED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if recorded + left_out > 0.0 {
+                tracing::info!(
+                    "ranges shaders write, declared per frame (VICTORY_DECLARE_ONCE=1): {recorded:.0} recorded,                      {left_out:.0} left out for being declared already in the list"
+                );
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        if let Some(line) = crate::descriptor::host::list_views_line(frames) {
+            tracing::info!("{line}");
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let [set, kept] = [0, 1].map(|i| crate::draw::TARGETS_SET[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if set + kept > 0.0 {
+                tracing::info!(
+                    "render target sets per frame (VICTORY_BIND_CACHE=1): {set:.0} made on the host list,                      {kept:.0} left out for the host list having the same views"
+                );
+            }
+        }
         {
             let buried = BURIED_ASIDE.swap(0, Ordering::Relaxed) as f64 / frames;
             if buried > 0.0 {
@@ -10942,469 +11102,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 }
 
 /// The host's own paths for a copy in the card's memory, end to end, on
-/// the software adapter only: the title's bytes go up, a shader reads them
-/// and writes, and what it wrote comes back into title memory. Run it with
-/// the switches under test in the environment (they are read once per
-/// process); it does nothing unless the host device is the software
-/// adapter (`VICTORY_D3D12_WARP=1` in a diagnostics build) and the copy is
-/// in the card's memory (`VICTORY_CARD_BUFFERS_MIN_MB=1`):
-///
-/// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 [VICTORY_QUEUE2=n]
-///  [VICTORY_RELAY=2 | VICTORY_LATE_WAIT=3] cargo test -p victory-gpu
-///  --features diagnostics queue2_tests`
-///
-/// The same title memory must come out whatever the switches: through the
-/// direct queue alone, and through the copy queues.
+/// the software adapter only; the tests are in a file of their own (this
+/// file is at the size limit).
 #[cfg(test)]
-mod queue2_tests {
-    use super::*;
+mod queue2_tests;
 
-    /// `memory[to] = memory[from] + add`, after `spin` steps.
-    const ADD: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0)"
-cbuffer What : register(b0) { uint to; uint from; uint add; uint spin; };
-RWByteAddressBuffer memory : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    uint h = 0u;
-    [loop]
-    for (uint i = 0u; i < spin; i++) {
-        h = (h ^ memory.Load(from)) * 0x01000193u;
-    }
-    memory.Store(to, memory.Load(from) + add + (h & 0u));
-}
-"#;
-
-    #[test]
-    fn warp_title_bytes_go_up_and_shader_writes_come_back_whatever_the_queues() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
-        let Some(host) = host() else {
-            return;
-        };
-        // Never on a real card.
-        // SAFETY: a plain query.
-        let software = host
-            .adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if !software {
-            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
-            return;
-        }
-        const PIECE: usize = 64 << 10;
-        const LEN: usize = 4 << 20;
-        const ROUNDS: usize = 12;
-        // "Title memory": write-watched, as the title's is.
-        // SAFETY: a plain allocation of our own.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
-        assert!(!title.is_null());
-        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
-        for i in 0..LEN / 4 {
-            // SAFETY: inside the allocation.
-            unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
-        }
-        crate::shadow::register(0x51_5151, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
-        if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
-            return;
-        }
-        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
-        // SAFETY: the shader's own root signature; plain creation.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
-            let pso = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .expect("a pipeline");
-            (root, pso)
-        };
-        // Round k: the title writes a dword in piece 1+k; a submission's
-        // shader adds k to it and stores the sum in piece 30+k, a range
-        // declared as shader-written. Nothing is waited for between the
-        // rounds where submissions are sent ahead.
-        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
-        let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
-        let titles = |k: usize| 0x0100_0000 + 0x1000 * k as u32 + 7;
-        let mut lists = Vec::new();
-        for k in 0..ROUNDS {
-            // SAFETY: inside the allocation.
-            unsafe { dword(from(k)).write_volatile(titles(k)) };
-            let list = host.new_list().expect("a host list");
-            shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + (30 + k) * PIECE) as u64, PIECE as u64);
-            // SAFETY: an open list; the copy's buffer, with unordered
-            // access; the shader's own root signature.
-            unsafe {
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetPipelineState(&pso);
-                let constants = [to(k) as u32, from(k) as u32, k as u32, 30_000];
-                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
-                list.list.Dispatch(1, 1, 1);
-            }
-            list.close();
-            if late() {
-                host.execute_own(&list);
-            } else {
-                host.execute(&[&list]);
-            }
-            lists.push(list);
-        }
-        settle_now(WHY_SYNC);
-        for k in 0..ROUNDS {
-            // SAFETY: inside the allocation.
-            let (sum, kept) = unsafe { (dword(to(k)).read_volatile(), dword(from(k)).read_volatile()) };
-            assert_eq!(kept, titles(k), "round {k}: the title's own dword changed");
-            assert_eq!(
-                sum,
-                titles(k) + k as u32,
-                "round {k}: the shader read {:#x} where the title had written {:#x}, or its write did not come back",
-                sum.wrapping_sub(k as u32),
-                titles(k)
-            );
-        }
-        // Nothing else moved.
-        let touched: std::collections::HashSet<usize> = (0..ROUNDS).flat_map(|k| [from(k), to(k)]).collect();
-        for i in (0..LEN / 4).filter(|i| !touched.contains(&(i * 4))) {
-            // SAFETY: inside the allocation.
-            let got = unsafe { dword(i * 4).read_volatile() };
-            assert_eq!(got, 0x5A00_0000 | i as u32, "dword {i} of title memory changed");
-        }
-        // The queues the switches name did the work.
-        if let Some(second) = crate::queue2::second() {
-            let (down, up) = (second.down.stats.jobs.load(Ordering::Relaxed), second.up.stats.jobs.load(Ordering::Relaxed));
-            // (Sends that found no landing buffer went the old way.)
-            let no_room = second.landing[1].load(Ordering::Relaxed);
-            eprintln!(
-                "queue2_tests: VICTORY_QUEUE2={} late {} relay {}: {down} fetches and {up} sends through the copy queues ({no_room} more found no landing buffer), the direct queue told to wait {} times",
-                crate::queue2::bits(),
-                late(),
-                relay(),
-                second.held[0].load(Ordering::Relaxed)
-            );
-            assert_eq!(down > 0, second.fetches(), "fetches through the copy queue");
-            assert_eq!(up + no_room > 0, second.uploads(), "sends through the copy queue");
-            assert_eq!(up, second.held[0].load(Ordering::Relaxed), "the direct queue waits for every send");
-        } else {
-            eprintln!("queue2_tests: the direct queue alone (late {}, relay {})", late(), relay());
-        }
-        drop(lists);
-    }
-
-    /// Two copies in the card's memory in every list, each with its own
-    /// title bytes going up and its own shader writes coming back: what
-    /// `VICTORY_CARD_SYNC_BATCH=1` records in three steps over the copies
-    /// (their ranges, one state change, their hash passes) must leave the
-    /// same title memory as copy by copy.
-    #[test]
-    fn warp_several_copies_in_the_card_go_up_and_come_back_whatever_the_order() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
-        let Some(host) = host() else {
-            return;
-        };
-        // Never on a real card.
-        // SAFETY: a plain query.
-        let software = host
-            .adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if !software {
-            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
-            return;
-        }
-        const PIECE: usize = 64 << 10;
-        const LEN: usize = 4 << 20;
-        const ROUNDS: usize = 8;
-        const COPIES: usize = 3;
-        let mut titles_memory = Vec::new();
-        let mut shadows = Vec::new();
-        for c in 0..COPIES {
-            // "Title memory": write-watched, as the title's is.
-            // SAFETY: a plain allocation of our own.
-            let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
-            assert!(!title.is_null());
-            for i in 0..LEN / 4 {
-                // SAFETY: inside the allocation.
-                unsafe { title.add(i * 4).cast::<u32>().write_volatile(0x5A00_0000 | (c as u32) << 20 | i as u32) };
-            }
-            crate::shadow::register(0x52_5200 + c, title as u64, LEN as u64);
-            let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
-            if !shadow.carded() {
-                eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
-                return;
-            }
-            titles_memory.push(title as usize);
-            shadows.push(shadow);
-        }
-        let dword = |c: usize, at: usize| (titles_memory[c] + at) as *mut u32;
-        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
-        // SAFETY: the shader's own root signature; plain creation.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
-            let pso = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .expect("a pipeline");
-            (root, pso)
-        };
-        // Round k, copy c: the title writes a dword in piece 1+k; the
-        // submission's shader adds k + c to it and stores the sum in piece
-        // 30+k, a range declared as shader-written.
-        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
-        let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
-        let written = |c: usize, k: usize| 0x0100_0000 + 0x1000 * k as u32 + 0x100_0000 * c as u32 + 7;
-        let mut lists = Vec::new();
-        for k in 0..ROUNDS {
-            let list = host.new_list().expect("a host list");
-            for (c, shadow) in shadows.iter().enumerate() {
-                // SAFETY: inside the allocation.
-                unsafe { dword(c, from(k)).write_volatile(written(c, k)) };
-                shadow.refresh(&list, titles_memory[c] as u64, LEN as u64);
-                shadow.gpu_writes(&list, (titles_memory[c] + (30 + k) * PIECE) as u64, PIECE as u64);
-                // SAFETY: an open list; the copy's buffer, with unordered
-                // access; the shader's own root signature.
-                unsafe {
-                    list.list.SetComputeRootSignature(&root);
-                    list.list.SetPipelineState(&pso);
-                    let constants = [to(k) as u32, from(k) as u32, (k + c) as u32, 30_000];
-                    list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                    list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
-                    list.list.Dispatch(1, 1, 1);
-                }
-            }
-            list.close();
-            if late() {
-                host.execute_own(&list);
-            } else {
-                host.execute(&[&list]);
-            }
-            lists.push(list);
-        }
-        settle_now(WHY_SYNC);
-        for c in 0..COPIES {
-            for k in 0..ROUNDS {
-                // SAFETY: inside the allocation.
-                let (sum, kept) = unsafe { (dword(c, to(k)).read_volatile(), dword(c, from(k)).read_volatile()) };
-                assert_eq!(kept, written(c, k), "copy {c} round {k}: the title's own dword changed");
-                assert_eq!(
-                    sum,
-                    written(c, k) + (k + c) as u32,
-                    "copy {c} round {k}: the shader read {:#x} where the title had written {:#x}, or its write did not come back",
-                    sum.wrapping_sub((k + c) as u32),
-                    written(c, k)
-                );
-            }
-        }
-        drop(lists);
-    }
-
-    /// `memory[to] = first` at once; then `spin` steps, each a store to
-    /// `memory[to + 4]`; then `memory[to + 4] = 0` and `memory[to] = last`.
-    /// Whatever `spin` is, the bytes it leaves are the same.
-    const TWICE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0)"
-cbuffer What : register(b0) { uint to; uint first; uint last; uint spin; };
-RWByteAddressBuffer memory : register(u0);
-[RootSignature(RS)]
-[numthreads(1, 1, 1)]
-void main() {
-    memory.Store(to, first);
-    [loop]
-    for (uint i = 0u; i < spin; i++) {
-        memory.Store(to + 4u, i);
-    }
-    memory.Store(to + 4u, 0u);
-    memory.Store(to, last);
-}
-"#;
-
-    /// The hole a fetch on the copy queue had (`VICTORY_QUEUE2` bit 1 with
-    /// the relay): flight A writes a piece; flight B, sent behind it,
-    /// writes the same piece through a half-way value and leaves it as A
-    /// left it. A is landed while B is half way: the fetch, beside B on
-    /// the copy queue, brings B's half-way bytes into title memory. B's
-    /// compare finds the piece as A's compare left it and flags nothing,
-    /// so B's landing fetched nothing and title memory kept the half-way
-    /// bytes. With the fix B's landing fetches the piece all the same
-    /// (`BESIDE`).
-    ///
-    /// `VICTORY_D3D12_WARP=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_QUEUE2=1
-    ///  VICTORY_RELAY=1 cargo test -p victory-gpu --features diagnostics
-    ///  fetched_again -- --nocapture` (alone: it lands its two flights
-    /// itself; `VICTORY_QUEUE2_REFETCH=0` shows the fault).
-    #[test]
-    fn warp_a_piece_fetched_while_a_later_flight_writes_it_is_fetched_again() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
-        let Some(host) = host() else {
-            return;
-        };
-        // Never on a real card.
-        // SAFETY: a plain query.
-        let software = host
-            .adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
-        if !software {
-            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
-            return;
-        }
-        if !relay() || !crate::queue2::second().is_some_and(|s| s.fetches()) {
-            eprintln!("queue2_tests: skipped, fetches do not go to a copy queue beside the relay (VICTORY_RELAY=1 VICTORY_QUEUE2=1)");
-            return;
-        }
-        const PIECE: usize = 64 << 10;
-        const LEN: usize = 4 << 20;
-        // SAFETY: a plain allocation of our own.
-        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
-        assert!(!title.is_null());
-        let dword = |at: usize| unsafe { title.add(at).cast::<u32>() };
-        for i in 0..LEN / 4 {
-            // SAFETY: inside the allocation.
-            unsafe { dword(i * 4).write_volatile(0x5A00_0000 | i as u32) };
-        }
-        crate::shadow::register(0x52_5252, title as u64, LEN as u64);
-        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
-        if !shadow.carded() {
-            eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
-            return;
-        }
-        let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
-        // SAFETY: the shader's own root signature; plain creation.
-        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
-            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
-            let pso = host
-                .device
-                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                    pRootSignature: std::mem::transmute_copy(&root),
-                    CS: D3D12_SHADER_BYTECODE {
-                        pShaderBytecode: code.as_ptr().cast(),
-                        BytecodeLength: code.len(),
-                    },
-                    ..Default::default()
-                })
-                .expect("a pipeline");
-            (root, pso)
-        };
-        // A list whose shader writes the dword at 256 of `piece`, declared.
-        let record = |piece: usize, first: u32, last: u32, spin: u32| {
-            let list = host.new_list().expect("a host list");
-            shadow.refresh(&list, title as u64, LEN as u64);
-            shadow.gpu_writes(&list, (title as usize + piece * PIECE) as u64, PIECE as u64);
-            // SAFETY: an open list; the copy's buffer, with unordered
-            // access; the shader's own root signature.
-            unsafe {
-                list.list.SetComputeRootSignature(&root);
-                list.list.SetPipelineState(&pso);
-                let constants = [(piece * PIECE + 256) as u32, first, last, spin];
-                list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
-                list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
-                list.list.Dispatch(1, 1, 1);
-            }
-            list.close();
-            list
-        };
-        // SAFETY: a plain query.
-        let completed = || unsafe { host.fence.GetCompletedValue() };
-        let wait_for = |value: u64| {
-            while completed() < value {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-        };
-        // How many steps keep the card busy for some seconds: timed on
-        // another piece, waited for.
-        const TRIAL: u32 = 1 << 20;
-        let trial = record(40, 1, 2, TRIAL);
-        let timing = std::time::Instant::now();
-        host.execute(&[&trial]);
-        let took = timing.elapsed().as_secs_f64().max(1e-4);
-        let spin = (f64::from(TRIAL) * 3.0 / took).clamp(f64::from(TRIAL), 2.0e9) as u32;
-        // SAFETY: inside the allocation.
-        assert_eq!(unsafe { dword(40 * PIECE + 256).read_volatile() }, 2, "the trial's write did not come back");
-        const AT: usize = 20 * PIECE + 256;
-        const HALF_WAY: u32 = 0xDEAD_0001;
-        const LEFT: u32 = 0x600D_0002;
-        // Flight A, and the card has run it.
-        let a = record(20, HALF_WAY, LEFT, 16);
-        let (submitted, mut sent_a) = host.submit(&[&a], true).expect("flight A sent ahead");
-        let fence_a = *submitted;
-        drop(submitted);
-        wait_for(fence_a);
-        // Flight B: the same piece, through the half-way value, for seconds.
-        let b = record(20, HALF_WAY, LEFT, spin);
-        let (submitted, mut sent_b) = host.submit(&[&b], true).expect("flight B sent ahead");
-        let fence_b = *submitted;
-        drop(submitted);
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        assert!(
-            completed() < fence_b,
-            "flight B had run after 0.3 s ({spin} steps; the trial's {TRIAL} took {took:.3} s): nothing to show"
-        );
-        // A lands, as `Host::relay_land` lands it, while B is half way.
-        let mut fetch = None;
-        {
-            let plan = sent_a.card.as_ref().expect("flight A has a plan for the card's copies");
-            host.relay_card_back(&[(sent_a.number, plan)], &mut fetch, fence_a, sent_a.number);
-        }
-        for (copy, ranges) in &sent_a.back {
-            copy.copy_back_done(ranges);
-        }
-        // SAFETY: inside the allocation.
-        let seen = unsafe { dword(AT).read_volatile() };
-        let b_ran = completed() >= fence_b;
-        eprintln!(
-            "queue2_tests: after A's landing title memory holds {seen:#x} (half way {HALF_WAY:#x}, left {LEFT:#x}); B had run: {b_ran}; {spin} steps"
-        );
-        assert_eq!(
-            seen, HALF_WAY,
-            "the fetch for A did not come down beside B (it waited for B, or B had not begun): this machine cannot show the fault"
-        );
-        // B has run; it left the piece as A left it, so its compare flags
-        // nothing. Its landing must bring the piece down all the same.
-        wait_for(fence_b);
-        {
-            let plan = sent_b.card.as_ref().expect("flight B has a plan for the card's copies");
-            host.relay_card_back(&[(sent_b.number, plan)], &mut fetch, fence_b, sent_b.number);
-        }
-        for (copy, ranges) in &sent_b.back {
-            copy.copy_back_done(ranges);
-        }
-        // SAFETY: inside the allocation.
-        let (left, beside) = unsafe { (dword(AT).read_volatile(), dword(AT + 4).read_volatile()) };
-        assert_eq!(
-            left, LEFT,
-            "title memory kept flight B's half-way bytes: B's compare found the piece as A left it and B's landing fetched nothing"
-        );
-        assert_eq!(beside, 0, "the dword beside it holds a half-way count");
-        for sent in [&mut sent_a, &mut sent_b] {
-            if let Some(plan) = sent.card.take() {
-                host.card_done(plan);
-            }
-        }
-        drop((a, b, trial));
-    }
-}
+/// Declarations of shader writes recorded once per list
+/// ([`Deferred::declare`]); the tests are in a file of their own.
+#[cfg(test)]
+mod declare_tests;
 
 #[cfg(test)]
 mod root_cbv_fill_tests {

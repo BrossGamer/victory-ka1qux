@@ -1638,7 +1638,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
     }
-    r.host.used.store(crate::host::moment(), Relaxed);
+    crate::host::touch(&r.host.used);
     made.clone()
 }
 
