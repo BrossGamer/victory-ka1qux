@@ -11149,7 +11149,18 @@ impl<'a> Lower<'a> {
             };
             let zero = self.s.m.i32(0);
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if kind == 5 && ch == 2 {
+                    // A cube's size query reports its six faces in the
+                    // depth channel (GCN3 ISA 12.16, RDNA3 ISA 10.1, LLPC,
+                    // RADV), not the 1 of a channel DXIL leaves out (after
+                    // Marvisak/VIctory pull request 3010 by RVZO6); past the
+                    // last level, as for the other channels, 0.
+                    let faces = self.s.m.i32(6);
+                    match beyond {
+                        Some(beyond) => self.s.m.select(c, beyond, zero, faces),
+                        None => faces,
+                    }
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     let x = self.s.m.extract(c, d, ch);
