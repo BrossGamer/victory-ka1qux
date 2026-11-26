@@ -24,6 +24,8 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod beside;
+mod quiet;
 mod under;
 pub(crate) use under::{on as under_fused, stats as under_stats};
 
@@ -124,8 +126,13 @@ pub(crate) struct Shadow {
     own_view: Option<crate::inplace::OwnView>,
     /// Made in place by `crate::unified` (bit 0: over physical pages, bit
     /// 1: over private memory, bit 2: it reaches the end of its title
-    /// memory, so a root view with no length may be given it).
+    /// memory, so a root view with no length may be given it, bit 3: it is
+    /// cut to its run of pages and a root view with no length is given it
+    /// all the same, `VICTORY_UNSIZED_RUN=1`).
     unified: u8,
+    /// Whether shaders have been declared to write the window and never
+    /// have (`VICTORY_QUIET_WINDOWS`), for a window that is a copy.
+    quiet: quiet::Quiet,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2005,6 +2012,16 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    if quiet::rules().mode != quiet::Mode::Off {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut now = [0u64; 2];
+        for s in loose.values().filter(|s| s.quiet.is_quiet()) {
+            now[0] += 1;
+            now[1] += s.len;
+        }
+        drop(loose);
+        quiet::line(frames, now);
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2808,6 +2825,18 @@ pub(crate) fn unified_alive() -> [[u64; 2]; 2] {
     out
 }
 
+/// For `crate::unified`'s cap and line: the windows alive that it placed
+/// and that are shorter than `limit` bytes, as (windows, bytes).
+pub(crate) fn unified_alive_below(limit: u64) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for s in loose.values().filter(|s| s.unified & 3 != 0 && s.len < limit) {
+        out[0] += 1;
+        out[1] += s.len;
+    }
+    out
+}
+
 /// For `crate::unified`'s census: the windows alive that are copies, as
 /// (start, bytes, lowest and highest title address asked in them, whether
 /// any ask had no length).
@@ -3026,6 +3055,7 @@ impl Shadow {
             fallback: Mutex::default(),
             own_view: None,
             unified: 0,
+            quiet: quiet::Quiet::new(),
         }
     }
 
@@ -3261,6 +3291,26 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.gpu_writes_marked(list, address, len, false);
+    }
+
+    /// [`Shadow::gpu_writes_marked`] for what a draw or a dispatch may
+    /// store through a root view or a buffer view of the copy: not made at
+    /// all for a window that has been compared many times with nothing
+    /// written (`VICTORY_QUIET_WINDOWS=1`, see `quiet`). The page tables of
+    /// title memory by address (`crate::memory`) and the copies of buffer
+    /// regions declare through [`Shadow::gpu_writes`] and always do.
+    pub(crate) fn gpu_writes_viewed(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if !marked && self.window && self.card.is_none() && self.place.is_none() && self.uploaded == 0 {
+            let rules = quiet::rules();
+            if rules.mode != quiet::Mode::Off {
+                let from = address as usize;
+                let to = from.saturating_add(len.min(self.left(address)) as usize);
+                if self.quiet.declared(&rules, from, to) == quiet::Verdict::Hold {
+                    return;
+                }
+            }
+        }
+        self.gpu_writes_marked(list, address, len, marked);
     }
 
     /// [`Shadow::gpu_writes`]; `marked`: through views of the heap by a
@@ -3518,6 +3568,11 @@ impl Shadow {
             // view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+            // What a window that shaders are declared to write gave back
+            // (`VICTORY_QUIET_WINDOWS`).
+            if self.window && self.card.is_none() {
+                self.quiet.compared(&quiet::rules(), start + from, start + to, written);
+            }
         }
         written
     }
@@ -3623,6 +3678,18 @@ impl Shadow {
     fn put_back(&self, at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) {
         let n = bytes.len();
         let write = |runs: Option<&[(usize, usize)]>| {
+            // View memory, beside the guards (`VICTORY_COPY_BACK_BESIDE`):
+            // what could not be written so goes on the old way below.
+            let left;
+            let runs = if beside::mode() != 0 && self.guarded() {
+                left = self.write_beside(at, bytes, runs);
+                if left.is_empty() {
+                    return;
+                }
+                Some(&left[..])
+            } else {
+                runs
+            };
             if !self.write_quietly(at, bytes, runs) {
                 match runs {
                     Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
@@ -5489,7 +5556,9 @@ fn in_place_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, need_e
         .rev()
         .take(32)
         .find(|((start, len), s)| {
-            s.place.is_some() && start + len >= need_end && (!reach || s.unified & 4 != 0 || start + len >= cell_end)
+            // Bit 4: it reaches where the title's memory ends; bit 8: cut to
+            // its run for root views with no length (`VICTORY_UNSIZED_RUN`).
+            s.place.is_some() && start + len >= need_end && (!reach || s.unified & 12 != 0 || start + len >= cell_end)
         })
         .map(|(_, s)| s)
 }

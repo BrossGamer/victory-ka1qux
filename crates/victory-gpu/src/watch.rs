@@ -1968,6 +1968,47 @@ pub(crate) fn gpu_wrote(at: usize, len: usize) {
     crate::descriptor::host::page_written(at, len);
 }
 
+/// Title memory `[at, at + len)` is about to be written (`before`) or has
+/// just been written through a view of our own beside the guards
+/// (`crate::inplace::write_own_runs`, `VICTORY_COPY_BACK_BESIDE=1`): no guard
+/// is opened, so no protection changes, and the title's first write to a
+/// block still faults and is seen. What opening one would have told is told
+/// here: the blocks, and the same pages at their other views, are no longer
+/// clean (the next asking of the guards finds them written, takes them as
+/// such and has nothing to guard again: they are still read-only), the count
+/// of changes of their regions moves (a range found all clean is not all
+/// clean now), and the armed ones keep their bytes first (`before`).
+///
+/// Told before the write and again after it, as upstream VIctory pull
+/// request 3069 does for its trackers: a copy that took a block between the
+/// two read the bytes from before the write.
+pub(crate) fn wrote_beside(at: usize, len: usize, before: bool) {
+    if len == 0 {
+        return;
+    }
+    let mut g = guards();
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    touched_range(&mut g, first, last, before);
+    for block in first..last {
+        g.clean.remove(block);
+    }
+    changed(first, last);
+    if g.aliased.is_empty() {
+        return;
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
+    for block in aliased {
+        for alias in crate::inplace::pages_of(block * BLOCK) {
+            let alias = alias / BLOCK;
+            if alias != block {
+                touched_range(&mut g, alias, alias + 1, before);
+                g.clean.remove(alias);
+                changed(alias, alias + 1);
+            }
+        }
+    }
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked
@@ -3223,6 +3264,36 @@ mod tests {
         assert!(writes_guarded(mine, mine + local.len()).is_none());
         // The journal forgets the view's pages before the address is given
         // back: a test that is handed it next starts from nothing written.
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let pages: Vec<usize> = j.written.range(at / PAGE..(at + 2 * BLOCK) / PAGE).map(|(&p, _)| p).collect();
+        for page in pages {
+            j.written.remove(&page);
+        }
+    }
+
+    /// A write made beside the guards leaves the block read-only, and the
+    /// next asking finds it written (and the count of changes has moved).
+    #[test]
+    fn a_write_beside_the_guards_counts_as_written_and_opens_nothing() {
+        let mut shown = Shown::new();
+        let at = shown.map(false);
+        let range = (at, at + 2 * BLOCK);
+        let (_, first, settled) = writes_guarded(range.0, range.1).expect("a view");
+        assert!(settled, "all guarded");
+        let asked = |list: &[(usize, u64)], block: usize| {
+            list.iter().find(|(page, _)| *page == (at + block * BLOCK) / PAGE).map(|&(_, asking)| asking).expect("a page of the range")
+        };
+        let count = || guard_changes(range.0, range.1);
+        let before = count();
+        wrote_beside(at + BLOCK + 8, 16, true);
+        assert!(count() > before, "a write beside the guards moves the count");
+        let (now, written, settled) = writes_guarded(range.0, range.1).expect("a view");
+        assert_eq!(asked(&written, 0), asked(&first, 0), "the first block is as it was");
+        assert!(asked(&written, 1) > asked(&first, 1) && now >= asked(&written, 1), "the second block was written since");
+        assert!(settled, "still guarded, and clean again once taken");
+        assert!(!writable(at + BLOCK), "the block was not opened");
+        // The journal forgets the view's pages before the address is given
+        // back.
         let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
         let pages: Vec<usize> = j.written.range(at / PAGE..(at + 2 * BLOCK) / PAGE).map(|(&p, _)| p).collect();
         for page in pages {

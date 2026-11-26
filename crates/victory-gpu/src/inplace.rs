@@ -832,7 +832,23 @@ static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex
 /// nothing written: not view memory, a page of very many views, the
 /// runtime changing mappings at this moment, or the host refusing.
 pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
+    write_own_runs(at, bytes, &[(0, bytes.len())])
+}
+
+/// [`write_own`] for the `runs` (offset, bytes; in order, none overlapping)
+/// of `bytes`, which lies at title address `at`: only the runs are stored,
+/// and all of them must lie in one 64 KiB page. What lies between two runs
+/// is not touched (it is the title's, read some time ago).
+pub(crate) fn write_own_runs(at: usize, bytes: &[u8], runs: &[(usize, usize)]) -> Option<Vec<usize>> {
+    let (&(first, _), &(last, last_len)) = (runs.first()?, runs.last()?);
+    let end = last.checked_add(last_len)?;
+    if first >= end || end > bytes.len() {
+        return None;
+    }
+    // From the first run's first byte to the last run's last: what is
+    // looked up, and checked against the view and the section.
+    let (low, span) = (at + first, end - first);
+    if low / K64 != (low + span - 1) / K64 {
         return None;
     }
     // No mapping changes until the bytes are in: the view found below
@@ -840,11 +856,11 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     let _still = crate::watch::title_memory_reading_now()?;
     let (section, offset, shown, section_bytes) = {
         let v = views();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
-        if at + bytes.len() > base + len {
+        let (&base, &(len, section, offset)) = v.views.range(..=low).next_back()?;
+        if low + span > base + len {
             return None;
         }
-        let offset = offset + (at - base) as u64;
+        let offset = offset + (low - base) as u64;
         let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
         if shown.len() > crate::watch::MANY_VIEWS {
             return None;
@@ -852,7 +868,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         let section_bytes = v.sections.get(&section)?.0;
         (section, offset, shown, section_bytes)
     };
-    if offset + bytes.len() as u64 > section_bytes {
+    if offset + span as u64 > section_bytes {
         return None;
     }
     let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -890,7 +906,7 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
             })
         })
         .as_mut()?;
-    if offset + bytes.len() as u64 > view.bytes {
+    if offset + span as u64 > view.bytes {
         return None;
     }
     let block = offset as usize / K64;
@@ -906,9 +922,11 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         }
         view.committed[block / 64] |= 1u64 << (block % 64);
     }
-    // SAFETY: committed bytes inside our own view; the source is the
-    // caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
+    for &(run, n) in runs {
+        // SAFETY: committed bytes inside our own view (the runs lie in the
+        // page checked above); the source is the caller's slice.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(run), (view.base + offset as usize + (run - first)) as *mut u8, n) };
+    }
     Some(shown)
 }
 
@@ -1717,6 +1735,49 @@ pub(crate) mod tests {
         assert_eq!(views_of_section(78, 9 * K64 as u64, 1), [(pool + K64, K64)]);
         views_gone(pool, 4 * K64);
         assert_eq!(views_of_section(78, 0, 16 * K64), []);
+    }
+
+    /// Runs of one page are stored through a view of ours and show at the
+    /// title's view; the bytes between them stay as they were; runs that lie
+    /// in two pages, or past the view, are not stored.
+    #[test]
+    fn runs_are_stored_through_a_view_of_ours_and_the_bytes_between_stay() {
+        let _one = crate::address_space();
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        const SIZE: usize = 4 * K64;
+        // SAFETY: a section and a view of the test's own, released below.
+        unsafe {
+            let section = mem::CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_RESERVE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = mem::MapViewOfFile(section, mem::FILE_MAP_WRITE, 0, 0, SIZE).Value as usize;
+            assert_ne!(view, 0);
+            mem::VirtualAlloc(view as *const c_void, SIZE, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            std::ptr::write_bytes(view as *mut u8, 0xAA, SIZE);
+            title_memory_section(section as usize, SIZE as u64, false);
+            title_memory_view(view, SIZE, section as usize, 0);
+            let bytes: Vec<u8> = (0..64u8).collect();
+            let shown = write_own_runs(view + K64 + 100, &bytes, &[(0, 4), (10, 2), (60, 4)]).expect("runs in one page of a view");
+            assert_eq!(shown, [view + K64], "the page, at its one view");
+            let read = |at: usize, n: usize| std::slice::from_raw_parts(at as *const u8, n).to_vec();
+            assert_eq!(read(view + K64 + 100, 4), [0, 1, 2, 3]);
+            assert_eq!(read(view + K64 + 104, 6), [0xAA; 6], "between the runs: as it was");
+            assert_eq!(read(view + K64 + 110, 2), [10, 11]);
+            assert_eq!(read(view + K64 + 112, 48), [0xAA; 48]);
+            assert_eq!(read(view + K64 + 160, 4), [60, 61, 62, 63]);
+            // The whole stretch is `write_own`.
+            assert!(write_own(view + 2 * K64, &bytes).is_some());
+            assert_eq!(read(view + 2 * K64, 64), bytes);
+            // Two pages: not stored.
+            assert!(write_own_runs(view + K64 - 2, &bytes, &[(0, 4)]).is_none());
+            assert_eq!(read(view + K64 - 2, 2), [0xAA; 2]);
+            // Past the view's end, runs out of order, nothing: not stored.
+            assert!(write_own_runs(view + SIZE - 2, &bytes, &[(0, 4)]).is_none());
+            assert!(write_own_runs(view, &bytes, &[]).is_none());
+            assert!(write_own_runs(view, &bytes, &[(0, 100)]).is_none(), "more than the bytes");
+            views_gone(view, SIZE);
+            mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut c_void });
+            CloseHandle(section);
+        }
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
