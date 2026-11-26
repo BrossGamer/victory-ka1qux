@@ -676,6 +676,13 @@ impl Drop for Tiled {
     }
 }
 
+/// `VICTORY_RESIDENT_MIN_LOD=0` takes the shift of the view's start off its
+/// minimum LOD again, as `show_resident` did before (see there).
+fn resident_min_lod() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESIDENT_MIN_LOD").is_none_or(|v| v != "0"))
+}
+
 /// Restricts a 2D shader view to the first contiguous resident mip run
 /// within its requested range. If the whole range is absent, use the
 /// nearest coarser resident mip, or the coarsest finer one.
@@ -707,7 +714,15 @@ pub(crate) fn show_resident(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, resident
         }
         *most = first;
         *mips = count;
-        if *min_lod > 0.0 {
+        // `ResourceMinLODClamp` is measured from mip 0 of the resource, not
+        // from the view's first mip: moving the start of the view keeps it
+        // (a minimum of 3 stays 3, whatever mip the view starts at), cut
+        // to the last mip the view shows. Taking the shift off it made the
+        // adjusted view sample a finer mip than the title's own (fork pull
+        // request 1210).
+        if *min_lod > 0.0 && resident_min_lod() {
+            *min_lod = min_lod.min((first + count - 1) as f32);
+        } else if *min_lod > 0.0 {
             *min_lod = (*min_lod - shift as f32).clamp(0.0, (count - 1) as f32);
         }
     };
@@ -1310,16 +1325,42 @@ void look() {
     /// (v) Shader sampling clamps at the end of the first resident run,
     /// even when there are more resident levels beyond a hole.
     fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
+        let read = sample_resident_views(rig, true, 1, 0.0, 1)?;
+        assert_eq!(read[0], 32, "the resident view clamps sampling to level 1");
+        assert_eq!(read[1], 0, "the legacy view samples the unmapped level 2");
+        Some(())
+    }
+
+    /// (vi) A minimum LOD the title gave its view is in the resource's own
+    /// level numbers: with level 0 without tiles and the others backed, a
+    /// minimum of 3 selects level 3 through the view as asked and through the
+    /// one that starts at level 1 alike (taking the shift of the view's
+    /// start off it made the second sample level 2).
+    fn the_view_keeps_the_resource_minimum_lod(rig: &mut Rig) -> Option<()> {
+        let read = sample_resident_views(rig, false, 0, 3.0, 0)?;
+        // Level n holds (n + 1) * 16.
+        assert_eq!(read, [64, 64], "a minimum LOD of 3 through the resident view and through the view as asked");
+        Some(())
+    }
+
+    /// Samples `level` of two views of a texture with the first level
+    /// without tiles and the others backed (with a hole at level 2 when
+    /// `hole`), both with the minimum LOD `min_lod`: the title's view as
+    /// [`show_resident`] adjusts it, and the view as asked but starting at
+    /// `second_most`. Their samples.
+    fn sample_resident_views(rig: &mut Rig, hole: bool, level: u32, min_lod: f32, second_most: u32) -> Option<[u32; 2]> {
         rig.step = "step 5, the view from the first level with tiles";
-        let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
+        let source = LOOK.replace("float2(0.3, 0.3), 1)", &format!("float2(0.3, 0.3), {level})"));
+        let cs = compile(&source, s!("look"), s!("cs_5_1")).ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
         let desc = Rig::desc(format, SIDE, LEVELS, true);
         let layout = rig.footprints(&desc);
         let (texture, tiled) = rig.reserved(&desc);
-        // Level 1 and the coarse mips are backed, with a hole at level 2.
+        // Level 1 and the coarse mips are backed, with a hole at level 2
+        // if asked.
         let before = STATS[6].load(Ordering::Relaxed);
         let regions_before = STATS[5].load(Ordering::Relaxed);
-        rig.give(&tiled, &texture, from_level(1) & !(1 << 2));
+        rig.give(&tiled, &texture, if hole { from_level(1) & !(1 << 2) } else { from_level(1) });
         let calls = STATS[6].load(Ordering::Relaxed) - before;
         let regions = STATS[5].load(Ordering::Relaxed) - regions_before;
         let given = tiled.given.lock().unwrap();
@@ -1327,7 +1368,7 @@ void look() {
         assert_eq!(calls as usize, heaps.len(), "one mapping call per backing heap");
         drop(given);
         assert_eq!(tiled.first_shown(), Some(1));
-        assert!(!tiled.has_tiles(2));
+        assert_eq!(tiled.has_tiles(2), !hole);
         let upload = rig.filled(&layout, |level| (level as u8 + 1) * 16);
         rig.round_trip(&texture, &layout, Some(&upload));
         // SAFETY: plain object creation; the views are made in a heap
@@ -1363,16 +1404,18 @@ void look() {
                         MostDetailedMip: 0,
                         MipLevels: u32::MAX,
                         PlaneSlice: 0,
-                        ResourceMinLODClamp: 0.0,
+                        ResourceMinLODClamp: min_lod,
                     },
                 },
             };
             let mut shown = as_asked;
             show_resident(&mut shown, tiled.shown_levels(), u32::from(LEVELS));
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
-            assert_eq!(shown.Anonymous.Texture2D.MipLevels, 1);
+            if hole {
+                assert_eq!(shown.Anonymous.Texture2D.MipLevels, 1);
+            }
             let mut legacy = as_asked;
-            legacy.Anonymous.Texture2D.MostDetailedMip = 1;
+            legacy.Anonymous.Texture2D.MostDetailedMip = second_most;
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
             rig.device.CreateShaderResourceView(&texture, Some(&raw const shown), at);
@@ -1412,10 +1455,11 @@ void look() {
             back.Unmap(0, None);
             read
         };
-        eprintln!("sample through resident view: {}, legacy view: {}; mapped {regions} regions in {calls} calls", read[0], read[1]);
-        assert_eq!(read[0], 32, "the resident view clamps sampling to level 1");
-        assert_eq!(read[1], 0, "the legacy view samples the unmapped level 2");
-        Some(())
+        eprintln!(
+            "sample at level {level}, minimum LOD {min_lod}, through the resident view: {}, through the view from level {second_most}: {}; mapped {regions} regions in {calls} calls",
+            read[0], read[1]
+        );
+        Some([read[0], read[1]])
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
@@ -1507,6 +1551,9 @@ void look() {
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
         }
+        if resident_min_lod() && the_view_keeps_the_resource_minimum_lod(&mut rig).is_none() {
+            eprintln!("the minimum LOD test's shader or objects could not be made; that part was skipped");
+        }
         rig.step = "the end";
         rig.check("every step done");
         eprintln!(
@@ -1534,7 +1581,7 @@ void look() {
     }
 
     #[test]
-    fn show_resident_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_resident_clamps_2d_and_2d_array_and_keeps_min_lod() {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1554,7 +1601,23 @@ void look() {
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        // The minimum is in the resource's own levels: it stays.
+        assert_eq!(v2d.ResourceMinLODClamp, if resident_min_lod() { 3.5 } else { 0.5 });
+        // One past the last level the view shows (3 + 8 - 1 = 10) is cut to it.
+        let mut far = srv2d;
+        far.Anonymous.Texture2D = D3D12_TEX2D_SRV {
+            MostDetailedMip: 0,
+            MipLevels: 12,
+            PlaneSlice: 0,
+            ResourceMinLODClamp: 20.0,
+        };
+        show_resident(&mut far, from_level(3), 11);
+        // SAFETY: `ViewDimension` is `TEXTURE2D`.
+        let far = unsafe { far.Anonymous.Texture2D };
+        assert_eq!((far.MostDetailedMip, far.MipLevels), (3, 8));
+        if resident_min_lod() {
+            assert_eq!(far.ResourceMinLODClamp, 10.0);
+        }
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1576,7 +1639,7 @@ void look() {
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, if resident_min_lod() { 1.5 } else { 0.0 });
 
         // A view asking for a missing range still has a valid finer mip.
         show_resident(&mut srv_arr, 1, 11);
