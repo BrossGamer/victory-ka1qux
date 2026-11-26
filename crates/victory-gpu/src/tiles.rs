@@ -66,8 +66,12 @@ const HEAP_TILES: u32 = 1024;
 /// the pool's heaps; such textures made in all; levels given; calls of
 /// `UpdateTileMappings`; their microseconds; heaps given back to the card;
 /// uploads that left a held level without tiles (the card had no room, or
-/// no heap could be had); uploads recorded again for such a level.
-pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+/// no heap could be had); uploads recorded again for such a level; view
+/// slots made again because the levels that have memory changed, and those
+/// of them no span of placed views held (a table's); slots made while the
+/// levels changed under them (asked for again); upload steps left alone
+/// because the staging buffer was never detiled.
+pub(crate) static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
 
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
@@ -804,7 +808,10 @@ pub(crate) fn status() {
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
          UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
+         level without memory (no room on the card, or no heap), {} uploads were recorded again for one; \
+         view slots made again for a change of the levels that have memory: {} ({} of them held by no span of \
+         placed views: a table's), {} made while the levels changed under them, {} upload steps left alone \
+         for a staging buffer no detiling had filled",
         s[0],
         s[4],
         s[2] >> 20,
@@ -819,6 +826,10 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
+        s[11],
+        s[12],
+        s[13],
+        s[14],
     );
 }
 

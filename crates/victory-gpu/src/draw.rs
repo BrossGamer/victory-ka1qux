@@ -2623,6 +2623,8 @@ impl State {
         // Levels on demand: the slots of textures whose levels with memory
         // changed since the last pass are made again from them.
         host.texture_views_remade();
+        #[cfg(feature = "diagnostics")]
+        host.tiled_census();
         // And with room, the textures whose upload left a held level
         // without the card's memory are uploaded again.
         if room {

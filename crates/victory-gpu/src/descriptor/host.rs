@@ -209,6 +209,11 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Levels on demand: the slots that show a texture made level by level
+    /// ([`TiledSlots`]), and whether there is one (the gate for every other
+    /// heap and for a run without the switch).
+    tiled_slots: Mutex<TiledSlots>,
+    has_tiled: std::sync::atomic::AtomicBool,
     /// Material records the card read for this heap
     /// (`crate::material_demand`).
     pub(crate) material_demand: crate::material_demand::Mailbox,
@@ -258,7 +263,89 @@ static RESHOWN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// The first level with memory of the placed texture at `start` changed:
 /// its slots are made again at the next texture pass.
 pub(crate) fn levels_changed(start: u64) {
+    // The count first, the start after: a slot made while the levels were
+    // changing sees the count move ([`HostHeap::note_tiled`]).
+    LEVELS_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+}
+
+/// How many times the levels a view of some texture may show changed
+/// ([`levels_changed`]), since the start.
+static LEVELS_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the start, of [`HostHeap::texture_views_remade`]: view slots made
+/// again while a submission was in flight, and passes put off because one
+/// was (`VICTORY_VIEWS_REMADE_QUIET=1`).
+static VIEWS_REMADE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether view slots of textures with levels on demand are made again
+/// only while no submission is in flight (`VICTORY_VIEWS_REMADE_QUIET=1`;
+/// off by default: at every texture pass). A texture then shows its new
+/// level a pass or more later. The slots made again are live slots of the
+/// heap the card reads, written at a moment of the layer's own choosing: a
+/// list already sent may be reading one (Direct3D 12 asks that a descriptor
+/// a submitted list reads is left alone until the list has run). After the
+/// fork's commit 4679615a, whose author does not know whether that is
+/// behind the device losses there.
+fn views_remade_quiet() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_REMADE_QUIET").is_some_and(|v| v == "1"))
+}
+
+/// The slots of a heap that show a texture made level by level, by slot and
+/// by the start of the texture's memory (the key of [`levels_changed`]),
+/// with the levels the slot's view was made from. Of every such slot, not
+/// only of those [`Spans`] holds: a slot a draw reads through a table is no
+/// span's (`HostHeap::note_buffer` leaves it out), and when the texture got
+/// the tiles of its levels at the submission that followed the draw, nothing
+/// remade the slot, which went on reading the levels that had no memory when
+/// it was made: a black texture for as long as the title left the slot
+/// alone (fork pull request #764). Entries that went stale are dropped when
+/// found ([`HostHeap::note_tiled`]).
+#[derive(Default)]
+struct TiledSlots {
+    by_slot: std::collections::HashMap<u32, (u64, u32)>,
+    by_start: std::collections::HashMap<u64, std::collections::BTreeSet<u32>>,
+}
+
+impl TiledSlots {
+    /// Slot `slot` was made from a view of the texture at `start` that
+    /// showed the levels `shown`.
+    fn note(&mut self, slot: u32, start: u64, shown: u32) {
+        if let Some(&(old, _)) = self.by_slot.get(&slot)
+            && old != start
+        {
+            self.forget(slot);
+        }
+        self.by_start.entry(start).or_default().insert(slot);
+        self.by_slot.insert(slot, (start, shown));
+    }
+
+    /// Slot `slot` shows no such texture (any more).
+    fn forget(&mut self, slot: u32) {
+        let Some((at, _)) = self.by_slot.remove(&slot) else {
+            return;
+        };
+        if let Some(set) = self.by_start.get_mut(&at) {
+            set.remove(&slot);
+            if set.is_empty() {
+                self.by_start.remove(&at);
+            }
+        }
+    }
+
+    /// The slots that show the texture at `start`.
+    fn slots_at(&self, start: u64) -> Vec<u32> {
+        self.by_start.get(&start).map(|set| set.iter().copied().collect()).unwrap_or_default()
+    }
+}
+
+thread_local! {
+    /// The start of the memory of the texture, and the levels it showed,
+    /// that [`make`] last made a view of on this thread if the texture is
+    /// made level by level (`crate::tiles`): the slot the view goes to is
+    /// noted by it ([`HostHeap::note_tiled`]).
+    static TILED_MADE: std::cell::Cell<Option<(u64, u32)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Levels on demand (`crate::tiles`): where the placed textures start
@@ -1662,6 +1749,8 @@ impl HostHeap {
             material_demand: Default::default(),
             material_epochs: Default::default(),
             material_clock: Default::default(),
+            tiled_slots: Mutex::default(),
+            has_tiled: std::sync::atomic::AtomicBool::new(false),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
@@ -2402,19 +2491,43 @@ impl HostHeap {
     const WAITING_A_PASS: usize = 128;
 
     pub(crate) fn texture_views_remade(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
         if self.sampler {
+            return 0;
+        }
+        // Counted always; with `VICTORY_VIEWS_REMADE_QUIET=1` the pass is
+        // put off while a submission is in flight, and what is due stays due.
+        let flying = crate::host::started().saturating_sub(crate::host::finished()) > 0;
+        if flying && views_remade_quiet() {
+            if !RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+                VIEWS_REMADE[1].fetch_add(1, Relaxed);
+            }
             return 0;
         }
         let starts = std::mem::take(&mut *RESHOWN.lock().unwrap_or_else(|e| e.into_inner()));
         if starts.is_empty() {
             return 0;
         }
-        let slots: Vec<u32> = {
+        let (mut slots, spanned): (Vec<u32>, std::collections::HashSet<u32>) = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            starts.iter().flat_map(|&start| placed.slots_at(start)).collect()
+            let slots: Vec<u32> = starts.iter().flat_map(|&start| placed.slots_at(start)).collect();
+            let spanned = slots.iter().copied().collect();
+            (slots, spanned)
         };
+        // The slots of such textures no span holds (a table's), which the
+        // draw that read them made before the texture had the tiles it
+        // shows now.
+        if self.has_tiled.load(Relaxed) {
+            let tiled = self.tiled_slots.lock().unwrap_or_else(|e| e.into_inner());
+            for &start in &starts {
+                slots.extend(tiled.slots_at(start));
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        let mut remade = 0;
+        let mut remade = 0u64;
+        let mut unspanned = 0u64;
         for slot in slots {
             let Some(&key) = made.get(slot as usize) else {
                 continue;
@@ -2425,12 +2538,131 @@ impl HostHeap {
             let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
                 continue;
             };
+            let epoch = LEVELS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
             if let Some(kept) = make(&view, self.cpu(slot)) {
                 self.keep(slot, kept);
+                self.note_tiled(slot, epoch);
                 remade += 1;
+                if !spanned.contains(&slot) {
+                    unspanned += 1;
+                }
             }
         }
-        remade
+        let before = crate::tiles::STATS[11].fetch_add(remade, Relaxed);
+        crate::tiles::STATS[12].fetch_add(unspanned, Relaxed);
+        if flying {
+            VIEWS_REMADE[0].fetch_add(remade, Relaxed);
+        }
+        // Said at every 1,024 slots made again.
+        if (before + remade) / 1024 != before / 1024 {
+            tracing::info!(
+                "view slots of textures with levels on demand made again, since the start: {}, {} of them held by no span \
+                 of placed views (a table's), {} while a submission was in flight (a list already sent may have been \
+                 reading the slot); {} passes put off for that (VICTORY_VIEWS_REMADE_QUIET=1: {})",
+                before + remade,
+                crate::tiles::STATS[12].load(Relaxed),
+                VIEWS_REMADE[0].load(Relaxed),
+                VIEWS_REMADE[1].load(Relaxed),
+                if views_remade_quiet() { "on" } else { "off" }
+            );
+        }
+        remade as usize
+    }
+
+    /// Diagnostics: every ten seconds, a count of the slots that show a
+    /// texture made level by level against the levels it shows now: those
+    /// made from other levels than it has now are slots no pass made again
+    /// (`stale`; a slot made while the title streams may be one for a
+    /// moment, one that stays is a texture that reads zeros or a blurrier
+    /// level than it could), and of them those made when no level had memory
+    /// (`black`: the slots of a texture that stays black).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn tiled_census(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if self.sampler || !self.has_tiled.load(Relaxed) {
+            return;
+        }
+        let now = crate::host::now_ms();
+        let last = LAST.load(Relaxed);
+        if now < last + 10_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+            return;
+        }
+        let tracked: Vec<(u32, u64, u32)> = {
+            let tiled = self.tiled_slots.lock().unwrap_or_else(|e| e.into_inner());
+            tiled.by_slot.iter().map(|(&slot, &(start, shown))| (slot, start, shown)).collect()
+        };
+        let keys: Vec<u64> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            tracked.iter().map(|&(slot, ..)| made.get(slot as usize).copied().unwrap_or(0)).collect()
+        };
+        let [mut stale, mut black, mut empty, mut gone] = [0u32; 4];
+        let mut first = Vec::new();
+        for (&(slot, start, baked), key) in tracked.iter().zip(keys) {
+            let Some(view) = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten() else {
+                gone += 1;
+                continue;
+            };
+            let resource = match (&view, placed_texture(&view)) {
+                (&View::Shader(resource, _), _) | (_, Some(View::Shader(resource, _))) => resource,
+                _ => {
+                    gone += 1;
+                    continue;
+                }
+            };
+            let Some(shown) = crate::resource::tiled_levels(resource as crate::object::This) else {
+                gone += 1;
+                continue;
+            };
+            if shown == 0 {
+                empty += 1;
+            }
+            if shown != baked {
+                stale += 1;
+                if baked == 0 {
+                    black += 1;
+                }
+                if first.len() < 4 {
+                    first.push(format!("slot {slot} texture {start:#x} made from {baked:#b} shows {shown:#b} now"));
+                }
+            }
+        }
+        tracing::info!(
+            "slots that show a texture made level by level: {} noted, {} made from other levels than the texture shows now \
+             ({} of them made when no level had memory: black), {} of a texture with no level shown yet, {} no longer \
+             a view of one; {}",
+            tracked.len(),
+            stale,
+            black,
+            empty,
+            gone,
+            first.join("; ")
+        );
+    }
+
+    /// Slot `index` was just made by [`make`] on this thread (`epoch`: what
+    /// [`LEVELS_EPOCH`] said before it was): noted if the texture it shows is
+    /// made level by level, so that a change of the levels that have memory
+    /// makes it again ([`HostHeap::texture_views_remade`]); forgotten if not.
+    /// If the levels changed while it was made, the change may have come
+    /// ahead of the slot's noting and been taken without it: asked for again.
+    fn note_tiled(&self, index: u32, epoch: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        match TILED_MADE.take() {
+            Some((start, shown)) => {
+                self.tiled_slots.lock().unwrap_or_else(|e| e.into_inner()).note(index, start, shown);
+                self.has_tiled.store(true, Relaxed);
+                if LEVELS_EPOCH.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+                    crate::tiles::STATS[13].fetch_add(1, Relaxed);
+                    RESHOWN.lock().unwrap_or_else(|e| e.into_inner()).push(start);
+                }
+            }
+            None => {
+                if self.has_tiled.load(Relaxed) {
+                    self.tiled_slots.lock().unwrap_or_else(|e| e.into_inner()).forget(index);
+                }
+            }
+        }
     }
 
     /// The memory of the texture title slot `index` views is not mapped
@@ -3390,6 +3622,7 @@ impl HostHeap {
             // Cleared while the slot is made: a mirroring without the lock
             // never takes it for made from this record before it is.
             self.made_fast_set(index, 0);
+            let epoch = LEVELS_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
             let kept = if later {
                 None
             } else {
@@ -3401,6 +3634,13 @@ impl HostHeap {
             let kept = kept.flatten();
             let shows = kept.is_some();
             self.keep(index, kept);
+            // A texture made level by level: this slot is made again when
+            // the levels with memory change (a draw's slot is made here at
+            // record time, and the tiles of the texture's levels are given
+            // at the submission after it).
+            if !later && !self.sampler {
+                self.note_tiled(index, epoch);
+            }
             self.made_fast_set(index, made[index as usize]);
             if let Some(sig) = sig
                 && shows
@@ -4667,6 +4907,7 @@ fn constant_copy(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shado
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     // A mark is only for the view made now.
     MARK.with(|m| m.set(None));
+    TILED_MADE.set(None);
     let host = host()?;
     let device = &host.device;
     match view {
@@ -4731,7 +4972,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // and a view from the first level alone reached that hole).
                 // A texture whose every level has memory keeps the title's
                 // view as it is (with none, the default view).
-                let resident = crate::resource::shown_levels(resource);
+                let tiled = crate::resource::tiled_levels(resource);
+                let resident = tiled.unwrap_or(0);
                 // SAFETY: a live resource.
                 let own = (resident != 0).then(|| unsafe { texture.GetDesc() });
                 if let Some(own) = own.filter(|own| {
@@ -4767,6 +5009,11 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                         at,
                     )
                 };
+                // Made level by level: the slot is made again when the
+                // levels with memory change ([`HostHeap::note_tiled`]).
+                if let (Some(shown), Some((memory, _))) = (tiled, crate::resource::texture_memory(resource)) {
+                    TILED_MADE.set(Some((memory as u64, shown)));
+                }
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -6301,6 +6548,127 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// The slots that show a texture made level by level are kept by slot and
+    /// by the start of the texture's memory, a slot that moves is found at
+    /// its new start only, and one forgotten at none.
+    #[test]
+    fn tiled_slots_are_found_by_the_start_of_their_texture() {
+        let mut slots = TiledSlots::default();
+        assert!(slots.slots_at(0x1000).is_empty());
+        slots.note(7, 0x1000, 0);
+        slots.note(9, 0x1000, 0b1000);
+        slots.note(3, 0x2000, 0);
+        assert_eq!(slots.slots_at(0x1000), [7, 9]);
+        assert_eq!(slots.by_slot[&9], (0x1000, 0b1000));
+        // Made again from the same texture: its levels are the new ones.
+        slots.note(7, 0x1000, 0b1100);
+        assert_eq!(slots.slots_at(0x1000), [7, 9]);
+        assert_eq!(slots.by_slot[&7], (0x1000, 0b1100));
+        // The slot now shows another texture.
+        slots.note(7, 0x2000, 0);
+        assert_eq!(slots.slots_at(0x1000), [9]);
+        assert_eq!(slots.slots_at(0x2000), [3, 7]);
+        slots.forget(9);
+        slots.forget(9);
+        slots.forget(3);
+        slots.forget(7);
+        assert!(slots.by_slot.is_empty() && slots.by_start.is_empty());
+    }
+
+    /// A slot made while the levels of some texture changed (the count of
+    /// [`levels_changed`] moved between before it was made and after) asks
+    /// for itself to be made again: its texture's change may have been taken
+    /// by a pass ahead of the slot's noting. One that shows no texture of
+    /// the kind is forgotten. (Other tests may move the count or take what
+    /// is asked for, so this looks at the books and the counter alone.)
+    #[test]
+    fn a_slot_made_while_levels_changed_is_made_again() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // A start no texture of the tests or the title has.
+        let (mine, other) = (0x7fee_1000_0000u64, 0x7fee_2000_0000u64);
+        let epoch = LEVELS_EPOCH.load(SeqCst);
+        TILED_MADE.set(Some((mine, 0b0110)));
+        heap.note_tiled(1, epoch);
+        assert_eq!(heap.tiled_slots.lock().unwrap().slots_at(mine), [1]);
+        // The levels of another texture changed while a slot was made.
+        let asked = crate::tiles::STATS[13].load(SeqCst);
+        TILED_MADE.set(Some((mine, 0b0110)));
+        levels_changed(other);
+        heap.note_tiled(2, epoch);
+        assert_eq!(heap.tiled_slots.lock().unwrap().slots_at(mine), [1, 2]);
+        assert!(crate::tiles::STATS[13].load(SeqCst) > asked, "the slot made while the levels changed did not ask again");
+        // Made from a view of no such texture: forgotten.
+        TILED_MADE.set(None);
+        heap.note_tiled(2, LEVELS_EPOCH.load(SeqCst));
+        assert_eq!(heap.tiled_slots.lock().unwrap().slots_at(mine), [1]);
+        heap.tiled_slots.lock().unwrap().forget(1);
+        // What the two starts put among the starts a pass takes is nobody's.
+        RESHOWN.lock().unwrap().retain(|&s| s != mine && s != other);
+    }
+
+    /// Levels on demand, on the card (`VICTORY_LEVELS_ON_DEMAND=1`): a slot a
+    /// draw read through a table, made before its texture had the tiles of
+    /// any level, is a span of no heap's (`note_buffer` leaves a table's
+    /// out). When the texture gets its levels the slot is made again from
+    /// the levels it has, by the texture pass, and again as more arrive;
+    /// before, nothing did (fork pull request #764: a black texture).
+    #[test]
+    fn a_table_slot_of_a_tiled_texture_is_made_again_when_its_levels_get_memory() {
+        use windows_sys::Win32::System::Memory::*;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            eprintln!("skipped: no host GPU");
+            return;
+        };
+        if !crate::tiles::wanted() {
+            eprintln!("skipped: levels on demand are off (VICTORY_LEVELS_ON_DEMAND=1) or the card has no tiled resources tier 2");
+            return;
+        }
+        // 1024x1024 BC7, 11 levels (1.33 MiB: over the megabyte a texture
+        // must have to be made this way), of which only the head of its
+        // memory is mapped.
+        let rdesc: [u32; 14] = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).unwrap() as usize;
+        // SAFETY: a private reservation, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the head of our own reservation.
+        assert!(!unsafe { VirtualAlloc(base, 65536, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let at = base as u64;
+        let mut sdesc = [0u32; 16];
+        sdesc[..6].copy_from_slice(&[98, 4, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, 0, 0, 11]);
+        (sdesc[10], sdesc[11]) = (at as u32, (at >> 32) as u32);
+        let mut words = [0u32; 8];
+        let handle = words.as_mut_ptr() as u64;
+        super::super::record(handle, View::Placed(false, rdesc, sdesc));
+        // A table's slot: the draw read it.
+        heap.texture_slot_tabled(3, true);
+        // Made before any level had tiles.
+        assert!(heap.mirror(3, handle, true).is_some());
+        assert!(heap.placed.lock().unwrap().slots_at(at).is_empty(), "a table's slot is no span's");
+        assert_eq!(heap.tiled_slots.lock().unwrap().slots_at(at), [3]);
+        assert_eq!(heap.tiled_slots.lock().unwrap().by_slot[&3], (at, 0));
+        // The upload gives levels 3 to 10 their tiles.
+        let placed = crate::resource::texture_at(at, &rdesc).unwrap();
+        let on_demand = crate::resource::host_tiled(placed).expect("a texture made level by level");
+        let held = ((1u32 << 11) - 1) & !0b111;
+        let _ = on_demand.uploaded(held, at);
+        assert_eq!(crate::resource::tiled_levels(placed), Some(held));
+        assert_eq!(heap.texture_views_remade(), 1);
+        assert_eq!(heap.tiled_slots.lock().unwrap().by_slot[&3], (at, held));
+        // Levels 0 to 2 arrive.
+        let every = (1u32 << 11) - 1;
+        let _ = on_demand.uploaded(every, at);
+        assert_eq!(heap.texture_views_remade(), 1);
+        assert_eq!(heap.tiled_slots.lock().unwrap().by_slot[&3], (at, every));
+        // Nothing changed: nothing is made again.
+        assert_eq!(heap.texture_views_remade(), 0);
+        // SAFETY: freeing our private reservation.
+        unsafe { VirtualFree(base, 0, MEM_RELEASE) };
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
