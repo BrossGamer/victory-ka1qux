@@ -223,6 +223,8 @@ pub fn run(
         return Ok(());
     }
     victory_loader::report_crashes();
+    // The faults at the console's wait instructions, with the frame lines.
+    victory_gpu::add_frame_line_source(victory_loader::wait_fault_line);
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]

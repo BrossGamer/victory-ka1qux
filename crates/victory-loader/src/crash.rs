@@ -13,7 +13,7 @@
 //! crash log too.
 
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -201,11 +201,20 @@ const FATAL: [i32; 6] = [
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax` (see [`clzero`] for the loops around it);
 /// `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so a spin loop
-/// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
+/// around them works with mwaitx as a yield (counted per address, and with
+/// `VICTORY_REWRITE_WAITS=1` rewritten in place: [`rewrite_wait`]); `rdpru`
+/// (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
 /// changes frequency.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: forwarded from the caller.
+    unsafe { emulate_amd_only_as(info, rewrite_waits()) }
+}
+
+/// [`emulate_amd_only`] with the `VICTORY_REWRITE_WAITS` setting given (see
+/// [`rewrite_waits`]).
+unsafe fn emulate_amd_only_as(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
     unsafe {
@@ -217,8 +226,21 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {}
-            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
+            [0x0f, 0x01, 0xfa] => {
+                count_wait(context.Rip as usize, false);
+                // Rewritten, it runs as the new instruction from the same
+                // place; if it cannot be, this one is skipped as a hint.
+                if rewrite != Rewrite::Off && rewrite_wait(context.Rip as usize, false) {
+                    return true;
+                }
+            }
+            [0x0f, 0x01, 0xfb] => {
+                count_wait(context.Rip as usize, true);
+                if rewrite == Rewrite::Both && rewrite_wait(context.Rip as usize, true) {
+                    return true;
+                }
+                std::thread::yield_now();
+            }
             [0x0f, 0x01, 0xfd] => {
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
@@ -261,6 +283,217 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
         context.Rip += 3;
     }
     true
+}
+
+/// What `VICTORY_REWRITE_WAITS` asks for ([`rewrite_waits`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rewrite {
+    /// Every `monitorx` and `mwaitx` is emulated by an exception, every time.
+    Off,
+    /// Only `monitorx` is rewritten (`VICTORY_REWRITE_WAITS=monitor`): the
+    /// `mwaitx` of a loop stays an exception that yields the thread.
+    Monitor,
+    /// Both are rewritten (`VICTORY_REWRITE_WAITS=1`).
+    Both,
+}
+
+/// Whether the console's wait instructions are rewritten in place the
+/// first time the CPU refuses them (`VICTORY_REWRITE_WAITS=1`; off by
+/// default). An Intel CPU has neither `monitorx` nor `mwaitx`, so a title's
+/// wait loop takes an exception for each, every pass (a microsecond or two
+/// each, and `mwaitx` also gives the thread's time slice away). Rewritten,
+/// the three bytes of `monitorx` become a three-byte `nop` and the three of
+/// `mwaitx` `pause` and a `nop`: both are hints that change no register and
+/// no flag, and the loop around them checks its own condition. The loop
+/// then spins on `pause` where it gave the time slice away: a core's worth
+/// of a waiting thread either way. `monitor` rewrites only `monitorx`.
+/// (An idea of the XCL project, described to us; nothing of its code.)
+fn rewrite_waits() -> Rewrite {
+    static SETTING: std::sync::OnceLock<Rewrite> = std::sync::OnceLock::new();
+    *SETTING.get_or_init(|| match std::env::var("VICTORY_REWRITE_WAITS").as_deref() {
+        Ok("1") => Rewrite::Both,
+        Ok("monitor") => Rewrite::Monitor,
+        _ => Rewrite::Off,
+    })
+}
+
+const MONITORX: [u8; 3] = [0x0f, 0x01, 0xfa];
+const MWAITX: [u8; 3] = [0x0f, 0x01, 0xfb];
+/// `nop dword ptr [rax]`: the recommended three-byte `nop`, which touches no
+/// memory.
+const NOP3: [u8; 3] = [0x0f, 0x1f, 0x00];
+/// `pause`, then a `nop`.
+const PAUSE_NOP: [u8; 3] = [0xf3, 0x90, 0x90];
+
+/// The instruction at `at` (a `monitorx`, or an `mwaitx` if `mwait`), made
+/// the equivalent the CPU runs without an exception, in place: true if the
+/// bytes there are the new ones now (written here or by another thread
+/// that took the same exception), false if they are left as they are.
+///
+/// The three bytes are written with one atomic compare-and-exchange of the
+/// eight bytes of their cache line that hold them (a thread that fetches
+/// them at that moment sees the old instruction, which it faults on as this
+/// thread did, or the new one, never a mixture); none is written if they
+/// cross a cache line or a page. The page is made writable for the write
+/// alone and put back as it was, one rewrite at a time (two threads
+/// changing one page's protection would put it back wrong). A failure of
+/// the protection call is remembered, and none is tried again.
+///
+/// No jump can land inside the three bytes: they are one instruction the
+/// title's compiler wrote, and a jump into its middle would decode as
+/// another (`01 fa` is `add edx, edi`).
+unsafe fn rewrite_wait(at: usize, mwait: bool) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static REWRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROTECT_FAILED: AtomicBool = AtomicBool::new(false);
+    let (was, to) = if mwait { (MWAITX, PAUSE_NOP) } else { (MONITORX, NOP3) };
+    let line_start = at & !63;
+    if at + 3 > line_start + 64 || PROTECT_FAILED.load(Ordering::Relaxed) {
+        return false;
+    }
+    let _alone = REWRITING.lock().unwrap_or_else(|e| e.into_inner());
+    // The eight bytes inside the line that cover the three.
+    let word = at.min(line_start + 56);
+    let shift = at - word;
+    let page = at & !0xfff;
+    let mut old = 0u32;
+    // SAFETY: the page of the instruction the CPU just refused: mapped, and
+    // executable, so made writable (the title's code, which nothing of ours
+    // uses as data).
+    if unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        PROTECT_FAILED.store(true, Ordering::Relaxed);
+        return false;
+    }
+    let mut done = false;
+    for _ in 0..8 {
+        // SAFETY: eight readable bytes inside the page, now writable.
+        let now = unsafe { (word as *const u64).read_unaligned() }.to_le_bytes();
+        if now[shift..shift + 3] == to {
+            done = true;
+            break;
+        }
+        if now[shift..shift + 3] != was {
+            break; // not the instruction that was refused: leave it
+        }
+        let mut new = now;
+        new[shift..shift + 3].copy_from_slice(&to);
+        // SAFETY: as above; the exchange writes the eight bytes back whole.
+        if unsafe { compare_exchange(word as *mut u64, u64::from_le_bytes(now), u64::from_le_bytes(new)) } {
+            REWRITTEN[usize::from(mwait)].fetch_add(1, Ordering::Relaxed);
+            done = true;
+            break;
+        }
+    }
+    let mut restored = 0u32;
+    // SAFETY: the page as it was.
+    unsafe {
+        VirtualProtect(page as *const _, 0x1000, old, &mut restored);
+        if done {
+            FlushInstructionCache(GetCurrentProcess(), at as *const _, 3);
+        }
+    }
+    done
+}
+
+/// `lock cmpxchg` of eight bytes at `at` (inside one cache line, so atomic
+/// even if not aligned): whether `current` was there and `new` is now.
+unsafe fn compare_exchange(at: *mut u64, current: u64, new: u64) -> bool {
+    let swapped: u8;
+    // SAFETY: the caller's eight writable bytes inside a cache line.
+    unsafe {
+        std::arch::asm!(
+            "lock cmpxchg qword ptr [{at}], {new}",
+            "sete {swapped}",
+            at = in(reg) at,
+            new = in(reg) new,
+            swapped = out(reg_byte) swapped,
+            inout("rax") current => _,
+            options(nostack),
+        );
+    }
+    swapped != 0
+}
+
+/// The console's wait instructions the CPU refused, by address: the address
+/// (bit 63: an `mwaitx`; 0: the slot is free) and the faults since the last
+/// line ([`wait_fault_line`]).
+struct WaitSlot {
+    at: AtomicUsize,
+    hits: AtomicU64,
+}
+
+const WAIT_SLOTS: usize = 256;
+static WAITS: [WaitSlot; WAIT_SLOTS] =
+    [const { WaitSlot { at: AtomicUsize::new(0), hits: AtomicU64::new(0) } }; WAIT_SLOTS];
+/// Faults at addresses that did not fit in [`WAITS`] (since the last line),
+/// and the instructions rewritten so far: `monitorx`, `mwaitx`.
+static WAITS_LOST: AtomicU64 = AtomicU64::new(0);
+static REWRITTEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Counts a fault at the wait instruction at `at`. No lock and no
+/// allocation: the exception handler takes this on any thread.
+fn count_wait(at: usize, mwait: bool) {
+    let tag = at | (usize::from(mwait) << 63);
+    let mut i = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) % WAIT_SLOTS;
+    for _ in 0..WAIT_SLOTS {
+        let slot = &WAITS[i];
+        let mut seen = slot.at.load(Ordering::Relaxed);
+        if seen == 0 {
+            seen = match slot.at.compare_exchange(0, tag, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => tag,
+                Err(other) => other,
+            };
+        }
+        if seen == tag {
+            slot.hits.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        i = (i + 1) % WAIT_SLOTS;
+    }
+    WAITS_LOST.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The frame line for the console's wait instructions: how many faults they
+/// took per frame since the last line, at how many addresses, and which
+/// addresses took the most. `None` while there were none. For the frame
+/// lines of the layer (`victory_gpu::add_frame_line_source`).
+pub fn wait_fault_line(frames: f64) -> Option<String> {
+    let mut seen: Vec<(usize, u64)> = Vec::new();
+    for slot in &WAITS {
+        let hits = slot.hits.swap(0, Ordering::Relaxed);
+        if hits != 0 {
+            seen.push((slot.at.load(Ordering::Relaxed), hits));
+        }
+    }
+    let lost = WAITS_LOST.swap(0, Ordering::Relaxed);
+    let total: u64 = seen.iter().map(|(_, hits)| hits).sum::<u64>() + lost;
+    if total == 0 {
+        return None;
+    }
+    seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
+    let top: Vec<String> = seen
+        .iter()
+        .take(4)
+        .map(|&(tag, hits)| {
+            format!(
+                "{} at {:#x}: {:.0}",
+                if tag >> 63 != 0 { "mwaitx" } else { "monitorx" },
+                tag & !(1 << 63),
+                hits as f64 / frames
+            )
+        })
+        .collect();
+    let [monitorx, mwaitx] = [0, 1].map(|i| REWRITTEN[i].load(Ordering::Relaxed));
+    Some(format!(
+        "the console's wait instructions the CPU refused, taken by an exception each, per frame: {:.0} at {} addresses ({}); \
+         VICTORY_REWRITE_WAITS=1 rewrites them in place ({monitorx} monitorx and {mwaitx} mwaitx rewritten so far, {:?})",
+        total as f64 / frames,
+        seen.len(),
+        top.join(", "),
+        rewrite_waits()
+    ))
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -1640,5 +1873,191 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
+    }
+
+    /// A page of ours, as a title's code page is: readable and executable,
+    /// not writable, holding `code` at `at`.
+    unsafe fn code_page(code: &[u8], at: usize) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
+        };
+        // SAFETY: a page of ours, written before it is made executable.
+        unsafe {
+            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+            assert!(!page.is_null());
+            // Something else than zeros around: a byte that is touched shows.
+            for i in 0..0x1000 {
+                page.add(i).write((i as u8).wrapping_mul(7) | 1);
+            }
+            page.add(at).copy_from_nonoverlapping(code.as_ptr(), code.len());
+            let mut old = 0;
+            assert_ne!(VirtualProtect(page.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
+            page
+        }
+    }
+
+    fn protection(page: *mut u8) -> u32 {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // SAFETY: a plain query of a page of ours.
+        unsafe {
+            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page.cast(), &mut info, size_of::<MEMORY_BASIC_INFORMATION>()), 0);
+            info.Protect
+        }
+    }
+
+    fn free(page: *mut u8) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: a page the test made.
+        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_REWRITE_WAITS`: the three bytes are the new instruction
+    /// wherever they lie in a cache line, nothing else changes, and the page
+    /// has the protection it had.
+    #[test]
+    fn a_wait_instruction_is_rewritten_in_place_and_nothing_else_is() {
+        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
+        for mwait in [false, true] {
+            let (was, to) = if mwait { (MWAITX, PAUSE_NOP) } else { (MONITORX, NOP3) };
+            for at in [0usize, 1, 5, 40, 55, 56, 57, 58, 59, 60, 61, 64, 120, 125, 0x7c0 + 61] {
+                // SAFETY: a page of ours; the rewrite touches three bytes.
+                unsafe {
+                    let page = code_page(&was, at);
+                    let before: Vec<u8> = (0..0x1000).map(|i| page.add(i).read()).collect();
+                    let address = page as usize + at;
+                    assert!(rewrite_wait(address, mwait), "at {at}");
+                    let after: Vec<u8> = (0..0x1000).map(|i| page.add(i).read()).collect();
+                    assert_eq!(after[at..at + 3], to, "at {at}");
+                    for i in (0..0x1000).filter(|i| !(at..at + 3).contains(i)) {
+                        assert_eq!(after[i], before[i], "byte {i} changed, rewriting at {at}");
+                    }
+                    assert_eq!(protection(page), PAGE_EXECUTE_READ, "at {at}");
+                    // Done already (by another thread that took the same
+                    // exception): it stays done, and nothing else is written.
+                    assert!(rewrite_wait(address, mwait));
+                    free(page);
+                }
+            }
+        }
+    }
+
+    /// Three bytes that cross a cache line are not rewritten (no atomic
+    /// write covers them), nor bytes that are not the instruction.
+    #[test]
+    fn a_wait_instruction_across_a_line_or_not_there_is_left_alone() {
+        for at in [62usize, 63, 126, 127] {
+            // SAFETY: a page of ours.
+            unsafe {
+                let page = code_page(&MWAITX, at);
+                assert!(!rewrite_wait(page as usize + at, true), "at {at}");
+                assert_eq!(page.add(at).cast::<[u8; 3]>().read(), MWAITX);
+                free(page);
+            }
+        }
+        // An mwaitx where a monitorx was refused, and the reverse.
+        // SAFETY: a page of ours.
+        unsafe {
+            let page = code_page(&MWAITX, 8);
+            assert!(!rewrite_wait(page as usize + 8, false));
+            assert_eq!(page.add(8).cast::<[u8; 3]>().read(), MWAITX);
+            free(page);
+            let page = code_page(&MONITORX, 8);
+            assert!(!rewrite_wait(page as usize + 8, true));
+            assert_eq!(page.add(8).cast::<[u8; 3]>().read(), MONITORX);
+            free(page);
+        }
+    }
+
+    /// The rewritten instructions run on the CPU as they are, change no
+    /// register the title's loop uses (rax, rcx, rdx, the flags) and
+    /// return: this is what the exception path would have done, without it.
+    #[test]
+    fn the_rewritten_wait_instructions_run_and_change_no_register() {
+        for (code, mwait) in [(MONITORX, false), (MWAITX, true)] {
+            let program = [code[0], code[1], code[2], 0xc3]; // the instruction, ret
+            // SAFETY: a page of ours; after the rewrite the code is a nop or
+            // a pause, then ret.
+            unsafe {
+                let page = code_page(&program, 0x80);
+                let at = page as usize + 0x80;
+                assert!(rewrite_wait(at, mwait));
+                let (rax, rcx, rdx): (u64, u64, u64);
+                let flags: u64;
+                std::arch::asm!(
+                    "xor r10, r10",
+                    "cmp r10, 1", // sets the carry flag and others
+                    "call r9",
+                    "pushfq",
+                    "pop r8",
+                    in("r9") at,
+                    out("r8") flags,
+                    inout("rax") 0x1111_2222_3333_4444u64 => rax,
+                    inout("rcx") 0x5555_6666_7777_8888u64 => rcx,
+                    inout("rdx") 0x9999_aaaa_bbbb_ccccu64 => rdx,
+                    out("r10") _,
+                    clobber_abi("C"),
+                );
+                assert_eq!((rax, rcx, rdx), (0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_ccccu64));
+                assert_eq!(flags & u64::from(CMP_FLAGS), u64::from(cmp_flags(0, 1)));
+                free(page);
+            }
+        }
+    }
+
+    /// The emulation, given the exception of a wait instruction: with the
+    /// rewrite it leaves `Rip` where it was (the CPU runs the new bytes);
+    /// without it, or when it cannot rewrite, it skips the instruction.
+    #[test]
+    fn a_refused_wait_instruction_is_rewritten_or_skipped() {
+        for (code, mwait) in [(MONITORX, false), (MWAITX, true)] {
+            for (rewrite, rewritten) in [
+                (Rewrite::Off, false),
+                (Rewrite::Monitor, !mwait),
+                (Rewrite::Both, true),
+            ] {
+                // SAFETY: a page of ours; a record and a context of zeros.
+                unsafe {
+                    let page = code_page(&code, 0x100);
+                    let at = page as u64 + 0x100;
+                    let mut record: EXCEPTION_RECORD = std::mem::zeroed();
+                    record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
+                    let mut context: CONTEXT = std::mem::zeroed();
+                    context.Rip = at;
+                    let mut pointers = EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: &mut context };
+                    assert!(emulate_amd_only_as(&mut pointers, rewrite));
+                    let bytes = page.add(0x100).cast::<[u8; 3]>().read();
+                    if rewritten {
+                        assert_eq!(context.Rip, at, "{rewrite:?}, mwaitx {mwait}: the new bytes run from here");
+                        assert_eq!(bytes, if mwait { PAUSE_NOP } else { NOP3 });
+                    } else {
+                        assert_eq!(context.Rip, at + 3, "{rewrite:?}, mwaitx {mwait}: skipped");
+                        assert_eq!(bytes, code);
+                    }
+                    free(page);
+                }
+            }
+        }
+    }
+
+    /// The faults are counted per address and kind, a line names the busiest,
+    /// and what it counted is not counted again.
+    #[test]
+    fn faults_at_wait_instructions_are_counted_by_address() {
+        // An address no instruction of a test lies at.
+        let (monitor, mwait) = (0x7ff0_dead_0040usize, 0x7ff0_dead_0080usize);
+        for _ in 0..7000 {
+            count_wait(monitor, false);
+        }
+        for _ in 0..6000 {
+            count_wait(mwait, true);
+        }
+        let line = wait_fault_line(2.0).expect("a line for what was counted");
+        assert!(line.contains("monitorx at 0x7ff0dead0040: 3500"), "{line}");
+        assert!(line.contains("mwaitx at 0x7ff0dead0080: 3000"), "{line}");
+        // Taken: the same addresses count from zero.
+        count_wait(monitor, false);
+        let line = wait_fault_line(1.0).expect("a line");
+        assert!(line.contains("monitorx at 0x7ff0dead0040: 1,") || line.contains("monitorx at 0x7ff0dead0040: 1)"), "{line}");
     }
 }

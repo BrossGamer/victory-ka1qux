@@ -4817,6 +4817,16 @@ fn declare_once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
 }
 
+/// Lines other crates add to the frame lines: each is given the frames since
+/// the last one and says its line, or nothing.
+static LINE_SOURCES: Mutex<Vec<fn(f64) -> Option<String>>> = Mutex::new(Vec::new());
+
+/// Adds a source of a frame line (called once a second with the frames since
+/// the last, as the other counters are).
+pub fn add_frame_line_source(source: fn(f64) -> Option<String>) {
+    LINE_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).push(source);
+}
+
 /// With `VICTORY_DECLARE_ONCE=1`, since the last frame-rate line: ranges
 /// declared written and recorded, and those left out for being declared
 /// already ([`HostList::defer_gpu_write`]).
@@ -9993,6 +10003,11 @@ impl Meter {
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
                     if join_copies() { "on" } else { "off" }
                 );
+            }
+        }
+        for source in LINE_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            if let Some(line) = source(frames) {
+                tracing::info!("{line}");
             }
         }
         #[cfg(feature = "diagnostics")]
