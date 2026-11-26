@@ -907,7 +907,8 @@ fn meeting_mode() -> u32 {
 /// there: before the exit of an all-lane block into a region with LDS accesses, and at the
 /// start of an all-lane block entered from one. Accesses in all-lane blocks get their own
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
-/// joined without an all-lane block between them): refused.
+/// joined without an all-lane block between them): refused, unless the region only raises a
+/// flag ([`super::lds_flags`]).
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
@@ -955,8 +956,15 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             }
         }
     }
-    if (0..n).any(|r| reads[r] && writes[r]) {
-        return None;
+    // A region that reads and writes LDS is still taken when it only raises a flag
+    // (`lds_flags`): a read that misses the other host wave's write changes nothing the region
+    // leaves behind.
+    let flags_on = super::lds_flags::on();
+    for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
+        let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        if !(flags_on && super::lds_flags::lds_flag_region(p, st, &blocks)) {
+            return None;
+        }
     }
     let mut meet = vec![(false, false); n];
     for b in 0..n {

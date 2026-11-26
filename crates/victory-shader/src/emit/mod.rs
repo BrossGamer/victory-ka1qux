@@ -147,6 +147,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lane_uniform;
+mod lds_flags;
 mod lower;
 #[cfg(all(test, windows))]
 mod cbv_subdword_tests;

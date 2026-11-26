@@ -1362,19 +1362,19 @@ const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
 }
 
 /// DS `op vdst, addr, data0` at offset 0.
-const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
+pub(super) const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
     [
         0x36 << 26 | (op as u32) << 18,
         (vdst as u32) << 24 | (data0 as u32) << 8 | addr as u32,
     ]
 }
 
-const DS_WRITE_B32: u8 = 0x0D;
+pub(super) const DS_WRITE_B32: u8 = 0x0D;
 const DS_MIN_F32: u8 = 0x12;
 const DS_MAX_F32: u8 = 0x13;
 const DS_MIN_RTN_F32: u8 = 0x32;
 const DS_MAX_RTN_F32: u8 = 0x33;
-const DS_READ_B32: u8 = 0x36;
+pub(super) const DS_READ_B32: u8 = 0x36;
 
 /// What RDNA2 writes for `ds_max_f32` / `ds_min_f32` over a dword holding
 /// `old` with `data` (bits), as measured on gfx1036 with f32 denormals kept:
