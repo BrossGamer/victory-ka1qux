@@ -103,6 +103,8 @@ pub use bake_probe::{
     Writer as BakeProbeWriter, dstorage_tag as bake_probe_dstorage_tag, note as bake_probe_note,
     note_signal as bake_probe_dstorage_signal, probe_on as bake_probe_on,
 };
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use copystat::add_memory_lines;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
