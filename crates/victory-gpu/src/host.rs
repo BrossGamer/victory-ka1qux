@@ -2213,6 +2213,36 @@ fn rehash_runs() -> bool {
     }
 }
 
+/// Whether the list that brings copies in the card's memory up to date
+/// records its work in three steps over all the copies: every changed range
+/// copied up, then every state change in one call, then every hash pass with
+/// the pipeline bound once (`VICTORY_CARD_SYNC_BATCH=1`; off by default: copy
+/// by copy, each with its copies, its state change and its hash passes).
+///
+/// Copy by copy, the card went from copying to compute and back for every
+/// copy of the list: about 300 times a frame with every title buffer's copy in
+/// the card's memory (`VICTORY_CARD_BUFFERS_MIN_KB=64`), where the
+/// send-and-hash lists took 24 to 32 ms of the card a frame for 28 MB sent up
+/// and 600 pieces hashed, and 5 to 9 ms in three steps (an RTX 3090 Ti, fork
+/// pull request #1227). Nothing a hash pass reads is written by a later copy
+/// of the list: each copy's ranges and pieces are its own buffer's. The same
+/// copies, state changes and hash passes are recorded either way, and the
+/// frame line's "send-and-hash lists" card time (`crate::cardmeter`) shows
+/// the difference.
+fn sync_batched() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_SYNC_BATCH").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "the list that brings copies in the card's memory up to date records every copy, then every state \
+                 change, then every hash pass (VICTORY_CARD_SYNC_BATCH=1)"
+            );
+        }
+        on
+    })
+}
+
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists.
@@ -5577,6 +5607,66 @@ impl Host {
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    // With `VICTORY_CARD_SYNC_BATCH=1` in three steps over
+                    // all the copies ([`sync_batched`]): every changed range
+                    // copied up, then every state change in one call, then
+                    // every hash pass; else copy by copy, as before.
+                    struct Synced<'a> {
+                        shadow: &'a Arc<crate::shadow::Shadow>,
+                        ranges: &'a [(usize, usize)],
+                        before: Option<ID3D12Resource>,
+                        size: u64,
+                    }
+                    let batched = sync_batched();
+                    let mut synced: Vec<Synced> = Vec::with_capacity(dirty.len());
+                    // No twin (it cost the card the copy's size again, 399 MB
+                    // in run 75): `before` holds a 128-bit hash of each 64 KiB
+                    // piece. The pieces just sent up are hashed again, all of
+                    // them the first time; the compare after the lists hashes
+                    // the declared pieces and flags those whose hash is another.
+                    let hashes = |list: &ID3D12GraphicsCommandList, group: &[Synced]| {
+                        // (a copy promoted the buffer to a copy destination)
+                        let moves: Vec<_> = group
+                            .iter()
+                            .filter(|w| w.before.is_some() && !w.ranges.is_empty())
+                            .map(|w| {
+                                transition(
+                                    &w.shadow.buffer,
+                                    D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                )
+                            })
+                            .collect();
+                        if !moves.is_empty() {
+                            list.ResourceBarrier(&moves);
+                        }
+                        let mut bound = false;
+                        for w in group {
+                            let Some(before) = &w.before else {
+                                continue;
+                            };
+                            if !bound {
+                                bound = true;
+                                list.SetComputeRootSignature(&work.root);
+                                list.SetPipelineState(&work.pso);
+                                list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                            }
+                            list.SetComputeRootShaderResourceView(1, w.shadow.buffer.GetGPUVirtualAddress());
+                            list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                            let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, w.shadow)) {
+                                vec![w.shadow.card_run(0, usize::MAX)]
+                            } else {
+                                w.ranges.iter().map(|&(a, b)| w.shadow.card_run(a, b)).collect()
+                            };
+                            // The same pieces in fewer passes (`rehash_runs`).
+                            let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                            CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                            CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                            for run in runs {
+                                dispatch_card_compare(list, run.first, run.skew, w.size as u32, run.pieces, 0, 0);
+                            }
+                        }
+                    };
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -5590,39 +5680,14 @@ impl Host {
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
-                        let Some(before) = before else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
+                        synced.push(Synced { shadow, ranges, before, size });
+                        if !batched {
+                            // As before: this copy's hash passes behind its copies.
+                            hashes(list, &synced[synced.len() - 1..]);
                         }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            dispatch_card_compare(list, run.first, run.skew, size as u32, run.pieces, 0, 0);
-                        }
+                    }
+                    if batched {
+                        hashes(list, &synced);
                     }
                     crate::cardmeter::end(list, timed);
                     list.Close()?;
@@ -11283,6 +11348,122 @@ void main() {
             assert_eq!(up, second.held[0].load(Ordering::Relaxed), "the direct queue waits for every send");
         } else {
             eprintln!("queue2_tests: the direct queue alone (late {}, relay {})", late(), relay());
+        }
+        drop(lists);
+    }
+
+    /// Two copies in the card's memory in every list, each with its own
+    /// title bytes going up and its own shader writes coming back: what
+    /// `VICTORY_CARD_SYNC_BATCH=1` records in three steps over the copies
+    /// (their ranges, one state change, their hash passes) must leave the
+    /// same title memory as copy by copy.
+    #[test]
+    fn warp_several_copies_in_the_card_go_up_and_come_back_whatever_the_order() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        let Some(host) = host() else {
+            return;
+        };
+        // Never on a real card.
+        // SAFETY: a plain query.
+        let software = host
+            .adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0);
+        if !software {
+            eprintln!("queue2_tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)");
+            return;
+        }
+        const PIECE: usize = 64 << 10;
+        const LEN: usize = 4 << 20;
+        const ROUNDS: usize = 8;
+        const COPIES: usize = 3;
+        let mut titles_memory = Vec::new();
+        let mut shadows = Vec::new();
+        for c in 0..COPIES {
+            // "Title memory": write-watched, as the title's is.
+            // SAFETY: a plain allocation of our own.
+            let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
+            assert!(!title.is_null());
+            for i in 0..LEN / 4 {
+                // SAFETY: inside the allocation.
+                unsafe { title.add(i * 4).cast::<u32>().write_volatile(0x5A00_0000 | (c as u32) << 20 | i as u32) };
+            }
+            crate::shadow::register(0x52_5200 + c, title as u64, LEN as u64);
+            let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
+            if !shadow.carded() {
+                eprintln!("queue2_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+                return;
+            }
+            titles_memory.push(title as usize);
+            shadows.push(shadow);
+        }
+        let dword = |c: usize, at: usize| (titles_memory[c] + at) as *mut u32;
+        let code = compile(ADD, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
+        // SAFETY: the shader's own root signature; plain creation.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: code.as_ptr().cast(),
+                        BytecodeLength: code.len(),
+                    },
+                    ..Default::default()
+                })
+                .expect("a pipeline");
+            (root, pso)
+        };
+        // Round k, copy c: the title writes a dword in piece 1+k; the
+        // submission's shader adds k + c to it and stores the sum in piece
+        // 30+k, a range declared as shader-written.
+        let from = |k: usize| (1 + k) * PIECE + 4 * k + 64;
+        let to = |k: usize| (30 + k) * PIECE + 8 * k + 128;
+        let written = |c: usize, k: usize| 0x0100_0000 + 0x1000 * k as u32 + 0x100_0000 * c as u32 + 7;
+        let mut lists = Vec::new();
+        for k in 0..ROUNDS {
+            let list = host.new_list().expect("a host list");
+            for (c, shadow) in shadows.iter().enumerate() {
+                // SAFETY: inside the allocation.
+                unsafe { dword(c, from(k)).write_volatile(written(c, k)) };
+                shadow.refresh(&list, titles_memory[c] as u64, LEN as u64);
+                shadow.gpu_writes(&list, (titles_memory[c] + (30 + k) * PIECE) as u64, PIECE as u64);
+                // SAFETY: an open list; the copy's buffer, with unordered
+                // access; the shader's own root signature.
+                unsafe {
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetPipelineState(&pso);
+                    let constants = [to(k) as u32, from(k) as u32, (k + c) as u32, 30_000];
+                    list.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                    list.list.SetComputeRootUnorderedAccessView(1, shadow.buffer.GetGPUVirtualAddress());
+                    list.list.Dispatch(1, 1, 1);
+                }
+            }
+            list.close();
+            if late() {
+                host.execute_own(&list);
+            } else {
+                host.execute(&[&list]);
+            }
+            lists.push(list);
+        }
+        settle_now(WHY_SYNC);
+        for c in 0..COPIES {
+            for k in 0..ROUNDS {
+                // SAFETY: inside the allocation.
+                let (sum, kept) = unsafe { (dword(c, to(k)).read_volatile(), dword(c, from(k)).read_volatile()) };
+                assert_eq!(kept, written(c, k), "copy {c} round {k}: the title's own dword changed");
+                assert_eq!(
+                    sum,
+                    written(c, k) + (k + c) as u32,
+                    "copy {c} round {k}: the shader read {:#x} where the title had written {:#x}, or its write did not come back",
+                    sum.wrapping_sub((k + c) as u32),
+                    written(c, k)
+                );
+            }
         }
         drop(lists);
     }
