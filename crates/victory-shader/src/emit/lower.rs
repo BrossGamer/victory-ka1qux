@@ -45,11 +45,6 @@ mod lighting_mul;
 #[path = "console_threads.rs"]
 mod console_threads;
 
-/// Constant buffers read as raw bytes (`VICTORY_PORT_CBV=1`, renderer port
-/// 5), a child module so it shares the emitter's state.
-#[path = "raw_constants.rs"]
-mod raw_constants;
-
 type Why = &'static str;
 
 /// What the dwords of a descriptor the host has no value for read as.
@@ -6252,14 +6247,7 @@ impl<'a> Lower<'a> {
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-            // Renderer port 5 (`VICTORY_PORT_CBV=1`): the slots marked as
-            // constant buffers hold raw views too, read as the buffers are.
-            let as_raw = super::shader::constants_raw();
-            let reads = match as_raw.then(|| self.slot_is_constant(src)).transpose()?.flatten() {
-                Some(is_constant) => self.s.m.bin(self.cur, Bin::Or, is_buffer, is_constant),
-                None => is_buffer,
-            };
-            let at = self.begin_guarded(Some(reads));
+            let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
             for k in 0..count {
@@ -6281,13 +6269,6 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            if as_raw {
-                // (Zeros for any other slot, as the guard of the marks says.)
-                for (k, x) in raw.into_iter().enumerate() {
-                    self.write(inst, Reg::S(code + k as u8), x, None);
-                }
-                return Ok(());
-            }
             // Only a slot marked as a constant buffer is read as one; any
             // other non-buffer gives zeros (`SLOT_STRIDE_CONSTANT`).
             let other = match self.slot_is_constant(src)? {
@@ -6327,15 +6308,6 @@ impl<'a> Lower<'a> {
                 );
                 let x = self.s.m.extract(c, r, 0);
                 let x = self.as_int(x);
-                self.write(inst, Reg::S(code + k as u8), x, None);
-            }
-            return Ok(());
-        }
-        // Renderer port 5 (`VICTORY_PORT_CBV=1`): raw bytes of the slot's
-        // raw view, or of the root SRV, where the constant buffer is a
-        // table's, the heap's or a root one.
-        if let Some(h) = self.constants_raw(site, src)? {
-            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -7243,10 +7215,6 @@ impl<'a> Lower<'a> {
         let biased = match kind {
             Some(ResourceType::Uav) => true,
             Some(ResourceType::Srv) => crate::spill::is_spilled(self.x.native),
-            // A root constant buffer read as a root SRV
-            // (`VICTORY_PORT_CBV=1`, `raw_constants`): its address is
-            // anywhere on 16 bytes, a raw view begins on 16.
-            Some(ResourceType::Cbv) | None => super::shader::constants_raw(),
             _ => false,
         };
         biased.then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
@@ -11886,14 +11854,7 @@ impl<'a> Lower<'a> {
             // (it gave the whole dword, and a value at any byte but the
             // first of its dword read the bytes before it as well; after
             // Marvisak/VIctory pull request 3008 by RVZO6).
-            // (Renderer port 5, `VICTORY_PORT_CBV=1`: raw bytes of the raw
-            // view or root SRV, at the dword that holds the byte, as the
-            // constant buffer read takes it.)
-            let raw = self.constants_raw(site, src)?;
-            let h = match raw {
-                Some(h) => h,
-                None => self.handle(site, src, false, (13, 0x1_0000))?,
-            };
+            let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11908,14 +11869,7 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let mut x = match raw {
-                    Some(_) => {
-                        let mask = self.s.m.i32(!3);
-                        let aligned = self.s.m.bin(c, Bin::And, a, mask);
-                        self.raw_dwords(h, aligned, 1)[0]
-                    }
-                    None => self.cbuffer_dword(h, a),
-                };
+                let mut x = self.cbuffer_dword(h, a);
                 if let Some((bits, signed)) = narrow {
                     x = self.extract_sub(x, a, bits, signed);
                 }

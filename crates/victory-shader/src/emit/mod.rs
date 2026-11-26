@@ -158,8 +158,6 @@ mod native16_tests;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
-#[cfg(all(test, windows))]
-mod raw_constants_tests;
 mod rect;
 #[cfg(all(test, windows))]
 mod resinfo_tests;
@@ -192,7 +190,7 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDE_CONSTANT, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES,
     USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_GROUP_BASE, USER_MEMORY_BASE, USER_STRUCTURES,
-    USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS, constant_marks, constants_raw,
+    USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS, constant_marks,
     set_view_heap_limit, view_heap_limit,
 };
 

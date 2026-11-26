@@ -44,40 +44,6 @@ pub fn constant_marks() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_none_or(|v| v != "0"))
 }
 
-#[cfg(test)]
-thread_local! {
-    /// For a test's thread alone: [`constants_raw`].
-    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
-/// Renderer port 5 (`VICTORY_PORT_CBV=1`; off by default): constant buffers are read as raw
-/// bytes, so the host can give the card the title's bytes where they are (16-byte aligned,
-/// which a constant buffer view cannot take) instead of a copy made at every submission.
-///
-/// - A table's constant buffer, and one picked from the view heap, is read through the raw
-///   view in its slot (a raw buffer, resource kind 11, in place of the constant buffer view
-///   the host made there; the host's slot must follow, see `victory-gpu`'s `port_cbv`).
-/// - A root one is read as the root SRV `t<slot>` in [`ROOT_CBV_SPACE`] (the host binds it as
-///   it binds any root SRV, from 16 bytes below the title's address, with the bias of
-///   [`USER_VIEW_BIAS`]).
-///
-/// A raw read through a constant buffer's view has no end on AMD (measured by avatarmanz), so
-/// the host never makes one: every constant buffer slot holds a raw view with an end.
-///
-/// Needs [`constant_marks`]: a slot picked from the heap is read as a constant buffer only
-/// where it is marked as one, and told from a texture's by the mark; without the marks the
-/// switch is off. Part of the translation: the shader cache keys on the switch (it is read
-/// here, so `translation_fingerprint` has its value). After avatarmanz/VIctory-7900XTX
-/// (GPL-3.0), "Renderer port 5" (`3920dc2`).
-pub fn constants_raw() -> bool {
-    #[cfg(test)]
-    if let Some(on) = CONSTANTS_RAW_HERE.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1") && constant_marks())
-}
-
 /// The root SRV `t<SLOT_VIEW_ADDRESSES>` in [`ROOT_CBV_SPACE`] of a shader
 /// that reads the address out of a buffer descriptor it picks from the view
 /// heap at an index it computes, and uses it as a pointer (the title's sun

@@ -117,28 +117,6 @@ avatarmanz/VIctory-7900XTX), `VICTORY_CARD_SYNC_BATCH=1` (victory-fork #1227),
 and victory-fork's main), `VICTORY_FILL_WORKERS` (upstream #2900) and
 `VICTORY_MARKS_THREADS` (upstream #2914).
 
-**Constant buffers read as raw bytes** (`VICTORY_PORT_CBV=1`; off by default, not
-measured on the test machine yet; it needs `VICTORY_CONSTANT_MARKS`, on by
-default, and gains what `VICTORY_PORT_CONSTANTS=1` lets it). The console takes a
-constant buffer anywhere on 16 bytes and D3D12's views begin on 256, so the layer
-copied every constant buffer a draw's tables name (some 22,000 a frame in the
-open world) into upload memory at each submission, and every root one not on 256
-bytes (64 KiB each). With the switch the translated shaders read them as raw
-bytes: a table's, and one a shader picks from the view heap, through the raw
-buffer view the host makes in that very slot, and a root one as a root SRV (bound
-from the 16 bytes below its address, the shader adding the rest). A table's
-constant buffer in title memory in place is a raw view of the title's bytes:
-nothing is copied and no step runs at submission. Others are copied as before and
-viewed in the copy, and a title slot's constant buffer record is a raw view too,
-which has an end where a raw read through a constant buffer view has none (AMD).
-Every translation changes, and the shader cache keys on the switch. The idea is
-avatarmanz/VIctory-7900XTX's "Renderer port 5" (GPL-3.0; `VICTORY_PORT_CBV_PLACE=0`
-copies again while reading raw); his tree keeps the constant buffer view in the
-slot and makes the raw view in a twin slot of another range of a larger heap,
-this one needs no twins. The frame-rate line "renderer port 5" says per frame
-what was given in place, what was copied and why, the root ones bound, and how
-many of the records the heap mirroring met were constant buffers.
-
 **The title's descriptor stores tell their slots** (`VICTORY_PORT_DESCRIPTORS=1`
 with `VICTORY_DESCRIPTORS_PROFILE`, or `[paths].descriptors_profile`; off by
 default, not measured on the test machine yet). The layer finds the descriptor

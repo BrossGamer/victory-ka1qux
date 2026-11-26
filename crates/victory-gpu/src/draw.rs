@@ -914,10 +914,7 @@ pub(crate) static TARGETS_SET: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2]
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
-/// `cbv`: the root view is a root SRV a constant buffer is read through
-/// (renderer port 5, `crate::port_cbv`): found and cut as a constant buffer
-/// is, taken as it is as a root SRV is (no copy).
-fn root_view(list: &HostList, address: u64, srv: bool, cbv: bool) -> Option<u64> {
+fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
         std::env::var("VICTORY_ROOT_VIEW_MB")
@@ -925,54 +922,17 @@ fn root_view(list: &HostList, address: u64, srv: bool, cbv: bool) -> Option<u64>
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let kind = if srv && !cbv { crate::shadow::RootKind::Srv } else { crate::shadow::RootKind::Cbv };
+    let kind = if srv { crate::shadow::RootKind::Srv } else { crate::shadow::RootKind::Cbv };
     let shadow = crate::shadow::find_root(address, kind)?;
     let len = shadow
         .left(address)
-        .min(if srv && !cbv { limit } else { 1 << 16 });
+        .min(if srv { limit } else { 1 << 16 });
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
     list.fill_root_cbv(address as *const u8, len, reuse_root_cbv()).map(|(gpu, _)| gpu)
-}
-
-/// Renderer port 5 (`VICTORY_PORT_CBV=1`): whether the root parameter `slot`
-/// of the stage `t` is a constant buffer the shader reads as a root SRV.
-fn cbv_as_srv(t: &crate::pipeline::Translated, slot: u8) -> bool {
-    crate::port_cbv::on() && t.used.iter().any(|u| u.root == RootType::Descriptor && u.slot == slot && u.kind == ResourceType::Cbv)
-}
-
-/// Renderer port 5 (`VICTORY_PORT_CBV=1`, `crate::port_cbv`): makes the
-/// dynamic slot `index` of `host` a raw view of the table's constant buffer
-/// of `size` bytes at `address`, nothing of it copied where the title's
-/// memory is in place and on 16 bytes of its buffer (the card reads the
-/// bytes where the title wrote them), else copied into the list's upload
-/// memory at submission as before and viewed there. False if there is no
-/// room for the copy.
-fn table_constant_raw(list: &HostList, host: &crate::descriptor::host::HostHeap, index: u32, address: u64, size: u32) -> bool {
-    let bytes = crate::port_cbv::view_bytes(size);
-    let mut unaligned = false;
-    if crate::port_cbv::in_place_on()
-        && let Some(shadow) = crate::shadow::find_placed(address, u64::from(size))
-    {
-        let offset = shadow.offset(address);
-        if crate::port_cbv::raw_ok(offset) {
-            host.raw_at(index, &shadow.buffer, offset, bytes.min(shadow.left(address)));
-            crate::port_cbv::in_place(size);
-            return true;
-        }
-        unaligned = true;
-    }
-    crate::port_cbv::copied(unaligned);
-    let staged = crate::descriptor::constant_staging_bytes(size);
-    let Some((_, to, Some((buffer, at)))) = list.scratch_in(u64::from(staged), true) else {
-        return false;
-    };
-    list.defer_fill(to, address as *const u8, staged as usize);
-    host.raw_at(index, &buffer, at, bytes);
-    true
 }
 
 /// Whether repeated bindings of the same unaligned root constant buffer view
@@ -1341,22 +1301,6 @@ impl State {
         }
     }
 
-    /// The bytes a root constant buffer's raw view begins early by
-    /// (`victory_shader::emit::USER_VIEW_BIAS`, renderer port 5): found as
-    /// [`root_view`] and [`State::root_srv_table`] find the copy, with no
-    /// ask without a length (`host_word` makes one, a 4 MiB window of the
-    /// memory for each root constant buffer address).
-    fn root_cbv_bias(&self, compute: bool, slot: u8) -> u32 {
-        match self.roots_ref(compute).get(usize::from(slot)) {
-            Some(&Root::View(address)) => crate::shadow::find_root(address, crate::shadow::RootKind::Cbv).map_or(0, |s| {
-                // SAFETY: a live buffer.
-                let base = unsafe { s.buffer.GetGPUVirtualAddress() };
-                ((s.gpu(address) - base) & 15) as u32
-            }),
-            _ => 0,
-        }
-    }
-
     /// A user-data dword the host computes for a translated shader
     /// (`victory_shader::emit::USER_MEMORY_BASE`, `USER_VIEW_ADDRESS`).
     fn host_word(
@@ -1682,11 +1626,8 @@ impl State {
                 };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
-                        values[u.index as usize] = if kind == victory_shader::emit::USER_VIEW_BIAS && cbv_as_srv(t, u.slot) {
-                            self.root_cbv_bias(compute, u.slot)
-                        } else {
-                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref())
-                        };
+                        values[u.index as usize] =
+                            self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
                         continue;
                     }
                     let fresh = made
@@ -1820,14 +1761,11 @@ impl State {
                         continue;
                     }
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
-                    // Renderer port 5: a root constant buffer the shader
-                    // reads as a root SRV (`VICTORY_PORT_CBV=1`).
-                    let cbv = srv && cbv_as_srv(t, slot);
                     let Some(&Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
                     else {
                         once!(slot, "a shader reads a root view the title did not set");
                         // A table left unset is undefined: a null view.
-                        if tabled && !self.root_srv_table(list, None, param, compute, false, cbv) {
+                        if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
                         }
                         continue;
@@ -1839,20 +1777,22 @@ impl State {
                                 && u.root == RootType::Other(victory_shader::emit::USER_VIEW_BIAS)
                         });
                     if tabled {
-                        if !self.root_srv_table(list, Some(address), param, compute, biased, cbv) {
+                        if !self.root_srv_table(list, Some(address), param, compute, biased) {
                             return false;
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv, cbv) else {
+                    let Some(mut gpu) = root_view(list, address, srv) else {
                         continue;
                     };
                     if biased {
-                        gpu -= u64::from(if cbv {
-                            self.root_cbv_bias(compute, slot)
-                        } else {
-                            self.host_word(compute, victory_shader::emit::USER_VIEW_BIAS, slot, 0, None)
-                        });
+                        gpu -= u64::from(self.host_word(
+                            compute,
+                            victory_shader::emit::USER_VIEW_BIAS,
+                            slot,
+                            0,
+                            None,
+                        ));
                     }
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -2081,7 +2021,6 @@ impl State {
         param: u32,
         compute: bool,
         biased: bool,
-        cbv: bool,
     ) -> bool {
         let heap = match self.heaps[0] {
             0 => None,
@@ -2091,21 +2030,17 @@ impl State {
             once!("a root SRV without a bound view heap: the draw is dropped");
             return false;
         };
-        // A view that begins early is another view than one that does not,
-        // and a constant buffer's (cut at 64 KiB) another than a root SRV's
-        // (title addresses stay below bit 62).
+        // A view that begins early is another view than one that does not
+        // (title addresses stay below bit 63).
         let key = (
             std::ptr::from_ref(heap) as usize,
-            address.unwrap_or(0) | u64::from(biased) << 63 | u64::from(cbv) << 62,
+            address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        // (Renderer port 5: a root constant buffer read as a root SRV is
-        // found and cut as a constant buffer is.)
-        let (kind, most) = if cbv { (crate::shadow::RootKind::Cbv, 1 << 16) } else { (crate::shadow::RootKind::Srv, u64::MAX) };
-        self.forget_moved_root(false, key, || address.and_then(|a| crate::shadow::find_root(a, kind)));
+        self.forget_moved_root(false, key, || address.and_then(|a| crate::shadow::find_root(a, crate::shadow::RootKind::Srv)));
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find_root(a, kind).map(|s| (a, s)));
+                let shadow = address.and_then(|a| crate::shadow::find_root(a, crate::shadow::RootKind::Srv).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
@@ -2117,16 +2052,13 @@ impl State {
                         // SAFETY: a live buffer.
                         let base = unsafe { s.buffer.GetGPUVirtualAddress() };
                         let offset = s.gpu(*a) - base;
-                        if cbv {
-                            crate::port_cbv::root_bound();
-                        }
                         if biased {
                             // From the 16 bytes below; the shader adds the
                             // rest (`victory_shader::emit::USER_VIEW_BIAS`).
                             let bias = offset & 15;
-                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a).min(most) + bias);
+                            host.raw_at(index, &s.buffer, offset - bias, s.left(*a) + bias);
                         } else if offset.is_multiple_of(16) {
-                            host.raw_at(index, &s.buffer, offset, s.left(*a).min(most));
+                            host.raw_at(index, &s.buffer, offset, s.left(*a));
                         } else {
                             // Raw views start on 16 bytes; one from the
                             // aligned start would shift every read.
@@ -2146,7 +2078,7 @@ impl State {
         // buffer is brought up to date. The first 1 MiB only left what lay
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
-            s.refresh(list, *a, s.left(*a).min(most));
+            s.refresh(list, *a, s.left(*a));
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -4138,15 +4070,6 @@ impl State {
                 let made_already = listed.is_some();
                 match listed.or_else(|| crate::descriptor::view(handle)) {
                     Some(View::Constant(address, size)) => {
-                        // Renderer port 5 (`VICTORY_PORT_CBV=1`): the slot a
-                        // raw view of the bytes, where the title has them
-                        // or in a copy of them.
-                        if crate::port_cbv::on() {
-                            if !table_constant_raw(list, host, index, address, size) {
-                                host.null_raw_at(index);
-                            }
-                            continue;
-                        }
                         let size = crate::descriptor::constant_staging_bytes(size);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
@@ -4183,13 +4106,7 @@ impl State {
                         }
                     }
                     None => {
-                        // (Renderer port 5: a constant buffer is read as raw
-                        // bytes, through a null raw view here.)
-                        if crate::port_cbv::on() && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                            host.null_raw_at(index);
-                        } else {
-                            host.make_null(index);
-                        }
+                        host.make_null(index);
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
