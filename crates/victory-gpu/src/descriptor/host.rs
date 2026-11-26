@@ -2371,21 +2371,37 @@ impl HostHeap {
                 counts[4] += 1;
                 continue;
             }
-            let (claim, against) = {
+            let (claim, against, bytes) = {
                 let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
                 let Some(bytes) = placed.bytes(&resource, crate::resource::first_mip(&desc)) else {
                     continue;
                 };
-                placed.claim(index, start, start.saturating_add(bytes), &resource)
+                let (claim, against) = placed.claim(index, start, start.saturating_add(bytes), &resource);
+                (claim, against, bytes)
             };
             counts[5 + claim as usize] += 1;
             counts[9] += u64::from(other);
             static SAID: [std::sync::atomic::AtomicU32; 4] = [const { std::sync::atomic::AtomicU32::new(0) }; 4];
-            if SAID[claim as usize].fetch_add(1, Relaxed) < 12 {
+            // `VICTORY_SWEEP_SAY=<n>`: how many of each kind are described,
+            // 12 unless said: a black surface that nothing brings a texture
+            // to is one of these (a slot that shows nothing or another
+            // view, whose memory is there and which is in no queue).
+            // `VICTORY_SWEEP_SAY_KB=<n>`: only views of at least this many
+            // KiB (the first of each kind were views of a few bytes, which
+            // nothing draws large): 0 unless said.
+            static SAY: std::sync::OnceLock<(u32, u64)> = std::sync::OnceLock::new();
+            let (say, say_kb) = *SAY.get_or_init(|| {
+                let number = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+                (number("VICTORY_SWEEP_SAY").map_or(12, |n| n as u32), number("VICTORY_SWEEP_SAY_KB").unwrap_or(0))
+            });
+            if bytes >= say_kb << 10 && SAID[claim as usize].fetch_add(1, Relaxed) < say {
                 let (width, height, format) = (resource[4], resource[6], resource[8]);
+                // How much of the memory is there now (the look is a
+                // kernel read per page, and only for what is described).
+                let mapped = crate::texture::mapped_bytes(start as *const u8, bytes as usize);
                 tracing::info!(
-                    "a texture view nothing brings up to date: slot {index}, {claim:?}, {width}x{height} f{format} \
-                     mips {} at {start:#x}, shows {}; against {against:x?}; its view {:x?}",
+                    "a texture view nothing brings up to date: slot {index}, frame {frame}, {claim:?}, {width}x{height} f{format} \
+                     mips {} at {start:#x} ({bytes} bytes, {mapped} mapped), shows {}; against {against:x?}; its view {:x?}",
                     resource[7] >> 16,
                     if other { "another view" } else { "nothing" },
                     &desc[..10]

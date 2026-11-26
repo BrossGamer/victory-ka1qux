@@ -295,15 +295,31 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
+    // A read of the texture the host wrote that is not made by a copy sees
+    // the bytes title memory holds, which are not what was written: said
+    // for the first few, with why.
+    let refused = |why: &str| {
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+            tracing::warn!(
+                view = ?placed,
+                texture = ?source,
+                why,
+                "a view placed in the memory of a texture the host writes, in another format, is not read by a copy: \
+                 it is filled from title memory, which does not hold what the host wrote"
+            );
+        }
+        false
+    };
     // Host copies with other mips than each other's: not copied.
     if crate::resource::dropped(placed) != crate::resource::dropped(source) {
-        return false;
+        return refused("the two host copies keep other mips");
     }
     let (Some(to), Some(from)) = (
         crate::resource::host_resource(placed),
         crate::resource::host_resource(source),
     ) else {
-        return false;
+        return refused("one of them has no host copy");
     };
     let Some(host) = host() else { return false };
     let through = {
@@ -325,7 +341,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 };
                 let parts = count(&of_from);
                 if parts == 0 || parts > ALIAS_PARTS || parts != count(&of_to) {
-                    return false;
+                    return refused("the levels and layers differ, or are too many");
                 }
                 let mut rows = [(); 2]
                     .map(|()| vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); parts as usize]);
@@ -361,10 +377,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                             == (fb.Width, fb.Height, fb.Depth, fb.RowPitch)
                 });
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
-                    return false;
+                    return refused("the two formats lay the texels out differently");
                 }
                 let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
+                    return refused("no buffer for the copy");
                 };
                 crate::host::name(&buffer, || {
                     format!(

@@ -125,6 +125,9 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// How often shaders found each page without a copy (the faults the
+    /// log adds up).
+    faulted: HashMap<u32, u32>,
     /// Filled pages and the index (in `copies`) of the copy each has.
     pages: BTreeMap<u64, usize>,
     /// Per copy (by index) the runs of pages the directory gives it, as
@@ -179,6 +182,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            faulted: HashMap::new(),
             pages: BTreeMap::new(),
             ranges: Vec::new(),
             recalculate: BTreeSet::new(),
@@ -483,11 +487,37 @@ impl Memory {
         if !pages.is_empty() {
             // Each is an access that read 0 or was dropped.
             static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 50 {
+            // `VICTORY_FAULT_SAY=<n>`: how many frames with faults are
+            // described, 50 unless said (a page that faults again and again
+            // reads zeros for good: see the summary line).
+            static SAY: OnceLock<u32> = OnceLock::new();
+            let say = *SAY.get_or_init(|| {
+                std::env::var("VICTORY_FAULT_SAY").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(50)
+            });
+            let notes = SAID.fetch_add(1, Ordering::Relaxed);
+            if notes < say {
                 tracing::warn!(
                     pages = pages.len(),
                     first = format_args!("{:#x}", u64::from(pages[0]) * PAGE),
                     "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); the copies are made now"
+                );
+            }
+            // What the faults add up to: how often each page faulted, and
+            // of the pages that faulted again, the ones that have no copy
+            // even now (not committed whole, or in no buffer a shader may
+            // write): those read zeros for as long as they are asked for.
+            for &page in &pages {
+                *self.faulted.entry(page).or_default() += 1;
+            }
+            if (notes >= say && (notes + 1).is_power_of_two()) || notes + 1 == say {
+                let again = self.faulted.values().filter(|&&n| n > 1).count();
+                let worst = self.faulted.iter().max_by_key(|&(&page, &n)| (n, page));
+                tracing::warn!(
+                    frames_with_faults = notes + 1,
+                    distinct_pages = self.faulted.len(),
+                    pages_that_faulted_again = again,
+                    most_often = ?worst.map(|(&page, &n)| (format!("{:#x}", u64::from(page) * PAGE), n)),
+                    "title memory by address: faults so far (a page that faults again after its copy was asked for has none: its reads give zeros)"
                 );
             }
         }
