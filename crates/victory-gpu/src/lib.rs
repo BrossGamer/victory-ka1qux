@@ -70,6 +70,8 @@ mod profile;
 mod unified_probe;
 #[cfg(all(test, windows))]
 mod card_commit_probe;
+#[cfg(all(test, windows))]
+mod gpu_upload_probe;
 pub mod query;
 pub mod queue;
 #[cfg(windows)]
