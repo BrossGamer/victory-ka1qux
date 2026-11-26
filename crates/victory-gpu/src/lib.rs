@@ -52,6 +52,8 @@ mod lazy;
 #[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
+mod unified;
+#[cfg(windows)]
 mod material_demand;
 pub mod list;
 pub mod object;
@@ -99,6 +101,8 @@ pub use bake_probe::{
 };
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use unified::{in_place_on, title_memory_change};
 #[cfg(windows)]
 pub use lazy::{kernel_will_read, lazy_back_on, title_memory_commit, title_memory_release, title_memory_reserved};
 #[cfg(windows)]
