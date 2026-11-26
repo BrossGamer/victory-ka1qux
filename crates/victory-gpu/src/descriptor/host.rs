@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) mod batched;
 mod debug_null;
 mod listed;
 pub(crate) mod spanned;

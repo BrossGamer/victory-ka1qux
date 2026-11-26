@@ -214,6 +214,16 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // Records of 32 bytes (view heaps), fingerprinted where they are.
         let in_place = step == 32 && page_at_once() && crate::heapprint::on();
+        // All the changed pages of the heap together (`VICTORY_HEAP_SYNC_BATCH=1`).
+        if host::batched::on() && page_at_once() {
+            let ranges = written.take(start as usize, end as usize);
+            let changed = host::batched::pages_of(&ranges);
+            let (read, seen, made) = host.mirror_copied_batch(&changed, (start, step), mirrored_count, in_place);
+            pages += read;
+            looked += seen;
+            mirrored += made;
+            continue;
+        }
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
@@ -308,6 +318,7 @@ pub(crate) fn sync_line(frames: f64) {
         );
     }
     crate::heapprint::line(frames);
+    host::batched::line(frames);
     if pages == 0 {
         return;
     }
