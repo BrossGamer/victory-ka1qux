@@ -27,9 +27,9 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
 | Light in shadow | 🟡 | the title's own ray-traced light runs, on by default (`VICTORY_RAYS=0` turns it off): its structures are built and traced, and shaded faces of buildings, trees and characters get bounced light, where without it they are near black. Four runs on the street, 5 to 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 to 0.1 s more |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
-| Frame rate | 🟡 | in the open world, with ray-traced light and the switches below: a median of 0.30 to 0.32 s a frame (about 3.1 to 3.3 frames a second) on a street with 5,800 to 7,300 draws a frame, 0.15 to 0.23 s at best; per draw about 51 to 55 µs, against 60 µs before this build's memory and submission changes. Preparing 76 ms and copying back 35 ms a frame, against 108 and 55. 0.53 to 0.56 s without victory-fork's speed defaults |
+| Frame rate | 🟡 | in the open world, with ray-traced light and the switches below: a median of 0.22 to 0.25 s a frame (about 4.0 to 4.5 frames a second) on a street with about 5,800 to 6,100 draws a frame, against 0.30 to 0.32 s before this round. Measured A/B in the same scene: the title's 32-bit graphics heap read in place 6 to 9 % (three pairs), guard walks by runs of blocks 6 % (preparing 63 to 53 ms). The frame is still bound by the processor: mirroring the title's changed descriptor records takes about 70 ms a frame on the submitting thread |
 | Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
-| Memory | 🟡 | the process takes about 31 GB of a 32 GB PC (it was 32.5): part of the title's memory is now read by the card in place instead of copied (1.9 GB in a street run), and root constant buffer views get 64 KiB copies instead of 4 MiB ones. The card holds about 12 to 12.7 GB of its 14 GB budget; textures it has no room for are made at a lower resolution or wait (below) |
+| Memory | 🟡 | the process takes about 26 GB (it was 32.5 a day earlier): small copies of views' own bytes now share slabs (1.4 GB of 64 KiB buffers down to about 70 MB), the 32-bit graphics heap has no copy, part of the title's memory is read by the card in place, and root constant buffer views get 64 KiB copies. The card holds about 12 to 12.7 GB of its 14 GB budget |
 | Upscaling | ✅ | AMD's FSR 4.1.2 (FidelityFX SDK 2.4.0, DLLs supplied by the user) runs on the RX 7800 XT in place of the title's own upscaler: rendering at 1920x1080 for a 3840x2160 picture in a street run, picture sharp (below) |
 | Tests | ✅ | `cargo test --workspace` runs 873 tests and all pass on the test machine (one GPU test fails now and then when the whole suite runs in one thread; it passes alone) |
 
@@ -461,6 +461,9 @@ $env:VICTORY_UNIFIED = "1"; $env:VICTORY_ASYNC_SUBMIT = "1"; $env:VICTORY_CARD_A
 $env:VICTORY_CARD_SYNC_BATCH = "1"; $env:VICTORY_CARD_REHASH_RUNS = "1"; $env:VICTORY_REUSE_ROOT_CBV = "1"
 $env:VICTORY_FILL_HOT = "1"; $env:VICTORY_STEP_INDEX = "1"; $env:VICTORY_BURY_ASIDE = "1"
 $env:VICTORY_CARD_WINDOWS_MB = "512"     # more of the card for textures
+$env:VICTORY_PORT_CONSTANTS = "1"; $env:VICTORY_EXACT_FAST = "1"; $env:VICTORY_EXACT_SUB = "1"
+$env:VICTORY_WATCH_INTERVALS = "1"       # this round's measured gains (below)
+# $env:VICTORY_MOUSE = "1"              # mouse as the right stick, WASD as the left (layout in docs/victory-fork-readme.md)
 # FSR (AMD's DLLs and your own title profile, above):
 # $env:VICTORY_FIDELITYFX_DIR = "<folder with amd_fidelityfx_upscaler_dx12.dll>"
 # $env:VICTORY_FSR_PROFILE = "<your profile file>"; $env:VICTORY_FSR = "performance"
@@ -492,6 +495,9 @@ VIctory #2821; `VICTORY_HEAP_LOCKS=0` takes it every time): 0.345 → 0.303 s.
 
 The frame rate is drawn in the top left corner of the window
 (`VICTORY_FPS_COUNTER=0` turns it off; victory-fork's main).
+
+**This round's switches** (off by default, measured A/B in the same street scene; the recommended set above has them on):
+`VICTORY_PORT_CONSTANTS=1`, the title's 32-bit graphics heap opened once as a host heap through a view of ours and its buffers placed in it, nothing copied, sent up or compared for them (avatarmanz/VIctory-7900XTX "renderer port 1"; probed on the card: nothing stays committed); `VICTORY_EXACT_SUB=1`, small copies of views' own bytes as ranges of shared slabs; `VICTORY_EXACT_FAST=1`, idle copies found from a queue; `VICTORY_WATCH_INTERVALS=1`, the write guards walk runs of blocks (victory-fork #1279). Picture fixes on by default: raw buffer views kept inside their buffer (victory-fork #1266), the skin bake's own textures uploaded before it for every bake program (#1264), 2-D compute groups on 32-lane waves counted by a group ticket (#1261; 32 of 64 dwords were written on the RX 7800 XT before), BC7 channel rotation only in modes 4 and 5 (upstream #3111), bound render targets kept alive on their list (upstream #3128), DirectStorage writes tell the write watch first (upstream #3037), wave32 cascade shadows, BVH prefix scans and LDS flag regions (avatarmanz #82, #142, #4; they change nothing on a 64-lane host). Tried and left off, measured at no gain here: renderer port 2 (descriptor stores patched to mark their slots: finding the changed slots was not the cost), heaps mirrored in parallel (one heap carries all), quiet windows, 64 KiB in-place windows, unsized root views cut at their run, copy-back beside the guards, recording on eight threads, P-core pinning.
 
 Fixes taken in this round, with thanks to their authors: avatarmanz/VIctory-7900XTX
 (the card kept awake, the 64 KiB constant windows' finding), Linox-IDK/LNX-victory
