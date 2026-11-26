@@ -211,6 +211,17 @@ Memory sync between the title's memory and the copies on the card:
   went in, the first room had its walls in the later frames of 4 runs out of
   4 (2 of 5 before); the room's very first shot still comes up without walls
   in some runs.
+- `VICTORY_WATCH_INTERVALS=1` (off by default; after victory-fork pull
+  request #1279): the guards work a run of blocks at a time. A range of clean
+  blocks, of holes known to lie in a placeholder reservation (no question to
+  Windows until the runtime tells of a mapping or a commit there), or of
+  blocks already read-only is passed over in one step; the blocks that need a
+  guard, and the other views of their pages, are made read-only with one call
+  for each run; a write that opens a block opens the other views the same
+  way; an asking that finds its first block already known as view memory
+  takes the guards' lock once. The frame log's "watch per frame" line counts
+  the calls the guards make to Windows, with and without it. (The sets the
+  guards keep are runs of blocks in either case.)
 - Kernel reads into title memory are read beside and copied in, so a block
   guarded again in between no longer fails the read.
 - Writes of the storage layer into physical pages are counted where the title

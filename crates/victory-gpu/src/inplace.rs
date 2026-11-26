@@ -646,6 +646,95 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// For each 64 KiB block of the title's views inside `[start, end)` whose
+/// page is shown in more than one view: the block, and the blocks that show
+/// the same page (its own included), or `None` if there are more than
+/// [`crate::watch::MANY_VIEWS`] of them (the page the title shows wherever it
+/// has nothing). What [`pages_of`] says for each block, with the views taken
+/// once for the whole range, not once for each block (after victory-fork
+/// pull request #1279's `aliases_in_range`).
+pub(crate) fn shown_between(start: usize, end: usize) -> Vec<(usize, Option<Vec<usize>>)> {
+    let mut out = Vec::new();
+    if start >= end {
+        return out;
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return out;
+    }
+    let mut visit = |base: usize, bytes: usize, section: usize, offset: u64| {
+        let first = (base / K64).max(start / K64);
+        let last = base.saturating_add(bytes).div_ceil(K64).min(end.div_ceil(K64));
+        for block in first..last {
+            let within = (block * K64).wrapping_sub(base);
+            if within >= bytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let Some(shown) = v.pages.get(&(section, offset + within as u64)) else {
+                continue;
+            };
+            if shown.len() < 2 {
+                continue;
+            }
+            out.push((block, (shown.len() <= crate::watch::MANY_VIEWS).then(|| shown.iter().map(|&a| a / K64).collect())));
+        }
+    };
+    if let Some((&base, &(bytes, section, offset))) = v.views.range(..=start).next_back()
+        && base.saturating_add(bytes) > start
+    {
+        visit(base, bytes, section, offset);
+    }
+    for (&base, &(bytes, section, offset)) in v.views.range(start.saturating_add(1)..end) {
+        visit(base, bytes, section, offset);
+    }
+    out
+}
+
+/// The blocks that show the same pages as any block of `runs` (`(from, to)`
+/// in blocks, each block's own included, only where it is a view shown
+/// more than once), sorted and without repeats: [`pages_of`] for all of
+/// them with the views taken once.
+pub(crate) fn aliases_for_blocks(runs: &[(usize, usize)]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if runs.is_empty() {
+        return out;
+    }
+    let v = views();
+    if v.views.is_empty() {
+        return out;
+    }
+    for &(from, to) in runs {
+        let mut block = from;
+        while block < to {
+            let address = block.saturating_mul(K64);
+            if let Some((&base, &(bytes, section, offset))) = v.views.range(..=address).next_back()
+                && address < base.saturating_add(bytes)
+            {
+                // The rest of this view inside the run.
+                let view_end = base.saturating_add(bytes).div_ceil(K64).min(to);
+                for at in block..view_end.max(block + 1) {
+                    let within = (at * K64).wrapping_sub(base);
+                    if within < bytes
+                        && within.is_multiple_of(K64)
+                        && let Some(shown) = v.pages.get(&(section, offset + within as u64))
+                    {
+                        out.extend(shown.iter().map(|&a| a / K64));
+                    }
+                }
+                block = view_end.max(block + 1);
+            } else if let Some((&next, _)) = v.views.range(address.saturating_add(1)..to.saturating_mul(K64)).next() {
+                // Nothing here: on to the next view.
+                block = (next / K64).max(block + 1);
+            } else {
+                break;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {

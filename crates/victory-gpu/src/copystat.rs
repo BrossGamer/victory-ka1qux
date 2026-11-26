@@ -152,6 +152,14 @@ pub(crate) enum C {
     CleanNotNoted,
     CleanMoved,
     CleanSame,
+    /// What the guards ask of Windows (`watch`): protection changes, queries
+    /// of a region (`VirtualQuery`), questions about a placeholder
+    /// (`NtQueryVirtualMemory`), and blocks passed over as known holes in a
+    /// placeholder (`VICTORY_WATCH_INTERVALS=1`, no question asked).
+    WatchProtects,
+    WatchQueries,
+    WatchPlaceholderQueries,
+    WatchHolesSkipped,
 }
 const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1372,6 +1380,21 @@ pub(crate) fn log(frames: f64) {
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
         c[C::GuardAsks as usize],
         c[C::GuardAllClean as usize],
+    );
+    tracing::info!(
+        "  watch per frame: {:.0} askings {:.2} ms (the kernel's write watch and the guards), {:.2} ms of them \
+         in the guards; asked of Windows by the guards: {:.0} protection changes, {:.0} region queries, {:.0} \
+         placeholder questions; {:.0} blocks passed over as known holes of a placeholder (VICTORY_WATCH_INTERVALS=1: {}); \
+         {:.0} guard faults",
+        c[C::Watches as usize],
+        ms(c[C::WatchUs as usize]),
+        ms(c[C::GuardUs as usize]),
+        c[C::WatchProtects as usize],
+        c[C::WatchQueries as usize],
+        c[C::WatchPlaceholderQueries as usize],
+        c[C::WatchHolesSkipped as usize],
+        if crate::watch::intervals() { "on" } else { "off" },
+        c[C::GuardFaults as usize],
     );
     tracing::info!(
         "  refreshes of guarded view memory per frame by their clean span: {:.0} not noted all clean, {:.0}          noted but their regions changed since, {:.0} unchanged (passed over); regions of {} KiB          (VICTORY_CLEAN_REGION_KB)",
