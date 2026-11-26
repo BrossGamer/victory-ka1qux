@@ -887,9 +887,24 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill_root_cbv(address as *const u8, len, reuse_root_cbv()).map(|(gpu, _)| gpu)
+}
+
+/// Whether repeated bindings of the same unaligned root constant buffer view
+/// in one list share one fill (`VICTORY_REUSE_ROOT_CBV=1`; off by default,
+/// until measured in a title). After fxceless/victory-fork pull request
+/// #1212, adapted from avatarmanz/VIctory-7900XTX c96525d.
+pub(crate) fn reuse_root_cbv() -> bool {
+    static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REUSE.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_REUSE_ROOT_CBV").is_some_and(|value| value == "1");
+        if on {
+            tracing::info!(
+                "repeated bindings of one unaligned root constant buffer view share one fill of the list (VICTORY_REUSE_ROOT_CBV=1)"
+            );
+        }
+        on
+    })
 }
 
 macro_rules! once {
