@@ -450,6 +450,49 @@ fn window_card_most() -> u64 {
 /// Bytes alive of windows' card sides ([`window_card_most`]).
 static WINDOW_CARD_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Of [`WINDOW_CARD_BYTES`], the bytes of windows in GPU upload heaps
+/// (`crate::window_upload`; counted in both).
+static WINDOW_UPLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The part of the budget of windows on the card ([`window_card_most`]) that
+/// windows with a card side of their own (a copy in the PC's memory and
+/// another on the card) leave to windows in GPU upload heaps, which only
+/// ask for one buffer: `VICTORY_WINDOW_UPLOAD_SHARE` percent of it, 50 by
+/// default, and only with `VICTORY_WINDOW_UPLOAD=1`.
+///
+/// Why: in the last open-world run the first window the ask of a read-only
+/// kind wanted in a GPU upload heap was turned down for the most asked
+/// ("the most is reached at one of 4096 KiB; 0 made, ... 512 MB of windows
+/// on the card"): the windows of asks that may write, with their card sides,
+/// had filled the whole of `VICTORY_CARD_WINDOWS_MB` by then, and a window
+/// of 4 MiB never fitted again. What the share holds back is what such
+/// windows may not take; upload windows may use all that is free, the share
+/// included. 0 holds nothing back, as before.
+fn window_upload_share() -> u64 {
+    static SHARE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SHARE.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_UPLOAD_SHARE").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(50, |n| n.min(100))
+    })
+}
+
+/// How much of `most` a window with a card side of its own may not take
+/// ([`window_upload_share`]): the share, or the bytes of upload windows if
+/// they are more. Nothing without upload windows.
+fn window_upload_held_back(most: u64) -> u64 {
+    if !crate::window_upload::enabled() {
+        return 0;
+    }
+    (most / 100 * window_upload_share()).max(WINDOW_UPLOAD_BYTES.load(Ordering::Relaxed))
+}
+
+/// Whether a window with a card side of its own fits the budget `most`, with
+/// `total` bytes of windows on the card counting it, `upload` of them in GPU
+/// upload heaps, and `held_back` that such windows may not take
+/// ([`window_upload_held_back`]).
+fn own_window_fits(total: u64, upload: u64, held_back: u64, most: u64) -> bool {
+    total <= most && total.saturating_sub(upload) + held_back <= most
+}
+
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
@@ -466,7 +509,12 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     {
         return None;
     }
-    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+    // (The bytes of upload windows are in the total: the windows with card
+    // sides of their own are the rest, and may not reach what upload windows
+    // have or are held back for.)
+    let held_back = window_upload_held_back(most);
+    let total = WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size;
+    if !own_window_fits(total, WINDOW_UPLOAD_BYTES.load(Ordering::Relaxed), held_back, most) {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
@@ -526,6 +574,7 @@ fn window_upload_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     if made.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     } else {
+        WINDOW_UPLOAD_BYTES.fetch_add(size, Ordering::Relaxed);
         window_upload_said(0, size);
     }
     made
@@ -540,13 +589,15 @@ fn window_upload_said(which: usize, size: u64) {
         let what = ["went to a GPU upload heap", "turned down: no room on the card for", "turned down: the most is reached at"][which];
         tracing::info!(
             "windows outside buffers in GPU upload heaps (VICTORY_WINDOW_UPLOAD=1, VICTORY_CARD_WINDOWS_MB={}): {what} one of {} KiB; \
-             so far {} made, {} turned down for the card's room, {} for the most asked; {} MB of windows on the card",
+             so far {} made, {} turned down for the card's room, {} for the most asked; {} MB of windows on the card, {} MB of them in              GPU upload heaps, {}% of the most held back for those from windows with a card side (VICTORY_WINDOW_UPLOAD_SHARE)",
             window_card_most() >> 20,
             size >> 10,
             COUNTS[0].load(Ordering::Relaxed),
             COUNTS[1].load(Ordering::Relaxed),
             COUNTS[2].load(Ordering::Relaxed),
-            WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20
+            WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20,
+            WINDOW_UPLOAD_BYTES.load(Ordering::Relaxed) >> 20,
+            window_upload_share()
         );
     }
 }
@@ -2503,6 +2554,7 @@ impl Drop for Shadow {
         if self.uploaded != 0 && !crate::window_upload::give(&self.buffer, self.data, self.uploaded) {
             // Not kept for a window to come: no longer counted.
             WINDOW_CARD_BYTES.fetch_sub(self.uploaded, Ordering::Relaxed);
+            let _ = WINDOW_UPLOAD_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(self.uploaded)));
         }
         if let Some(card) = &mut self.card {
             if window {
@@ -6446,6 +6498,31 @@ mod lookup_tests {
         panic!("a count moved five times while a registration waited for the table's lock");
     }
 
+    /// Windows with a card side of their own leave a share of the budget to
+    /// windows in GPU upload heaps (`VICTORY_WINDOW_UPLOAD_SHARE`), and take
+    /// what upload windows have not used up to what is held back.
+    #[test]
+    fn windows_with_card_sides_leave_the_upload_share() {
+        use super::own_window_fits;
+        const MB: u64 = 1 << 20;
+        let most = 512 * MB;
+        // Nothing held back (the share off, or upload windows off): all of it.
+        assert!(own_window_fits(512 * MB, 0, 0, most));
+        assert!(!own_window_fits(512 * MB + 4 * MB, 0, 0, most));
+        // Half held back with no upload window yet: the other half only.
+        let held = 256 * MB;
+        assert!(own_window_fits(256 * MB, 0, held, most));
+        assert!(!own_window_fits(256 * MB + 4 * MB, 0, held, most));
+        // Upload windows have 300 MB (more than the share: held back is
+        // what they have): the windows with card sides had 100 and take more
+        // up to the 212 left, and no more.
+        let held = 300 * MB;
+        assert!(own_window_fits(300 * MB + 212 * MB, 300 * MB, held, most));
+        assert!(!own_window_fits(300 * MB + 216 * MB, 300 * MB, held, most));
+        // The total is never past the most, whatever is held back.
+        assert!(!own_window_fits(516 * MB, 516 * MB, 0, most));
+    }
+
     /// A window in a GPU upload heap (`VICTORY_WINDOW_UPLOAD=1`) is for asks
     /// that only read it: those get it, and an ask that may write (a root
     /// unordered access view) takes it out of the table and gets a plain
@@ -6472,6 +6549,7 @@ mod lookup_tests {
         let upload = Arc::new(upload);
         // (Counted as a window made in such a heap is.)
         WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+        super::WINDOW_UPLOAD_BYTES.fetch_add(len, Ordering::Relaxed);
         LOOSE.write().unwrap().insert((start, len), upload.clone());
         let same = |a: &Arc<Shadow>, b: &Arc<Shadow>| Arc::ptr_eq(a, b);
         assert!(same(&lookup_reading(at, 1, false, false).unwrap(), &upload), "a read ask gets it");
