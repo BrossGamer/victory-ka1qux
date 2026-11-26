@@ -3,6 +3,7 @@
 //! write, and programs without such writes come out as without marks.
 
 use super::host::{Dispatch, Host, Root, View};
+use super::lower::marks::{TEST_WAVE_MARKS, WaveMarks};
 use super::{HostShader, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, VIEW_MARK_NONE, lower, validator};
 use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
 use crate::{io, ir, resource, structure};
@@ -51,6 +52,15 @@ const fn v_lshlrev_b32(vdst: u8, shift: u8, src: u8) -> u32 {
 }
 
 const S_NOP: u32 = 0xBF80_0000;
+
+/// VOP2 `op vdst, src0, v<vsrc1>`; `src0` is a 9-bit source: an SGPR's
+/// number, 128 + n for the inline constant n, 256 + v for a VGPR.
+const fn vop2(op: u32, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    op << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | src0 as u32
+}
+const V_LSHRREV_B32: u32 = 0x16;
+const V_AND_B32: u32 = 0x1B;
+const V_ADD_NC_U32: u32 = 0x25;
 
 /// A one-thread compute program with 4 dwords of root constants in
 /// `s0..s3` and a table of `views` raw UAVs at user data 4; `body` runs
@@ -270,6 +280,158 @@ fn lanes_of_a_wave_mark_every_page_they_write() {
             assert_eq!(out[0], data, "{label}: view 0, shift {shift}");
             let marked: Vec<usize> = (0..out[1].len() * 32).filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0).collect();
             assert_eq!(marked, pages, "{label}: pages, shift {shift}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// [`program_of`] with the lanes of a wave marking the way `mode` says.
+fn program_in(mode: WaveMarks, views: u32, body: &[[u32; 2]], threads: u32) -> HostShader {
+    let was = TEST_WAVE_MARKS.replace(Some(mode));
+    let shader = program_of(views, body, true, threads);
+    TEST_WAVE_MARKS.set(was);
+    shader
+}
+
+/// 64 threads store their index at byte `(((lane + s1) >> 6) << s0) +
+/// ((lane & s2) << s3)` of view 0 (`s0` to `s3` the root constants):
+/// `s0` and `s1` put the lanes whose `lane + s1` reaches 64 (the last lane
+/// for 1, all but the first for 63, the upper half for 32) a page or more
+/// from the rest, `s2` and `s3` spread the lanes among themselves.
+fn spread_body() -> Vec<[u32; 2]> {
+    let pair = |w: u32| [w, S_NOP];
+    vec![
+        // v1 = (lane + s1) >> 6, then << s0
+        pair(vop2(V_ADD_NC_U32, 1, 1, 0)),
+        pair(vop2(V_LSHRREV_B32, 1, 128 + 6, 1)),
+        pair(v_lshlrev_b32(1, 0, 1)),
+        // v2 = (lane & s2) << s3
+        pair(vop2(V_AND_B32, 2, 2, 0)),
+        pair(v_lshlrev_b32(2, 3, 2)),
+        // the byte, and the store at it
+        pair(vop2(V_ADD_NC_U32, 1, 256 + 1, 2)),
+        mubuf_offen(BUFFER_STORE_DWORD, 0, 1, 8),
+    ]
+}
+
+/// The byte of view 0 that `lane` stores at ([`spread_body`]).
+fn spread_byte(lane: u32, [s0, s1, s2, s3]: [u32; 4]) -> u32 {
+    (((lane + s1) >> 6) << s0).wrapping_add((lane & s2) << s3)
+}
+
+/// Whichever way the lanes of a wave set their marks (each its own, as one
+/// when they all share a dword, as the leading lane's dword's lanes do),
+/// the bits come out the same: exactly the pages of the lanes that wrote.
+/// The spreads have the lanes of the leading lane's dword the most of the
+/// wave, a few of it, or only that lane, with the others in the next dword,
+/// in dwords of their own or a dword apart; the view's first page is the
+/// first bit of a dword, inside one, or the last of one. The stores land
+/// the same too.
+#[test]
+fn every_way_of_marking_by_wave_sets_the_same_bits() {
+    let body = spread_body();
+    let modes = [WaveMarks::PerLane, WaveMarks::AllEqual, WaveMarks::Leader];
+    let shaders: Vec<_> = modes.iter().map(|&m| program_in(m, 1, &body, 64)).collect();
+    let waves = |shader: &HostShader| {
+        let container = crate::dxbc::Container::parse(&shader.dxil).expect("container");
+        let sfi = container.part(crate::dxbc::FourCC::SFI0).expect("SFI0").data;
+        u64::from_le_bytes(sfi.try_into().expect("8 bytes")) & 0x4000 != 0
+    };
+    assert!(!waves(&shaders[0]), "marks one by one need no wave operations");
+    assert!(waves(&shaders[1]) && waves(&shaders[2]), "the others declare them");
+    assert_ne!(shaders[1].dxil, shaders[2].dxil, "the leading lane's dword is another scheme");
+    assert_ne!(shaders[0].dxil, shaders[2].dxil);
+    // (s0, s1, s2, s3)
+    let spreads: [[u32; 4]; 20] = [
+        // every lane the same byte
+        [2, 0, 0, 2],
+        // one page, distinct dwords of it
+        [16, 0, 63, 2],
+        // the last lane a page on, in the leading lane's dword
+        [16, 1, 0, 2],
+        [16, 1, 63, 2],
+        // all but the first lane a page on
+        [16, 63, 0, 2],
+        // the last lane a dword on
+        [21, 1, 0, 2],
+        [21, 1, 63, 2],
+        // all but the first lane a dword on
+        [21, 63, 0, 2],
+        [21, 63, 63, 2],
+        // the first two lanes, then the rest
+        [21, 62, 0, 2],
+        // halves, a page apart and a dword apart
+        [16, 32, 0, 2],
+        [21, 32, 0, 2],
+        // a lane short of a third
+        [21, 31, 0, 2],
+        // two pages of one dword
+        [16, 0, 63, 11],
+        // a page each: 64 pages over three dwords
+        [16, 0, 63, 16],
+        [21, 1, 63, 16],
+        [21, 63, 63, 16],
+        // pages 32 apart, so a dword each
+        [21, 0, 63, 21],
+        // the last lane far off among near pages
+        [22, 1, 7, 16],
+        [22, 62, 3, 12],
+    ];
+    // The first bit of the view's first page: a dword's start, inside it,
+    // its last.
+    let firsts = [96u32, 100, 127];
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (shader, mode) in shaders.iter().zip(modes) {
+            let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+            for spread in spreads {
+                for first in firsts {
+                    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                    for u in &shader.user_data {
+                        ud[u.index as usize] = if u.root == RootType::Constants { spread[u.dword as usize] } else { 0 };
+                    }
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![
+                                    (0, Root::Constants(ud)),
+                                    (1, Root::View { srv: true, data: vec![first, 0] }),
+                                    (2, Root::Uav(4096 / 32)),
+                                ],
+                                views: &[View::RawUav(64)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{label}, {mode:?}: {e}"));
+                    let what = format!("{label}, {mode:?}, spread {spread:?}, first bit {first}");
+                    let mut pages: Vec<usize> =
+                        (0..64).map(|lane| first as usize + (spread_byte(lane, spread) >> 16) as usize).collect();
+                    pages.sort_unstable();
+                    pages.dedup();
+                    let marked: Vec<usize> =
+                        (0..out[1].len() * 32).filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0).collect();
+                    assert_eq!(marked, pages, "{what}: pages");
+                    // Each store that fits the view lands (where lanes share
+                    // a byte, one of theirs does).
+                    for at in 0..64u32 {
+                        let writers: Vec<u32> = (0..64).filter(|&l| spread_byte(l, spread) == at * 4).collect();
+                        match writers.as_slice() {
+                            [] => assert_eq!(out[0][at as usize], 0, "{what}: dword {at}"),
+                            [one] => assert_eq!(out[0][at as usize], *one, "{what}: dword {at}"),
+                            many => assert!(many.contains(&out[0][at as usize]), "{what}: dword {at}"),
+                        }
+                    }
+                }
+            }
         }
         ran += 1;
     }
