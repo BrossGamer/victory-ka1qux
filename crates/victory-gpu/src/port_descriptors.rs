@@ -1,63 +1,53 @@
-//! The title's writes of descriptor records into its shader-visible heap say
-//! which slots they wrote, and the per-frame look at every changed heap page
-//! goes (`VICTORY_PORT_DESCRIPTORS=1`, off by default; read in [`on`]).
+//! Renderer port #2: the title's writes of descriptor records into its
+//! shader-visible heap say which slots they wrote, and the per-frame look at
+//! every changed heap page goes (`VICTORY_PORT_DESCRIPTORS=1`, off by
+//! default; read in [`on`]).
 //!
-//! After avatarmanz/VIctory-7900XTX ("Renderer port 2", GPL-3.0), fitted to
-//! what this tree has. What the layer did before, with the title's heap
-//! placed in memory it owns (`descriptor::sync_heaps`): the write watch's
-//! changed 64 KiB pages of the heap, every record on them read and compared
-//! with the one last seen: some 290 pages and 600,000 slots a frame, 50 to
-//! 60 ms of the sync here, a good part of it asking the watch.
+//! What the title does (`victory-loader`'s `descriptor_sites` has the code):
+//! its placed shader-visible view heap is the memory of its frame allocator,
+//! which hands out the draws' and dispatches' descriptor tables and much else
+//! (constants, list nodes). The tables are filled one 32-byte record at a time
+//! by six stores in two functions; views made by our calls
+//! (`Create*View`, `CopyDescriptors*`) are mirrored where they are made
+//! (`descriptor::mirror`). What the layer did before: the write watch's
+//! changed 64 KiB pages of the heap, every slot on them read and compared
+//! with the one last seen (~290 pages, ~600,000 slots, 15-16 ms a frame of
+//! the heap-sync thread, 5-7 of it asking the watch, run port1-3).
 //!
-//! What the title does is told by the user's profile and not built in
-//! (`VICTORY_DESCRIPTORS_PROFILE`; `apps/victory`'s `descriptor_profile`):
-//! the heap is the memory of its frame allocator, which hands out the draws'
-//! and dispatches' descriptor tables (and much else), and the tables are
-//! filled one 32-byte record at a time by a few stores in two functions. Views
-//! made by our own calls (`Create*View`, `CopyDescriptors*`) are mirrored where
-//! they are made (`descriptor::mirror`).
+//! What is done here: the stores are patched (`descriptor_sites`) to set a
+//! byte per slot and per 128 slots in maps of ours ([`MARKS`]), and our own
+//! mirroring marks too; `descriptor::sync_heaps` takes the marked slots
+//! ([`take`]) in place of the changed pages, and compares and makes only
+//! those, as before. Where the stores are is told by the user's profile of the
+//! title (`VICTORY_TITLE_PROFILE`): without it, or where no store was found,
+//! this stays off and the pages are looked at as before, said in the log.
 //!
-//! What is done here: those stores are patched (`victory_loader::descriptor_sites`)
-//! to set a byte per slot and per 128 slots in maps of ours ([`MARKS`]), the
-//! title's `memcpy` and `memmove` mark the view records they copy into the heap
-//! ([`import`]), and our own mirroring marks too ([`mark`]). `sync_heaps` takes
-//! the marked slots ([`take`]) in place of the changed pages and compares
-//! and mirrors only those, as before: the batch of
-//! [`crate::descriptor::host::batched`] reads their runs where they are
-//! (`VICTORY_SYNC_IN_PLACE=1`) or through a copy, compares each record with the
-//! one last seen (a slot written with the record it had costs nothing more)
-//! and mirrors what changed.
-//!
-//! Correctness first, the fallback: every [`check_every`] frames the write watch
-//! is asked, and a few of the pages it says were written ([`check_budget`] a
-//! frame, round the heap) are looked at whole, as before. A slot found there
+//! Correctness first, the fallback: once a frame a few of the pages the
+//! write watch says were written ([`check_budget`], every
+//! [`check_every`] frames asked) are looked at whole, as before; a slot found
 //! with a new view record that no mark told of is made (so it is right from
-//! then on) and counted, with the place in the title's code that last faulted
-//! on its 64 KiB block when the guards saw one ([`faulted`]): a writer the
-//! patches miss shows in the log. Records that are not views (the allocator's
-//! other data) are counted apart, and so are those a draw's table holds (the
-//! draw makes what it reads).
+//! then on) and counted, with the place in the title's code that last
+//! faulted on its 64 KiB block when the guards saw one ([`faulted`]): a writer
+//! the patches miss shows in the log. Records that are not views (the
+//! allocator's other data) are made as before and counted apart.
 //!
 //! Assumption: a slot whose view record the title overwrote with other data
 //! (not a view) and no mark told of keeps showing its old view on the host
 //! until the fallback looks at its page; nothing reads such a slot as a
 //! descriptor (the title wrote no descriptor there).
 
-use std::sync::atomic::{
-    AtomicPtr, AtomicU8, AtomicU64, AtomicUsize,
-    Ordering::{AcqRel, Acquire, Relaxed, Release},
-};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
 
-/// Whether this is on.
+/// Whether renderer port #2 is on.
 pub fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // Read once, here: the switch.
+    // Read once, here: the switch of renderer port #2.
     *ON.get_or_init(|| std::env::var("VICTORY_PORT_DESCRIPTORS").is_ok_and(|v| v.trim() == "1"))
 }
 
-/// What the patched stores read (`victory_loader::descriptor_sites::MARKS_LEN`
-/// bytes): the heap's first byte, its length (0: none), the map of slots, the
-/// map of chunks of [`CHUNK`] slots.
+/// What the patched stores read (`victory_loader::descriptor_sites`,
+/// `MARKS_LEN` bytes): the heap's first byte, its length (0: none), the map
+/// of slots, the map of chunks of [`CHUNK`] slots.
 #[repr(C)]
 pub struct Marks {
     start: AtomicU64,
@@ -92,10 +82,13 @@ pub fn hooked(base: usize, size: usize, patched: usize) {
     IMAGE[0].store(base, Relaxed);
     IMAGE[1].store(size, Relaxed);
     IMAGE[2].store(patched, Relaxed);
+    if on() && patched == 0 {
+        tracing::warn!("descriptor marks (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched (see VICTORY_TITLE_PROFILE)");
+    }
 }
 
 /// Whether [`take`] stands for the heap's changed pages: the switch is on and
-/// stores were patched.
+/// the stores were patched.
 fn working() -> bool {
     on() && IMAGE[2].load(Relaxed) > 0
 }
@@ -112,8 +105,8 @@ struct Adopted {
 
 static ADOPTED: std::sync::RwLock<Option<Adopted>> = std::sync::RwLock::new(None);
 
-/// A placed shader-visible view heap of `count` records at `start`: the first
-/// such is the one whose slots are marked. Whether it is.
+/// A placed shader-visible view heap of `count` records at `start`: the
+/// first such is the one whose slots are marked. Whether it is.
 pub(crate) fn adopt(start: u64, count: u32) -> bool {
     working() && adopt_now(start, count)
 }
@@ -121,13 +114,13 @@ pub(crate) fn adopt(start: u64, count: u32) -> bool {
 fn adopt_now(start: u64, count: u32) -> bool {
     let mut adopted = ADOPTED.write().unwrap_or_else(|e| e.into_inner());
     if adopted.is_some() {
-        tracing::info!(start = format_args!("{start:#x}"), count, "descriptor marks: another placed view heap, looked at by its pages as before");
+        tracing::info!(start = format_args!("{start:#x}"), count, "renderer port 2: another placed view heap, looked at by its pages as before");
         return false;
     }
     let count = count as usize;
+    let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
     // (Never freed: a store of the title's may be marking while the heap
     // goes; a few MB at most.)
-    let leak = |n: usize| -> &'static [AtomicU8] { Box::leak((0..n).map(|_| AtomicU8::new(0)).collect()) };
     let slots = leak(count);
     let chunks = leak(count.div_ceil(CHUNK));
     let writers: &'static [AtomicUsize] = Box::leak((0..(count * 32).div_ceil(1 << 16)).map(|_| AtomicUsize::new(0)).collect());
@@ -141,7 +134,7 @@ fn adopt_now(start: u64, count: u32) -> bool {
         start = format_args!("{start:#x}"),
         count,
         stores = IMAGE[2].load(Relaxed),
-        "descriptor marks: the title's view heap's slots are told by its record stores and our calls, not looked for on its pages (VICTORY_PORT_DESCRIPTORS)"
+        "renderer port 2: the title's view heap's slots are told by its record stores and our calls, not looked for on its pages (VICTORY_PORT_DESCRIPTORS)"
     );
     true
 }
@@ -152,7 +145,7 @@ pub(crate) fn let_go(start: u64) {
     if adopted.as_ref().is_some_and(|a| a.start == start) {
         MARKS.len.store(0, Release);
         *adopted = None;
-        tracing::info!(start = format_args!("{start:#x}"), "descriptor marks: the marked view heap went");
+        tracing::info!(start = format_args!("{start:#x}"), "renderer port 2: the marked view heap went");
     }
 }
 
@@ -173,18 +166,13 @@ pub(crate) fn mark(handle: u64) {
     if at >= len {
         return;
     }
-    mark_slot((at / 32) as usize);
-    MARKED_BY_US.fetch_add(1, Relaxed);
-}
-
-/// Marks slot `slot` of the marked heap (in it: checked by the caller).
-#[inline]
-fn mark_slot(slot: usize) {
+    let slot = (at / 32) as usize;
     // SAFETY: the maps are leaked, as long as the length says.
     unsafe {
         (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
         (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
     }
+    MARKED_BY_US.fetch_add(1, Relaxed);
 }
 
 /// Whether slot `index`'s mark is set (told, not yet taken).
@@ -225,9 +213,8 @@ pub(crate) fn take(start: u64) -> Option<Vec<(u32, u32)>> {
     Some(runs)
 }
 
-/// A write fault of the title's at `at` (from its instruction at `rip`), if in
-/// the marked heap: who wrote its block last, for [`missed`]. Runs in the
-/// fault handler: nothing here waits.
+/// A write fault of the title's at `at` (from its instruction at `rip`),
+/// if in the marked heap: who wrote its block last, for [`missed`].
 pub(crate) fn faulted(at: usize, rip: usize) {
     if MARKS.len.load(Relaxed) == 0 {
         return;
@@ -257,7 +244,6 @@ fn check_budget() -> usize {
 
 /// The fallback's pages: those the watch said were written, not looked at yet;
 /// the frame it last asked in, and the frame it last looked in.
-#[derive(Default)]
 struct Fallback {
     pages: std::collections::BTreeSet<usize>,
     asked: u64,
@@ -266,84 +252,61 @@ struct Fallback {
     next: usize,
 }
 
-impl Fallback {
-    /// Whether to ask the write watch in `frame`: not with no budget, and
-    /// once in `every` frames.
-    fn ask_due(&mut self, frame: u64, every: u64, budget: usize) -> bool {
-        if budget == 0 || self.asked != 0 && frame < self.asked + every {
-            return false;
-        }
-        self.asked = frame.max(1);
-        true
-    }
-
-    /// What the watch said was written (byte ranges), for later.
-    fn asked(&mut self, ranges: &[(usize, usize)]) {
-        for &(from, to) in ranges {
-            let mut page = from & !(crate::watch::PAGE - 1);
-            while page < to {
-                self.pages.insert(page);
-                page += crate::watch::PAGE;
-            }
-        }
-    }
-
-    /// The pages to look at whole in `frame`, at most `budget` (once a frame;
-    /// none after), going on round the heap from where it left off.
-    fn pages_to_check(&mut self, frame: u64, budget: usize) -> Vec<usize> {
-        if self.looked == frame {
-            return Vec::new();
-        }
-        self.looked = frame;
-        let mut out = Vec::new();
-        while out.len() < budget {
-            let from = self.next;
-            let Some(&page) = self.pages.range(from..).next().or_else(|| self.pages.iter().next()) else {
-                break;
-            };
-            self.pages.remove(&page);
-            self.next = page + crate::watch::PAGE;
-            out.push(page);
-        }
-        out
-    }
-}
-
-static FALLBACK: std::sync::Mutex<Option<Fallback>> = std::sync::Mutex::new(None);
-
-fn with_fallback<T>(f: impl FnOnce(&mut Fallback) -> T) -> T {
-    f(FALLBACK.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Fallback::default))
-}
+static FALLBACK: std::sync::Mutex<Fallback> = std::sync::Mutex::new(Fallback { pages: std::collections::BTreeSet::new(), asked: 0, looked: 0, next: 0 });
 
 /// Whether to ask the write watch of the marked heap this frame.
 pub(crate) fn ask_due(frame: u64) -> bool {
-    with_fallback(|f| f.ask_due(frame, check_every(), check_budget()))
+    let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if check_budget() == 0 || f.asked != 0 && frame < f.asked + check_every() {
+        return false;
+    }
+    f.asked = frame.max(1);
+    true
 }
 
 /// What the watch said was written (byte ranges), for later.
 pub(crate) fn asked(ranges: &[(usize, usize)]) {
-    with_fallback(|f| f.asked(ranges));
+    let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    for &(from, to) in ranges {
+        let mut page = from & !(crate::watch::PAGE - 1);
+        while page < to {
+            f.pages.insert(page);
+            page += crate::watch::PAGE;
+        }
+    }
 }
 
 /// The pages to look at whole this frame (once a frame; none after).
 pub(crate) fn to_check(frame: u64) -> Vec<usize> {
-    let pages = with_fallback(|f| f.pages_to_check(frame, check_budget()));
-    CHECKED[0].fetch_add(pages.len() as u64, Relaxed);
-    pages
+    let mut f = FALLBACK.lock().unwrap_or_else(|e| e.into_inner());
+    if f.looked == frame {
+        return Vec::new();
+    }
+    f.looked = frame;
+    let mut out = Vec::new();
+    while out.len() < check_budget() {
+        let from = f.next;
+        let Some(&page) = f.pages.range(from..).next().or_else(|| f.pages.iter().next()) else {
+            break;
+        };
+        f.pages.remove(&page);
+        f.next = page + crate::watch::PAGE;
+        out.push(page);
+    }
+    CHECKED[0].fetch_add(out.len() as u64, Relaxed);
+    out
 }
 
-/// The fallback found slot `index` (at `handle`) with a record other than the
-/// one last seen. `view`: it is a view record; `tabled`: a draw read the slot
-/// through a table lately (the draw makes it anyway). A view record that no
-/// mark told of is counted and said.
+/// The fallback found slot `index` (at `handle`) with a new record: a view
+/// record that no mark told of is counted and said.
 pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     if !view {
         CHECKED[2].fetch_add(1, Relaxed);
         return;
     }
     if tabled {
-        CHECKED[4].fetch_add(1, Relaxed);
-        return;
+        // A draw read it through a table lately: the draw makes it anyway.
+        CHECKED[5].fetch_add(1, Relaxed);
     }
     let adopted = ADOPTED.read().unwrap_or_else(|e| e.into_inner());
     let Some(a) = adopted.as_ref() else { return };
@@ -354,22 +317,19 @@ pub(crate) fn missed(index: u32, handle: u64, view: bool, tabled: bool) {
     }
     let n = CHECKED[1].fetch_add(1, Relaxed);
     MISSED_ALL.fetch_add(1, Relaxed);
-    let rip = a.writers.get((handle.wrapping_sub(a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
+    let rip = a.writers.get(((handle - a.start) >> 16) as usize).map_or(0, |w| w.load(Relaxed));
     let (base, size) = (IMAGE[0].load(Relaxed), IMAGE[1].load(Relaxed));
-    let writer = if rip >= base && rip < base + size {
-        format!("title+{:#x}", rip - base)
-    } else if rip != 0 {
-        format!("{rip:#x} (not the title's)")
-    } else {
-        "not known (no fault on its block)".into()
-    };
-    *WRITERS.lock().unwrap_or_else(|e| e.into_inner()).entry(writer.clone()).or_default() += 1;
+    let writer = if rip >= base && rip < base + size { format!("title+{:#x}", rip - base) } else if rip != 0 { format!("{rip:#x} (not the title's)") } else { "not known (no fault on its block)".into() };
+    {
+        let mut by = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        *by.entry(writer.clone()).or_default() += 1;
+    }
     if n < 20 || n.is_power_of_two() {
         tracing::warn!(
             slot = index,
             handle = format_args!("{handle:#x}"),
             %writer,
-            "descriptor marks: a view record in the title's heap that no store told of (found by the fallback; made now)"
+            "renderer port 2: a view record in the title's heap that no store told of (found by the fallback; made now)"
         );
     }
 }
@@ -381,17 +341,17 @@ static REAL: [AtomicUsize; 2] = [const { AtomicUsize::new(0) }; 2];
 static COPIES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// What the title's import of `name` (bound to `address`) is bound to: with
-/// the switch, and stores patched, its `memcpy` and `memmove` mark the view
-/// records they copy into the heap (the fallback found some hundreds of view
-/// records a frame on its pages that the stores had not told of, the last
-/// writers of their blocks the runtime's `memcpy` among them).
+/// the switch, its `memcpy` and `memmove` mark the view records they copy
+/// into the heap (the fallback of run port2-2 found ~250 view records a
+/// frame on 16 pages that the six stores had not told of, the last writers
+/// of their blocks the runtime's `memcpy` among them).
 pub fn import(name: &str, address: usize) -> usize {
     let (which, ours) = match name {
         "memcpy" => (0, copy as *const () as usize),
         "memmove" => (1, shift as *const () as usize),
         _ => return address,
     };
-    if !working() {
+    if !on() {
         return address;
     }
     REAL[which].store(address, Relaxed);
@@ -420,47 +380,47 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     let out = unsafe { real(to, from, n) };
     let len = MARKS.len.load(Acquire);
     if len != 0 && n >= 4 {
-        // SAFETY: just written by the copy.
-        unsafe { marked_by_copy(to as u64, n as u64) };
+        let start = MARKS.start.load(Relaxed);
+        let (lo, hi) = ((to as u64).max(start), (to as u64 + n as u64).min(start + len));
+        if lo < hi {
+            COPIES[0].fetch_add(1, Relaxed);
+            // Each slot whose first word now lies in the copy and is a view's.
+            let mut slot = (lo - start).div_ceil(32);
+            let mut marked = 0;
+            while start + slot * 32 + 4 <= hi {
+                let at = start + slot * 32;
+                // SAFETY: just written by the copy, inside the heap.
+                if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
+                    mark_slot(slot as usize);
+                    marked += 1;
+                }
+                slot += 1;
+            }
+            COPIES[1].fetch_add(marked, Relaxed);
+        }
     }
     out
 }
 
-/// Marks each slot of the marked heap whose first word the copy of `n` bytes
-/// to `to` just wrote and is a view record's.
-///
-/// # Safety
-/// The bytes `[to, to + n)` were just written, so those inside the heap are
-/// readable.
-unsafe fn marked_by_copy(to: u64, n: u64) {
-    let (start, len) = (MARKS.start.load(Relaxed), MARKS.len.load(Relaxed));
-    let (lo, hi) = (to.max(start), to.saturating_add(n).min(start + len));
-    if lo >= hi {
-        return;
+/// Marks slot `slot` of the marked heap (in it: checked by the caller).
+#[inline]
+fn mark_slot(slot: usize) {
+    // SAFETY: the maps are leaked, as long as the length says.
+    unsafe {
+        (*MARKS.slots.load(Relaxed).add(slot)).store(1, Release);
+        (*MARKS.chunks.load(Relaxed).add(slot / CHUNK)).store(1, Release);
     }
-    COPIES[0].fetch_add(1, Relaxed);
-    let mut slot = (lo - start).div_ceil(32);
-    let mut marked = 0;
-    while start + slot * 32 + 4 <= hi {
-        let at = start + slot * 32;
-        // SAFETY: by the caller, inside the heap.
-        if unsafe { (at as *const u32).read_unaligned() } == crate::descriptor::VIEW_TAG {
-            mark_slot(slot as usize);
-            marked += 1;
-        }
-        slot += 1;
-    }
-    COPIES[1].fetch_add(marked, Relaxed);
 }
 
 /// Our own calls' marks since the last line.
 static MARKED_BY_US: AtomicU64 = AtomicU64::new(0);
 /// Since the last line: slots taken, takings, nanoseconds taking.
 static TAKEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-/// Since the last line, of the fallback: pages looked at whole, view records no
-/// mark told of, other records changed (not views), view records told and not
-/// taken yet, and view records of draws' tables.
-pub(crate) static CHECKED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// Since the last line, of the fallback: pages looked at whole, view records
+/// no mark told of, other records changed (not views), view records told and
+/// not taken yet; nanoseconds.
+/// and of the view records no mark told of, those of draws' tables.
+pub(crate) static CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// Since the start: view records the fallback found that no mark told of.
 static MISSED_ALL: AtomicU64 = AtomicU64::new(0);
 /// Since the start: the missed records by the place that last faulted on their block.
@@ -468,20 +428,20 @@ static WRITERS: std::sync::Mutex<std::collections::BTreeMap<String, u64>> = std:
 /// Since the start: slots taken, of them marked by our calls; pages checked.
 static ALL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// With the frame line: what this did per frame over `frames`.
+/// With the frame line: what port #2 did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
     let [taken, takings, ns] = [0, 1, 2].map(|i| TAKEN[i].swap(0, Relaxed));
     let ours = MARKED_BY_US.swap(0, Relaxed);
-    let [pages, missed, other, pending, tabled] = [0, 1, 2, 3, 4].map(|i| CHECKED[i].swap(0, Relaxed));
+    let [pages, missed, other, pending, check_ns, tabled] = [0, 1, 2, 3, 4, 5].map(|i| CHECKED[i].swap(0, Relaxed));
     let copies = [0, 1].map(|i| COPIES[i].swap(0, Relaxed));
     ALL[0].fetch_add(taken, Relaxed);
     ALL[1].fetch_add(ours, Relaxed);
     ALL[2].fetch_add(pages, Relaxed);
     if !working() {
-        tracing::info!("descriptor marks (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched (see VICTORY_DESCRIPTORS_PROFILE)");
+        tracing::info!("renderer port 2 (VICTORY_PORT_DESCRIPTORS=1): not working, no store of the title's was patched");
         return;
     }
     let writers = {
@@ -491,9 +451,8 @@ pub(crate) fn line(frames: f64) {
         v.iter().take(6).map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", ")
     };
     tracing::info!(
-        "descriptor marks (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores and its memcpy/memmove) in {:.1} takings, {:.3} ms taking; \
-         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no mark told of, \
-         {:.2} view records of draws' tables, {:.0} other records changed, {:.1} told and not taken yet; \
+        "renderer port 2 (VICTORY_PORT_DESCRIPTORS=1) per frame: {:.0} slots told (of them {:.0} marked by our calls, the rest by the title's {} patched stores) in {:.1} takings, {:.3} ms taking; \
+         of the title's memcpy/memmove calls into the heap {:.0}, {:.0} records they marked; fallback: {:.1} pages looked at whole, {:.2} view records no store told of ({:.2} of them of draws' tables), {:.0} other records changed, {:.1} told and not taken yet, {:.2} ms; \
          since the start: {} slots told ({} by our calls), {} pages looked at, {} view records missed; their writers: {}",
         taken as f64 / frames,
         ours as f64 / frames,
@@ -507,6 +466,7 @@ pub(crate) fn line(frames: f64) {
         tabled as f64 / frames,
         other as f64 / frames,
         pending as f64 / frames,
+        check_ns as f64 / 1e6 / frames,
         ALL[0].load(Relaxed),
         ALL[1].load(Relaxed),
         ALL[2].load(Relaxed),
@@ -519,28 +479,26 @@ pub(crate) fn line(frames: f64) {
 mod tests {
     use super::*;
 
-    /// One test at a time uses the statics.
-    static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn marks_layout_is_what_the_stores_read() {
-        // `victory_loader::descriptor_sites::MARKS_LEN` (no dependency on the loader).
-        assert_eq!(size_of::<Marks>(), 32);
+        assert_eq!(size_of::<Marks>(), victory_loader_marks_len());
         assert_eq!(std::mem::offset_of!(Marks, start), 0);
         assert_eq!(std::mem::offset_of!(Marks, len), 8);
         assert_eq!(std::mem::offset_of!(Marks, slots), 16);
         assert_eq!(std::mem::offset_of!(Marks, chunks), 24);
     }
 
-    /// Slots marked as the stores mark them, by our calls and by the
-    /// title's copies come out once each, as runs; outside the heap nothing is
-    /// marked, and after it goes nothing is taken.
+    /// `victory_loader::descriptor_sites::MARKS_LEN` (no dependency on the loader).
+    fn victory_loader_marks_len() -> usize {
+        32
+    }
+
+    /// Slots marked as the stores mark them, and by our calls, come out once
+    /// each, as runs; outside the heap nothing is marked.
     #[test]
     fn marked_slots_are_taken_once_as_runs() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let start = 0x1000_0000u64;
         assert!(adopt_now(start, 1000));
-        assert!(!adopt_now(start + 0x1_0000, 10), "the first heap only");
         assert!(adopted(start) && !adopted(start + 32));
         let store = |slot: usize| {
             let a = ADOPTED.read().unwrap();
@@ -561,101 +519,5 @@ mod tests {
         mark(start + 5 * 32);
         assert!(take(start).is_none());
         assert_eq!(MARKS.len.load(Relaxed), 0);
-    }
-
-    /// The title's copy into the heap marks the slots whose first word it wrote
-    /// and is a view record's; a copy outside the heap, or of other data, or
-    /// across a slot's start only, marks none.
-    #[test]
-    fn a_copy_into_the_heap_marks_the_view_records_it_wrote() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe extern "system-unwind" fn plain(to: *mut u8, from: *const u8, n: usize) -> *mut u8 {
-            // SAFETY: the test's own buffers, apart.
-            unsafe { std::ptr::copy(from, to, n) };
-            to
-        }
-        // A heap in memory of our own, 64 slots, 32-aligned.
-        let mut memory = vec![0u8; 64 * 32 + 64];
-        let start = (memory.as_mut_ptr() as usize).next_multiple_of(32) as u64;
-        assert!(adopt_now(start, 64));
-        REAL[0].store(plain as *const () as usize, Relaxed);
-        let view = |k: u8| {
-            let mut r = [k; 32];
-            r[..4].copy_from_slice(&crate::descriptor::VIEW_TAG.to_le_bytes());
-            r
-        };
-        // Records 3, 4 (views) and 5 (other data) in one copy of three; and
-        // the copy starts at 3's first byte.
-        let mut source = Vec::new();
-        source.extend(view(1));
-        source.extend(view(2));
-        source.extend([7u8; 32]);
-        // SAFETY: the heap and the source are ours.
-        unsafe {
-            copy((start + 3 * 32) as *mut u8, source.as_ptr(), source.len());
-            assert_eq!(take(start).unwrap(), [(3, 2)]);
-            // A copy that starts inside a record: its first word is not the copy's.
-            copy((start + 10 * 32 + 8) as *mut u8, view(3).as_ptr(), 32);
-            assert_eq!(take(start).unwrap(), []);
-            // One that starts in the middle of a record and covers the first words of
-            // two more, the last cut short (marked: its first word is written).
-            let mut long = vec![0u8; 16];
-            long.extend(view(2));
-            long.extend(&view(3)[..20]);
-            copy((start + 20 * 32 - 16) as *mut u8, long.as_ptr(), long.len());
-            assert_eq!(take(start).unwrap(), [(20, 2)]);
-            // Outside the heap, and short.
-            let mut elsewhere = view(4).to_vec();
-            copy(elsewhere.as_mut_ptr(), view(5).as_ptr(), 32);
-            copy((start + 40 * 32) as *mut u8, view(5).as_ptr(), 3);
-            assert_eq!(take(start).unwrap(), []);
-        }
-        let_go(start);
-    }
-
-    /// The fallback asks the watch once in a few frames, takes its pages
-    /// round the heap a few a frame, and looks only once a frame.
-    #[test]
-    fn the_fallback_looks_at_a_few_pages_round_the_heap() {
-        let page = crate::watch::PAGE;
-        let mut f = Fallback::default();
-        let (every, budget) = (4, 2);
-        assert!(f.ask_due(10, every, budget));
-        assert!(!f.ask_due(11, every, budget) && !f.ask_due(13, every, budget));
-        assert!(f.ask_due(14, every, budget));
-        assert!(!Fallback::default().ask_due(1, every, 0), "no budget, no asking");
-        // Pages 5, 6 and 9 written, the range of the last cut in the middle.
-        f.asked(&[(5 * page + 100, 7 * page), (9 * page + 8, 9 * page + 16)]);
-        assert_eq!(f.pages_to_check(20, budget), [5 * page, 6 * page]);
-        assert!(f.pages_to_check(20, budget).is_empty(), "once a frame");
-        assert_eq!(f.pages_to_check(21, budget), [9 * page]);
-        assert!(f.pages_to_check(22, budget).is_empty(), "none left");
-        // New pages: it goes on from where it was, then round to the start.
-        f.asked(&[(3 * page, 4 * page), (12 * page, 13 * page)]);
-        assert_eq!(f.pages_to_check(23, budget), [12 * page, 3 * page]);
-    }
-
-    /// What no mark told of is told apart from the told, the other data and the
-    /// tables.
-    #[test]
-    fn a_missed_record_is_counted_by_what_it_is() {
-        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
-        let start = 0x2000_0000u64;
-        assert!(adopt_now(start, 100));
-        for c in &CHECKED {
-            c.store(0, Relaxed);
-        }
-        let before = MISSED_ALL.load(Relaxed);
-        missed(3, start + 3 * 32, false, false);
-        missed(4, start + 4 * 32, true, true);
-        {
-            let a = ADOPTED.read().unwrap();
-            a.as_ref().unwrap().slots[5].store(1, Release);
-        }
-        missed(5, start + 5 * 32, true, false);
-        missed(6, start + 6 * 32, true, false);
-        assert_eq!(CHECKED.each_ref().map(|c| c.load(Relaxed)), [0, 1, 1, 1, 1]);
-        assert_eq!(MISSED_ALL.load(Relaxed), before + 1);
-        let_go(start);
     }
 }

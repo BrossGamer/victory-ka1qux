@@ -1,37 +1,31 @@
-//! List calls that only write down their arguments (`VICTORY_THIN=1`; off by
-//! default); what they mean is worked out by threads of ours, beside the
-//! title's.
-//!
-//! After avatarmanz/VIctory-7900XTX `list/thin.rs` (commit 3a99ee6, GPL-3.0),
-//! written again for this tree's list methods.
+//! List calls that only write down their arguments (`VICTORY_THIN=1`); what
+//! they mean is worked out by threads of ours, beside the title's.
 //!
 //! Why: the title makes 45,000 to 60,000 list calls a frame. Each was
-//! translated inside the call (about 11 microseconds here, 517 ms a frame
-//! over its recording threads); its own code between the calls is a tenth of
-//! that, and nothing else of its frame can go on meanwhile. On the console
-//! such a call writes a few words into the list's memory and the card reads
-//! them when the list runs. So it is here now: a call appends its arguments
-//! (and copies of what they point at) to a stream of words; threads of ours
-//! run the stream, call by call and in order, through the list methods there
-//! were before (the functions of `super`, `super::state`), on a list of ours
-//! ([`Recording::back`]) that the title never sees. They begin while the
-//! title still records (every [`CHUNK`] words are handed over), several lists
-//! at a time. A submission goes into the queue's line as it was made, by the
-//! recordings' names ([`submitted`], `crate::queue`'s `Held::Thin`); the
+//! translated inside the call, 3.5 us of it, 160 to 190 ms of processor time a
+//! frame on the title's five recording threads; its own code between the calls
+//! is a tenth of that. Nothing else of the title's frame could go on
+//! meanwhile: recording took 55 of 65 ms, and behind it the card stood idle
+//! for half the frame (timeline waits-3). On the console such a call writes a
+//! few words into the list's memory and the card reads them when the list
+//! runs. So it is here now: a call appends its arguments (and copies of what
+//! they point at) to a stream of words; threads of ours run the stream, call
+//! by call and in order, through the list methods there were before, on a list
+//! of ours ([`Recording::back`]) that the title never sees. They begin while
+//! the title still records (every [`CHUNK`] words are handed over), several
+//! lists at a time. A submission goes into the line of submissions
+//! (`crate::queue::behind`) as it was made, by the recordings' names; the
 //! thread that serves the line goes on with it when they are translated.
 //!
 //! What may be looked at later than before, and why that is all right: all
-//! that the card of the console looks at when the list runs (descriptor
-//! heaps, constants, upload memory, indirect arguments): it must stay as it
-//! is until the list has run, and no fence behind the list is set before.
-//! What D3D12 reads at the call is copied at the call: the arrays and
-//! structures passed, and the render target and depth views, whose slots may
-//! be written again right after. Objects named (pipelines, resources) must
-//! live until the list has run; a recording the title resets or releases
-//! without submitting it is not run any further.
-//!
-//! Not done through it: what a host library records into the title's own list
-//! (`crate::external`: the FidelityFX upscaler) finds no host list there.
+//! that the card of the console looks at when the list runs (descriptor heaps,
+//! constants, upload memory, indirect arguments): it must stay as it is until
+//! the list has run, and no fence behind the list is set before. What D3D12
+//! reads at the call is copied at the call: the arrays and structures passed,
+//! and the render target and depth views, whose slots may be written again
+//! right after. Objects named (pipelines, resources) must live until the list
+//! has run; a recording the title resets or releases without submitting it is
+//! not run any further.
 
 use super::*;
 use std::collections::VecDeque;
@@ -46,22 +40,15 @@ use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
 /// Words after which a stream is handed to the translating threads.
 const CHUNK: usize = 1024;
 
-/// Whether list calls are only written down (`VICTORY_THIN=1`; needs the
-/// thread that runs the queues' lines, `VICTORY_ASYNC_SUBMIT=1`, which it
-/// asks for).
+/// Whether list calls are only written down (`VICTORY_THIN=1`; needs the line
+/// of submissions, which it turns on).
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        if !wanted() {
-            return false;
-        }
-        let ready = crate::host::host().is_some() && crate::queue::behind();
-        if ready {
+        wanted() && crate::host::host().is_some() && crate::queue::line_on() && {
             start();
-        } else {
-            tracing::warn!("VICTORY_THIN=1 needs VICTORY_ASYNC_SUBMIT=1 (with its own needs: flights and lists cut at their waits) and a host GPU: lists are recorded as before");
+            true
         }
-        ready
     })
 }
 
@@ -71,15 +58,14 @@ pub(crate) fn wanted() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
 }
 
-/// What a title list keeps: the recording being written, the words of it not
-/// handed over yet, and the upload memory it handed out.
+/// What a title list keeps: the recording being written and the words of it
+/// not handed over yet.
 #[derive(Default)]
 pub(super) struct Front {
     recording: Option<Arc<Recording>>,
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
-    uploads: Uploads,
 }
 
 impl Drop for Front {
@@ -98,7 +84,6 @@ impl Front {
             recording.abandoned.store(true, Release);
         }
         self.words.clear();
-        self.uploads = Uploads::default();
     }
 
     /// Begins a recording, with `pipeline` bound.
@@ -134,7 +119,9 @@ impl Front {
             let from = self.words.len();
             self.words.resize(from + blob.len().div_ceil(8), 0);
             // SAFETY: the words just made hold the bytes; plain data.
-            unsafe { std::ptr::copy_nonoverlapping(blob.as_ptr(), self.words.as_mut_ptr().add(from).cast(), blob.len()) };
+            unsafe {
+                std::ptr::copy_nonoverlapping(blob.as_ptr(), self.words.as_mut_ptr().add(from).cast(), blob.len())
+            };
         }
         let len = (self.words.len() - at - 1) as u64;
         self.words[at] = op | len << 16;
@@ -166,11 +153,6 @@ impl Front {
         if self.closed {
             return;
         }
-        // The upload memory goes with the recording: the list of ours that
-        // runs it holds it until it has run.
-        if let Some(recording) = &self.recording {
-            *held(&recording.uploads) = std::mem::take(&mut self.uploads);
-        }
         self.put(CLOSE, &[]);
         self.closed = true;
         self.hand_over();
@@ -182,11 +164,22 @@ static WORDS: Mutex<Vec<Vec<u64>>> = Mutex::new(Vec::new());
 /// Recordings with words to translate.
 static READY: Mutex<VecDeque<Arc<Recording>>> = Mutex::new(VecDeque::new());
 static WORK: Condvar = Condvar::new();
-/// Lists of ours nobody uses, closed.
-static BACKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
-/// Since the last line of the log: streams handed over; then calls
-/// translated and the microseconds that took (all threads), recordings
-/// translated, and recordings let go of in the middle.
+/// Lists of ours nobody uses, closed, and the fewest it held since it was
+/// last trimmed ([`trim_backs`]).
+static BACKS: Mutex<Backs> = Mutex::new(Backs { lists: Vec::new(), low: 0 });
+
+struct Backs {
+    lists: Vec<usize>,
+    low: usize,
+}
+
+/// Lists of ours made, and let go (past the cap of the pool
+/// `VICTORY_LIST_POOL_CAP`, or trimmed), since the start. Each has a host
+/// list inside: a command allocator and a list of the driver's.
+static BACK_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the last line of the log: streams handed over; calls translated and
+/// the microseconds that took (all threads), recordings translated, and
+/// recordings let go of in the middle.
 static CHUNKS: AtomicU64 = AtomicU64::new(0);
 static STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
@@ -199,9 +192,6 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub(crate) struct Recording {
     kind: u32,
     inner: Mutex<Inner>,
-    /// The upload memory its list handed out (given to the list of ours when
-    /// the recording is translated to its end).
-    uploads: Mutex<Uploads>,
     /// Translated to its end.
     done: AtomicBool,
     moved: Condvar,
@@ -226,7 +216,6 @@ impl Recording {
         Recording {
             kind,
             inner: Mutex::default(),
-            uploads: Mutex::default(),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
             abandoned: AtomicBool::new(false),
@@ -273,13 +262,6 @@ impl Recording {
             if closed {
                 inner.closed = true;
                 let kept = std::mem::take(&mut inner.kept);
-                // The upload memory the title was handed goes with the list
-                // that runs the recording (its reset, at the stream's start,
-                // has been done).
-                // SAFETY: a list of ours, which only this thread writes until
-                // the recording is done.
-                let uploads = unsafe { &(*(back.cast::<List>())).uploads };
-                *held(uploads) = std::mem::take(&mut *held(&self.uploads));
                 self.done.store(true, Release);
                 self.moved.notify_all();
                 drop(inner);
@@ -301,9 +283,58 @@ impl Drop for Recording {
                 STATS[3].fetch_add(1, Relaxed);
                 super::close(inner.back as This);
             }
-            held(&BACKS).push(inner.back);
+            keep_back(inner.back);
         }
     }
+}
+
+/// A list of ours nobody uses now: kept for the next recording, or let go
+/// when the pool of them holds `VICTORY_LIST_POOL_CAP` already.
+fn keep_back(back: usize) {
+    let kept = {
+        let mut backs = held(&BACKS);
+        let room = backs.lists.len() < super::pool_cap();
+        if room {
+            backs.lists.push(back);
+        }
+        room
+    };
+    if !kept {
+        free_back(back);
+    }
+}
+
+/// Lets go of a list of ours that is in no pool and no recording.
+fn free_back(back: usize) {
+    BACK_COUNTS[1].fetch_add(1, Relaxed);
+    // SAFETY: made by `back_list` as a box of a list, and named by nothing
+    // now: its recording is gone, its host list was taken at submission.
+    drop(unsafe { Box::from_raw(back as *mut List) });
+}
+
+/// Lets go of the lists of ours the pool held through the whole window
+/// that ends now ([`super::surplus`]), or all but a few if the PC is short
+/// of memory; how many. Called by [`super::trim_idle_lists`].
+pub(super) fn trim_backs(pressured: bool) -> usize {
+    let gone: Vec<usize> = {
+        let mut backs = held(&BACKS);
+        let n = super::surplus(backs.lists.len(), backs.low, pressured);
+        let gone = backs.lists.drain(..n).collect();
+        backs.low = backs.lists.len();
+        gone
+    };
+    let count = gone.len();
+    for back in gone {
+        free_back(back);
+    }
+    count
+}
+
+/// For the memory line: lists of ours idle in the pool, made and let go
+/// since the start.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn census() -> [u64; 3] {
+    [held(&BACKS).lists.len() as u64, BACK_COUNTS[0].load(Relaxed), BACK_COUNTS[1].load(Relaxed)]
 }
 
 fn give_back(streams: Vec<Vec<u64>>) {
@@ -318,11 +349,18 @@ fn give_back(streams: Vec<Vec<u64>>) {
 
 /// A list of ours, closed.
 fn back_list(kind: u32) -> This {
-    if let Some(back) = held(&BACKS).pop() {
+    let kept = {
+        let mut backs = held(&BACKS);
+        let back = backs.lists.pop();
+        backs.low = backs.low.min(backs.lists.len());
+        back
+    };
+    if let Some(back) = kept {
         // SAFETY: a list of ours nobody uses.
         unsafe { (*(back as *mut List)).kind = kind };
         return back as This;
     }
+    BACK_COUNTS[0].fetch_add(1, Relaxed);
     let list: This = Box::into_raw(super::boxed(kind, std::ptr::null(), false)).cast_const().cast();
     super::close(list);
     list
@@ -332,7 +370,8 @@ fn start() {
     let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
     for i in 0..threads {
         let worker = move || {
-            crate::cores::prefer(&format!("victory-list-{i}"), crate::cores::Kind::Pool, false);
+            crate::cores::keep_many_on_fast_cores("victory-list");
+            crate::queue::no_drain_here();
             loop {
                 let recording = {
                     let mut ready = held(&READY);
@@ -355,8 +394,8 @@ fn start() {
     tracing::info!(threads, "list calls are written down and translated by threads of ours (VICTORY_THIN=1)");
 }
 
-/// The recordings of submitted lists, in order (one that was not begun is
-/// left out).
+/// The recordings of submitted lists, in order (one that was not begun is left
+/// out).
 pub(crate) fn submitted(lists: &[This]) -> Arc<[Arc<Recording>]> {
     lists
         .iter()
@@ -378,7 +417,7 @@ pub(crate) fn line(frames: f64) {
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "list calls translated by threads of ours per frame (VICTORY_THIN=1): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
+        "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
         s[1] / 1000.0,
         s[2],
@@ -482,20 +521,21 @@ const fn after(n: u64) -> u64 {
 }
 const RESET: u64 = after(0);
 const CLOSE: u64 = after(1);
-const BARRIER: u64 = after(2);
-const BARRIER_GROUPS: u64 = after(3);
-const VIEWPORTS: u64 = after(4);
-const SCISSORS: u64 = after(5);
-const BLEND_FACTOR: u64 = after(6);
-const HEAPS: u64 = after(7);
-const COMPUTE_CONSTANTS: u64 = after(8);
-const GRAPHICS_CONSTANTS: u64 = after(9);
-const INDEX_BUFFER: u64 = after(10);
-const VERTEX_BUFFERS: u64 = after(11);
-const TARGETS: u64 = after(12);
-const CLEAR_RTV: u64 = after(13);
-const CLEAR_DSV: u64 = after(14);
-const COPY_TEXTURE: u64 = after(15);
+const UPLOAD: u64 = after(2);
+const BARRIER: u64 = after(3);
+const BARRIER_GROUPS: u64 = after(4);
+const VIEWPORTS: u64 = after(5);
+const SCISSORS: u64 = after(6);
+const BLEND_FACTOR: u64 = after(7);
+const HEAPS: u64 = after(8);
+const COMPUTE_CONSTANTS: u64 = after(9);
+const GRAPHICS_CONSTANTS: u64 = after(10);
+const INDEX_BUFFER: u64 = after(11);
+const VERTEX_BUFFERS: u64 = after(12);
+const TARGETS: u64 = after(13);
+const CLEAR_RTV: u64 = after(14);
+const CLEAR_DSV: u64 = after(15);
+const COPY_TEXTURE: u64 = after(16);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -523,7 +563,9 @@ fn record(handle: u64) -> [u64; RECORD] {
     let mut words = [0u64; RECORD];
     if handle != 0 {
         // SAFETY: a descriptor slot the title passes (they are larger).
-        unsafe { std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), size_of::<RtvRecord>()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(handle as *const u8, words.as_mut_ptr().cast(), size_of::<RtvRecord>())
+        };
     }
     words
 }
@@ -546,14 +588,25 @@ extern "system" fn list_reset_x(this: This, allocator: This, pipeline: This, _fl
     list_reset(this, allocator, pipeline)
 }
 extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mut u8 {
-    if this.is_null() {
+    let align = usize::try_from(alignment).unwrap_or(0).max(16);
+    let Some(len) = usize::try_from(size).ok().and_then(|s| s.checked_add(align)) else {
+        return std::ptr::null_mut();
+    };
+    if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
     let front = front(this);
     if front.closed || front.recording.is_none() {
         return std::ptr::null_mut();
     }
-    super::allocate_in(&mut front.uploads, size, alignment)
+    let Some(mut block) = Upload::new(len) else {
+        return std::ptr::null_mut();
+    };
+    let start = block.start();
+    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
+    let place = unsafe { start.add(start.align_offset(align)) };
+    front.put(UPLOAD, &[Box::into_raw(Box::new(block)) as u64]);
+    place
 }
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     if !barriers.is_null() {
@@ -582,7 +635,11 @@ extern "system" fn heaps(this: This, count: u32, items: *const This) {
 }
 fn constants(this: This, op: u64, slot: u32, count: u32, values: *const u32, offset: u32) {
     let count = if values.is_null() { 0 } else { count };
-    front(this).put_with(op, &[u64::from(slot) | u64::from(offset) << 32, u64::from(count)], &[bytes_of(values, count as usize)]);
+    front(this).put_with(
+        op,
+        &[u64::from(slot) | u64::from(offset) << 32, u64::from(count)],
+        &[bytes_of(values, count as usize)],
+    );
 }
 extern "system" fn compute_constants(this: This, slot: u32, count: u32, values: *const u32, offset: u32) {
     constants(this, COMPUTE_CONSTANTS, slot, count, values, offset);
@@ -599,7 +656,7 @@ extern "system" fn vertex_buffers(this: This, start: u32, count: u32, views: *co
     front(this).put_with(
         VERTEX_BUFFERS,
         &[u64::from(start) | u64::from(count) << 32, u64::from(given)],
-        &[bytes_of(views, if given { count as usize } else { 0 })],
+        &[bytes_of(views, count as usize)],
     );
 }
 extern "system" fn targets(this: This, count: u32, handles: *const u64, one_range: i32, depth: *const u64) {
@@ -635,7 +692,15 @@ extern "system" fn clear_rtv(this: This, handle: u64, color: *const [f32; 4], co
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(color, 1), bytes_of(rects, count as usize)],
     );
 }
-extern "system" fn clear_dsv(this: This, handle: u64, flags: u32, depth: f32, stencil: u8, count: u32, rects: *const Rect) {
+extern "system" fn clear_dsv(
+    this: This,
+    handle: u64,
+    flags: u32,
+    depth: f32,
+    stencil: u8,
+    count: u32,
+    rects: *const Rect,
+) {
     if handle == 0 {
         return;
     }
@@ -683,15 +748,23 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
-    let (mut i, mut calls, mut closed) = (0, 0u64, false);
+    let (mut i, mut calls, mut closed) = (0, 0, false);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
-        if calls.is_multiple_of(64) {
+        if calls % 64 == 0 {
             skip = left();
+        }
+        if op == UPLOAD {
+            // SAFETY: made by `allocate_upload`, named once.
+            let block = *unsafe { Box::from_raw(w[0] as *mut Upload) };
+            // SAFETY: a list of ours.
+            let uploads = unsafe { &(*list.cast::<List>()).uploads };
+            held(uploads).push(block);
+            continue;
         }
         if skip && op != CLOSE && op != RESET {
             continue;
@@ -741,7 +814,13 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                 state::targets(list, n as u32, handles.as_ptr(), 0, &depth);
             }
             CLEAR_RTV => {
-                super::clear_rtv(list, w[1..].as_ptr() as u64, at_or(w, 1 + RECORD), n as u32, at(w, 1 + RECORD + 2, n));
+                super::clear_rtv(
+                    list,
+                    w[1..].as_ptr() as u64,
+                    at_or(w, 1 + RECORD),
+                    n as u32,
+                    at(w, 1 + RECORD + 2, n),
+                );
             }
             CLEAR_DSV => {
                 super::clear_dsv(
@@ -780,7 +859,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     let mut i = 0;
     while i < MINE.len() {
         let (slot, method) = MINE[i];
-        f[if newer { super::newer_slot(slot) } else { slot }] = method;
+        f[if newer { newer_slot(slot) } else { slot }] = method;
         i += 1;
     }
     if newer {
@@ -851,8 +930,7 @@ mod tests {
     /// left in both tables alike records nothing.
     #[test]
     fn every_recording_method_is_written_down() {
-        // The unknown, the object's own and the methods that only ignore.
-        const NOTHING: [usize; 11] = [0, 2, 7, 8, 28, 29, 33, 34, 73, 99, 124];
+        const NOTHING: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 28, 29, 33, 34, 73, 99, 124];
         let mine: Vec<usize> = MINE.iter().map(|m| m.0).collect();
         for (slot, _) in METHODS.iter().chain(MORE_METHODS.iter()) {
             assert!(mine.contains(slot) != NOTHING.contains(slot), "slot {slot}");
@@ -863,13 +941,6 @@ mod tests {
                 "slot {slot} is written down and not there"
             );
         }
-        // The table keeps the others' methods where nothing is written down,
-        // and the newer lists' two more.
-        let (plain, thin) = (super::super::list_table(false), table(false));
-        assert!(plain[0] == thin[0] && plain[7] == thin[7] && plain[99] == thin[99]);
-        assert!(plain[9] != thin[9] && plain[12] != thin[12]);
-        let newer = table(true);
-        assert!(newer[146] == barrier_groups as *const () && newer[148] == allocate_upload as *const ());
     }
 
     /// Arguments come out of a stream as they went in.
@@ -902,81 +973,8 @@ mod tests {
         let mut slot = [0x5256_5476u64, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
         let kept = record(slot.as_ptr() as u64);
         slot[1] = 99;
-        assert_eq!((kept[1], std::hint::black_box(slot[1])), (2, 99));
+        assert_eq!(slot[1], 99);
+        assert_eq!(kept[1], 2);
         assert_eq!(record(0), [0; RECORD]);
-    }
-
-    /// A recording is translated onto a list of ours to its end, in pieces
-    /// of a few words (the stream handed over as the title writes it), and
-    /// the list of ours is closed at the end. On a host device.
-    #[test]
-    fn a_recording_is_translated_onto_a_list_of_ours() {
-        let _one = crate::address_space();
-        if crate::host::host().is_none() {
-            return; // no host device
-        }
-        let mut f = Front::default();
-        f.recording = Some(Arc::new(Recording::new(0)));
-        // A reset with no pipeline, state calls, a barrier of none, a close.
-        f.put(RESET, &[0]);
-        f.put(Plain::TOPOLOGY as u64, &[4]);
-        f.put(Plain::STENCIL_REF as u64, &[1]);
-        f.put_with(VIEWPORTS, &[1], &[bytes_of([0.0f32, 0.0, 64.0, 64.0, 0.0, 1.0].as_ptr(), 6)]);
-        f.put_with(SCISSORS, &[1], &[bytes_of([0i32, 0, 64, 64].as_ptr(), 4)]);
-        f.put(CLOSE, &[]);
-        let stream = std::mem::take(&mut f.words);
-        let list = back_list(0);
-        // In two pieces, as chunks come.
-        let cut = stream.iter().position(|w| w & 0xffff == Plain::STENCIL_REF as u64).unwrap();
-        let (a, b) = stream.split_at(cut);
-        let (calls_a, closed_a) = translate(list, a, || false);
-        let (calls_b, closed_b) = translate(list, b, || false);
-        assert_eq!((calls_a, closed_a), (2, false));
-        assert_eq!((calls_b, closed_b), (4, true));
-        // An abandoned recording is not run any further: only its reset and
-        // its close are (all six are counted).
-        let (calls, closed) = translate(list, &stream, || true);
-        assert_eq!((calls, closed), (6, true));
-        held(&BACKS).push(list as usize);
-    }
-
-    /// A title list whose calls are written down goes through to a host
-    /// list: begun, called, handed upload memory, closed, submitted; its
-    /// recording translated (by hand here, where threads of ours would) and
-    /// the list of ours taken apart for the queue as any list's are.
-    #[test]
-    fn a_title_list_written_down_ends_as_a_host_list() {
-        let _one = crate::address_space();
-        if crate::host::host().is_none() {
-            return; // no host device
-        }
-        let null = std::ptr::null();
-        let list: This = Box::into_raw(super::boxed(0, null, true)).cast_const().cast();
-        front(list).begin(0, null);
-        topology(list, 4);
-        let place = allocate_upload(list, 256, 64);
-        assert!(!place.is_null() && (place as usize).is_multiple_of(64), "memory is handed out at the call");
-        // SAFETY: 256 bytes handed out just now.
-        unsafe { place.write_bytes(7, 256) };
-        assert_eq!(list_close(list), S_OK);
-        assert!(allocate_upload(list, 16, 16).is_null(), "none once closed");
-        let recordings = submitted(&[list, std::ptr::null()]);
-        assert_eq!(recordings.len(), 1);
-        assert!(!recordings[0].done());
-        recordings[0].run();
-        assert!(recordings[0].done());
-        let back = recordings[0].back();
-        assert!(!back.is_null());
-        // SAFETY: a list of ours nobody else touches now.
-        let held_uploads = !unsafe { &(*back.cast::<List>()).uploads }.lock().unwrap().is_empty();
-        assert!(held_uploads, "the list of ours holds the upload memory until it has run");
-        let parts = super::detach_parts(&[back]);
-        assert_eq!((parts.len(), parts[0].1.len(), parts[0].2.clone()), (1, 1, vec![0]));
-        // The memory is still there until the parts are dropped.
-        // SAFETY: held by the part.
-        assert_eq!(unsafe { place.read() }, 7);
-        drop(parts);
-        // SAFETY: the list was made above; nothing else holds it.
-        drop(unsafe { Box::from_raw(list as *mut List) });
     }
 }

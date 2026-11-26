@@ -8,12 +8,9 @@
 //! exception too), is reported from the unhandled-exception filter
 //! (`report_unhandled`, which the runtime calls ahead of the title's own)
 //! and appended to the crash log, with the title's last debug output, which
-//! often states the reason. Diagnostics builds can also append first-chance
-//! breakpoints with `VICTORY_CRASH_BREAKPOINTS=1`. Panics of ours go to the
-//! crash log too.
+//! often states the reason. Panics of ours go to the crash log too.
 
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use windows_sys::Win32::Foundation::{
     EXCEPTION_ACCESS_VIOLATION, EXCEPTION_BREAKPOINT, EXCEPTION_ILLEGAL_INSTRUCTION,
     EXCEPTION_INT_DIVIDE_BY_ZERO, EXCEPTION_PRIV_INSTRUCTION, EXCEPTION_STACK_OVERFLOW, HMODULE,
@@ -48,21 +45,17 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
-/// Read before installing the exception handler.
-static LOG_FIRST_CHANCE_BREAKPOINTS: AtomicBool = AtomicBool::new(false);
-
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
     if LOG.set(file).is_ok() {
-        let _ = HOST.set(host());
         let print = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             print(info);
             append_to_log(&format!(
                 "VIctory: panic on thread {:?}: {info}\n{}",
                 std::thread::current().name().unwrap_or("?"),
-                report_end()
+                title_output()
             ));
         }));
     }
@@ -72,7 +65,7 @@ pub fn log_crashes_to(file: std::path::PathBuf) {
 /// log, with the title's last debug output, and prints it.
 pub fn log_crash(text: &str) {
     let text = format!("{text}
-{}", report_end());
+{}", title_output());
     eprint!("{text}");
     append_to_log(&text);
 }
@@ -115,57 +108,6 @@ fn title_output() -> String {
     said.iter().map(|l| format!("  title said: {l}\n")).collect()
 }
 
-/// The host's line in a crash report. Its CPU and Windows build decide what
-/// title code runs (Intel CPUs lack some of the console's AMD-only
-/// instructions) and which D3D12 runtime there is, so a report needs both.
-/// Set along with the crash log, so a crash queries nothing.
-static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-/// What ends a crash report: the host, then the title's last debug output.
-fn report_end() -> String {
-    let host = HOST.get().map_or("", String::as_str);
-    format!("{host}{}", title_output())
-}
-
-/// The line [`HOST`] holds.
-fn host() -> String {
-    format!("  host: {}, Windows {}\n", cpu_name(), windows_version())
-}
-
-/// The CPU's brand string, e.g. `AMD Ryzen 7 5700X3D 8-Core Processor`.
-fn cpu_name() -> String {
-    use std::arch::x86_64::__cpuid;
-    if __cpuid(0x8000_0000).eax < 0x8000_0004 {
-        return "an unnamed CPU".into();
-    }
-    let bytes: Vec<u8> = (0x8000_0002..=0x8000_0004)
-        .flat_map(|leaf| {
-            let r = __cpuid(leaf);
-            [r.eax, r.ebx, r.ecx, r.edx]
-        })
-        .flat_map(u32::to_le_bytes)
-        .collect();
-    let padding = |c: char| c == '\0' || c.is_whitespace();
-    let name = String::from_utf8_lossy(&bytes);
-    name.trim_matches(padding).to_owned()
-}
-
-/// The running Windows as `major.minor.build`. `RtlGetVersion` gives the
-/// real one; `GetVersionEx` gives what the executable's manifest declares.
-fn windows_version() -> String {
-    use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
-    use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
-    // SAFETY: a zeroed OSVERSIONINFOW is valid; its size field is set.
-    let mut info: OSVERSIONINFOW = unsafe { std::mem::zeroed() };
-    info.dwOSVersionInfoSize = size_of::<OSVERSIONINFOW>() as u32;
-    // SAFETY: fills the structure passed, whose size it was told.
-    if unsafe { RtlGetVersion(&mut info) } != 0 {
-        return "of unknown version".into();
-    }
-    let (major, minor, build) = (info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber);
-    format!("{major}.{minor}.{build}")
-}
-
 /// Installs the handlers; call once before running title code.
 pub fn report_crashes() {
     unsafe extern "system" fn filter(info: *const EXCEPTION_POINTERS) -> i32 {
@@ -173,11 +115,6 @@ pub fn report_crashes() {
         unsafe { report_unhandled(info) };
         EXCEPTION_CONTINUE_SEARCH
     }
-    LOG_FIRST_CHANCE_BREAKPOINTS.store(
-        cfg!(feature = "diagnostics")
-            && std::env::var_os("VICTORY_CRASH_BREAKPOINTS").is_some_and(|value| value == "1"),
-        Ordering::Relaxed,
-    );
     // SAFETY: registers handlers that only read the exception they are
     // given; the title's own filter, once it sets one, takes the place of
     // ours and calls `report_unhandled` first.
@@ -201,44 +138,11 @@ const FATAL: [i32; 6] = [
 /// lack. Does their job instead: `clzero` (`0f 01 fc`) zeroes the 64-byte
 /// line at `rax` (see [`clzero`] for the loops around it);
 /// `monitorx`/`mwaitx` (`0f 01 fa`/`fb`) are wait hints, so a spin loop
-/// around them works with mwaitx as a yield (counted per address, and with
-/// `VICTORY_REWRITE_WAITS=1` rewritten in place: [`rewrite_wait`]); `rdpru`
-/// (`0f 01 fd`) reads
+/// around them works with mwaitx as a yield; `rdpru` (`0f 01 fd`) reads
 /// MPERF (`ecx` 0) or APERF (1), cycles at the nominal and the actual
 /// frequency, and gets the time-stamp counter for both: a core that never
 /// changes frequency.
 unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: forwarded from the caller.
-    unsafe { emulate_amd_only_as(info, rewrite_waits()) }
-}
-
-/// [`emulate_amd_only`] with the `VICTORY_REWRITE_WAITS` setting given (see
-/// [`rewrite_waits`]).
-unsafe fn emulate_amd_only_as(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -> bool {
-    // SAFETY: forwarded from the caller.
-    if unsafe { emulate_amd_only_now(info, rewrite) } {
-        return true;
-    }
-    // An instruction this thread faulted on, which another thread has
-    // rewritten since: the bytes there are legal, so the exception is no
-    // crash, and the thread goes on to run them from the same place
-    // ([`note_patched`]).
-    // SAFETY: the system passes valid exception pointers.
-    let (illegal, at) = unsafe {
-        (
-            (*(*info).ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION,
-            (*(*info).ContextRecord).Rip as usize,
-        )
-    };
-    if illegal && is_patched(at) {
-        STALE_FAULTS.fetch_add(1, Ordering::Relaxed);
-        return true;
-    }
-    false
-}
-
-/// [`emulate_amd_only_as`] without that last chance.
-unsafe fn emulate_amd_only_now(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
     unsafe {
@@ -250,21 +154,8 @@ unsafe fn emulate_amd_only_now(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) 
         let code = context.Rip as *const u8;
         match code.cast::<[u8; 3]>().read_unaligned() {
             [0x0f, 0x01, 0xfc] => return clzero(context),
-            [0x0f, 0x01, 0xfa] => {
-                count_wait(context.Rip as usize, false);
-                // Rewritten, it runs as the new instruction from the same
-                // place; if it cannot be, this one is skipped as a hint.
-                if rewrite != Rewrite::Off && rewrite_wait(context.Rip as usize, false) {
-                    return true;
-                }
-            }
-            [0x0f, 0x01, 0xfb] => {
-                count_wait(context.Rip as usize, true);
-                if rewrite == Rewrite::Both && rewrite_wait(context.Rip as usize, true) {
-                    return true;
-                }
-                std::thread::yield_now();
-            }
+            [0x0f, 0x01, 0xfa] => {}
+            [0x0f, 0x01, 0xfb] => std::thread::yield_now(),
             [0x0f, 0x01, 0xfd] => {
                 // Flags are left as they are: a Zen 3 changes none, for
                 // known counters or not (measured in user mode).
@@ -297,15 +188,9 @@ unsafe fn emulate_amd_only_now(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) 
                     context.Rip += len as u64;
                     return true;
                 }
-                let rewrite = rewrite_sse4a();
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters, rewrite) else {
+                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
                     return false;
                 };
-                // After the first fault at a place with its field in the
-                // instruction, a jump to the same work in SSE2 takes the place
-                // of the instruction's first bytes (`VICTORY_REWRITE_SSE4A=1`).
-                let replaced = rewrite && crate::sse4a::replace(context.Rip as usize);
-                count_sse4a(context.Rip as usize, bytes[0] == 0xf2, replaced);
                 context.Rip += len as u64;
                 return true;
             }
@@ -313,365 +198,6 @@ unsafe fn emulate_amd_only_now(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) 
         context.Rip += 3;
     }
     true
-}
-
-/// What `VICTORY_REWRITE_WAITS` asks for ([`rewrite_waits`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Rewrite {
-    /// Every `monitorx` and `mwaitx` is emulated by an exception, every time.
-    Off,
-    /// Only `monitorx` is rewritten (`VICTORY_REWRITE_WAITS=monitor`): the
-    /// `mwaitx` of a loop stays an exception that yields the thread.
-    Monitor,
-    /// Both are rewritten (`VICTORY_REWRITE_WAITS=1`).
-    Both,
-}
-
-/// Whether the console's wait instructions are rewritten in place the
-/// first time the CPU refuses them (`VICTORY_REWRITE_WAITS=1`; off by
-/// default). An Intel CPU has neither `monitorx` nor `mwaitx`, so a title's
-/// wait loop takes an exception for each, every pass (a microsecond or two
-/// each, and `mwaitx` also gives the thread's time slice away). Rewritten,
-/// the three bytes of `monitorx` become a three-byte `nop` and the three of
-/// `mwaitx` `pause` and a `nop`: both are hints that change no register and
-/// no flag, and the loop around them checks its own condition. The loop
-/// then spins on `pause` where it gave the time slice away: a core's worth
-/// of a waiting thread either way. `monitor` rewrites only `monitorx`.
-/// (An idea of the XCL project, described to us; nothing of its code.)
-fn rewrite_waits() -> Rewrite {
-    static SETTING: std::sync::OnceLock<Rewrite> = std::sync::OnceLock::new();
-    *SETTING.get_or_init(|| match std::env::var("VICTORY_REWRITE_WAITS").as_deref() {
-        Ok("1") => Rewrite::Both,
-        Ok("monitor") => Rewrite::Monitor,
-        _ => Rewrite::Off,
-    })
-}
-
-const MONITORX: [u8; 3] = [0x0f, 0x01, 0xfa];
-const MWAITX: [u8; 3] = [0x0f, 0x01, 0xfb];
-/// `nop dword ptr [rax]`: the recommended three-byte `nop`, which touches no
-/// memory.
-const NOP3: [u8; 3] = [0x0f, 0x1f, 0x00];
-/// `pause`, then a `nop`.
-const PAUSE_NOP: [u8; 3] = [0xf3, 0x90, 0x90];
-
-/// The instruction at `at` (a `monitorx`, or an `mwaitx` if `mwait`), made
-/// the equivalent the CPU runs without an exception, in place: true if the
-/// bytes there are the new ones now (written here or by another thread
-/// that took the same exception), false if they are left as they are.
-///
-/// The three bytes are written with one atomic compare-and-exchange of the
-/// eight bytes of their cache line that hold them (a thread that fetches
-/// them at that moment sees the old instruction, which it faults on as this
-/// thread did, or the new one, never a mixture); none is written if they
-/// cross a cache line or a page. The page is made writable for the write
-/// alone and put back as it was, one rewrite at a time (two threads
-/// changing one page's protection would put it back wrong). A failure of
-/// the protection call is remembered, and none is tried again.
-///
-/// No jump can land inside the three bytes: they are one instruction the
-/// title's compiler wrote, and a jump into its middle would decode as
-/// another (`01 fa` is `add edx, edi`).
-unsafe fn rewrite_wait(at: usize, mwait: bool) -> bool {
-    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
-    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let (was, to) = if mwait { (MWAITX, PAUSE_NOP) } else { (MONITORX, NOP3) };
-    let line_start = at & !63;
-    if at + 3 > line_start + 64 || PROTECT_FAILED.load(Ordering::Relaxed) {
-        return false;
-    }
-    let _alone = CODE_PATCH.lock().unwrap_or_else(|e| e.into_inner());
-    // The eight bytes inside the line that cover the three.
-    let word = at.min(line_start + 56);
-    let shift = at - word;
-    let page = at & !0xfff;
-    let mut old = 0u32;
-    // SAFETY: the page of the instruction the CPU just refused: mapped, and
-    // executable, so made writable (the title's code, which nothing of ours
-    // uses as data).
-    if unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
-        PROTECT_FAILED.store(true, Ordering::Relaxed);
-        return false;
-    }
-    let mut done = false;
-    for _ in 0..8 {
-        // SAFETY: eight readable bytes inside the page, now writable.
-        let now = unsafe { (word as *const u64).read_unaligned() }.to_le_bytes();
-        if now[shift..shift + 3] == to {
-            done = true;
-            break;
-        }
-        if now[shift..shift + 3] != was {
-            break; // not the instruction that was refused: leave it
-        }
-        let mut new = now;
-        new[shift..shift + 3].copy_from_slice(&to);
-        // SAFETY: as above; the exchange writes the eight bytes back whole.
-        if unsafe { compare_exchange(word as *mut u64, u64::from_le_bytes(now), u64::from_le_bytes(new)) } {
-            REWRITTEN[usize::from(mwait)].fetch_add(1, Ordering::Relaxed);
-            done = true;
-            break;
-        }
-    }
-    let mut restored = 0u32;
-    // SAFETY: the page as it was.
-    unsafe {
-        VirtualProtect(page as *const _, 0x1000, old, &mut restored);
-        if done {
-            FlushInstructionCache(GetCurrentProcess(), at as *const _, 3);
-        }
-    }
-    if done {
-        note_patched(at);
-    }
-    done
-}
-
-/// One thread at a time changes the title's code ([`rewrite_wait`], and
-/// `crate::sse4a` for `VICTORY_REWRITE_SSE4A`): two changing one page's
-/// protection would put it back wrong.
-pub(crate) static CODE_PATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-/// A change of a page's protection failed: no code is changed after.
-pub(crate) static PROTECT_FAILED: AtomicBool = AtomicBool::new(false);
-
-const PATCHED_SLOTS: usize = 4096;
-/// The addresses of the title's instructions that were changed in place
-/// (nothing is ever taken out), for a thread that faulted on the old bytes
-/// and reads the new ones when its handler runs: the new bytes are legal
-/// instructions, so no exception at such an address is a crash, and the
-/// thread is let go on to run them. Open addressing, no lock and no
-/// allocation: the exception handler reads it on any thread.
-static PATCHED: [AtomicUsize; PATCHED_SLOTS] = [const { AtomicUsize::new(0) }; PATCHED_SLOTS];
-/// Exceptions let go on that way since the start.
-static STALE_FAULTS: AtomicU64 = AtomicU64::new(0);
-
-fn patched_start(at: usize) -> usize {
-    (at.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) % PATCHED_SLOTS
-}
-
-/// The instruction at `at` was changed in place and now holds legal bytes.
-pub(crate) fn note_patched(at: usize) {
-    let mut i = patched_start(at);
-    for _ in 0..PATCHED_SLOTS {
-        match PATCHED[i].compare_exchange(0, at, Ordering::Release, Ordering::Relaxed) {
-            Ok(_) => return,
-            Err(seen) if seen == at => return,
-            Err(_) => i = (i + 1) % PATCHED_SLOTS,
-        }
-    }
-}
-
-/// Whether [`note_patched`] was told of `at`.
-fn is_patched(at: usize) -> bool {
-    let mut i = patched_start(at);
-    for _ in 0..PATCHED_SLOTS {
-        match PATCHED[i].load(Ordering::Acquire) {
-            0 => return false,
-            seen if seen == at => return true,
-            _ => i = (i + 1) % PATCHED_SLOTS,
-        }
-    }
-    false
-}
-
-/// Whether `extrq` and `insertq` with their field in the instruction are
-/// replaced, after their first fault, by a jump to the same work in SSE2
-/// (`VICTORY_REWRITE_SSE4A=1`; off by default; `crate::sse4a`). Intel CPUs
-/// have no SSE4a: each one is an exception, 191 to 491 a second in a
-/// title's gameplay on one i9, 442 a second at one place (upstream VIctory
-/// #3042). With it on, the emulation also zeroes the destination's high
-/// quadword ([`sse4a`]), as the SSE2 code does.
-fn rewrite_sse4a() -> bool {
-    #[cfg(test)]
-    if FORCE_SSE4A.get() {
-        return true;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_REWRITE_SSE4A").is_some_and(|v| v == "1"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test turns the rewriting on for its own thread (the exceptions
-    /// it takes are handled on it), so that tests that run other code on
-    /// other threads see none of it.
-    static FORCE_SSE4A: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Turns [`rewrite_sse4a`] on for this thread, in a test.
-#[cfg(test)]
-pub(crate) fn force_rewrite_sse4a(on: bool) {
-    FORCE_SSE4A.set(on);
-}
-
-/// [`emulate_amd_only`], for the tests of `crate::sse4a`.
-#[cfg(test)]
-pub(crate) unsafe fn emulate_amd_only_for_test(info: *mut EXCEPTION_POINTERS) -> bool {
-    // SAFETY: forwarded from the caller.
-    unsafe { emulate_amd_only(info) }
-}
-
-/// `lock cmpxchg` of eight bytes at `at` (inside one cache line, so atomic
-/// even if not aligned): whether `current` was there and `new` is now.
-unsafe fn compare_exchange(at: *mut u64, current: u64, new: u64) -> bool {
-    let swapped: u8;
-    // SAFETY: the caller's eight writable bytes inside a cache line.
-    unsafe {
-        std::arch::asm!(
-            "lock cmpxchg qword ptr [{at}], {new}",
-            "sete {swapped}",
-            at = in(reg) at,
-            new = in(reg) new,
-            swapped = out(reg_byte) swapped,
-            inout("rax") current => _,
-            options(nostack),
-        );
-    }
-    swapped != 0
-}
-
-/// The console's wait instructions the CPU refused, by address: the address
-/// (bit 63: an `mwaitx`; 0: the slot is free) and the faults since the last
-/// line ([`wait_fault_line`]).
-struct WaitSlot {
-    at: AtomicUsize,
-    hits: AtomicU64,
-}
-
-const WAIT_SLOTS: usize = 256;
-static WAITS: [WaitSlot; WAIT_SLOTS] =
-    [const { WaitSlot { at: AtomicUsize::new(0), hits: AtomicU64::new(0) } }; WAIT_SLOTS];
-/// Faults at addresses that did not fit in [`WAITS`] (since the last line),
-/// and the instructions rewritten so far: `monitorx`, `mwaitx`.
-static WAITS_LOST: AtomicU64 = AtomicU64::new(0);
-static REWRITTEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-
-/// Counts a fault at the wait instruction at `at`. No lock and no
-/// allocation: the exception handler takes this on any thread.
-fn count_wait(at: usize, mwait: bool) {
-    count_tag(at | (usize::from(mwait) << 63));
-}
-
-/// The kinds of instruction the table [`WAITS`] counts, in the two top bits
-/// of a tag (an address has none of them): 0 `monitorx`, 1 `extrq`, 2
-/// `mwaitx`, 3 `insertq`.
-const KIND_SHIFT: u32 = 62;
-
-fn count_tag(tag: usize) {
-    let at = tag & !(3 << KIND_SHIFT);
-    let mut i = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) % WAIT_SLOTS;
-    for _ in 0..WAIT_SLOTS {
-        let slot = &WAITS[i];
-        let mut seen = slot.at.load(Ordering::Relaxed);
-        if seen == 0 {
-            seen = match slot.at.compare_exchange(0, tag, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => tag,
-                Err(other) => other,
-            };
-        }
-        if seen == tag {
-            slot.hits.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        i = (i + 1) % WAIT_SLOTS;
-    }
-    WAITS_LOST.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Since the last frame line: `extrq` and `insertq` taken by an exception
-/// (of any form), and of those the ones left to the exception for good (the
-/// field in a register, no room for a jump, or the switch off).
-static SSE4A_FAULTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
-static SSE4A_LEFT: AtomicU64 = AtomicU64::new(0);
-
-/// Counts a fault at the `extrq` (or `insertq`) at `at` that was emulated,
-/// and whether its place holds a jump to SSE2 code now. No lock and no
-/// allocation: the exception handler takes this on any thread.
-fn count_sse4a(at: usize, insert: bool, replaced: bool) {
-    count_tag(at | (1 << KIND_SHIFT) | (usize::from(insert) << 63));
-    SSE4A_FAULTS[usize::from(insert)].fetch_add(1, Ordering::Relaxed);
-    if !replaced {
-        SSE4A_LEFT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The frame line for the instructions of the console's CPU that this one
-/// refused: the wait instructions, and SSE4a's `extrq` and `insertq`. How
-/// many faults they took per frame since the last line, at how many
-/// addresses, and which addresses took the most. `None` while there were
-/// none. For the frame lines of the layer
-/// (`victory_gpu::add_frame_line_source`).
-pub fn wait_fault_line(frames: f64) -> Option<String> {
-    let mut seen: Vec<(usize, u64)> = Vec::new();
-    for slot in &WAITS {
-        let hits = slot.hits.swap(0, Ordering::Relaxed);
-        if hits != 0 {
-            seen.push((slot.at.load(Ordering::Relaxed), hits));
-        }
-    }
-    let lost = WAITS_LOST.swap(0, Ordering::Relaxed);
-    // Waits: kinds 0 and 2; SSE4a: 1 and 3.
-    let (mut sse4a_seen, mut seen): (Vec<_>, Vec<_>) = seen.into_iter().partition(|&(tag, _)| tag >> KIND_SHIFT & 1 != 0);
-    let total: u64 = seen.iter().map(|(_, hits)| hits).sum::<u64>() + lost;
-    let mut lines = Vec::new();
-    if total != 0 {
-        seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
-        let top: Vec<String> = seen
-            .iter()
-            .take(4)
-            .map(|&(tag, hits)| {
-                format!(
-                    "{} at {:#x}: {:.0}",
-                    if tag >> 63 != 0 { "mwaitx" } else { "monitorx" },
-                    tag & !(1 << 63),
-                    hits as f64 / frames
-                )
-            })
-            .collect();
-        let [monitorx, mwaitx] = [0, 1].map(|i| REWRITTEN[i].load(Ordering::Relaxed));
-        lines.push(format!(
-            "the console's wait instructions the CPU refused, taken by an exception each, per frame: {:.0} at {} addresses ({}); \
-             VICTORY_REWRITE_WAITS=1 rewrites them in place ({monitorx} monitorx and {mwaitx} mwaitx rewritten so far, {:?})",
-            total as f64 / frames,
-            seen.len(),
-            top.join(", "),
-            rewrite_waits()
-        ));
-    }
-    let [extrq, insertq] = [0, 1].map(|i| SSE4A_FAULTS[i].swap(0, Ordering::Relaxed));
-    let left = SSE4A_LEFT.swap(0, Ordering::Relaxed);
-    let stale = STALE_FAULTS.load(Ordering::Relaxed);
-    if extrq + insertq != 0 {
-        sse4a_seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
-        let top: Vec<String> = sse4a_seen
-            .iter()
-            .take(4)
-            .map(|&(tag, hits)| {
-                format!(
-                    "{} at {:#x}: {:.0}",
-                    if tag >> 63 != 0 { "insertq" } else { "extrq" },
-                    tag & !(3 << KIND_SHIFT),
-                    hits as f64 / frames
-                )
-            })
-            .collect();
-        let [replaced_extrq, replaced_insertq] = [0, 1].map(|i| crate::sse4a::REPLACED[i].load(Ordering::Relaxed));
-        lines.push(format!(
-            "SSE4a instructions the CPU refused, taken by an exception each, per frame: {:.0} extrq and {:.0} insertq at {} addresses \
-             ({}), {:.0} of them left to the exception (the field in a register, no room for a jump, or the switch off); \
-             VICTORY_REWRITE_SSE4A=1 replaces the ones with their field in the instruction by SSE2 code after their first fault \
-             ({replaced_extrq} extrq and {replaced_insertq} insertq replaced so far, {stale} faults let go on at a place another \
-             thread had replaced, {})",
-            extrq as f64 / frames,
-            insertq as f64 / frames,
-            sse4a_seen.len(),
-            top.join(", "),
-            left as f64 / frames,
-            if rewrite_sse4a() { "on" } else { "off" }
-        ));
-    }
-    (!lines.is_empty()).then(|| lines.join("; "))
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -896,13 +422,8 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length. With
-/// `zero_high` the destination's high quadword is zeroed, as AMD's CPUs do
-/// and as the SSE2 code that takes the instruction's place does
-/// (`VICTORY_REWRITE_SSE4A=1`, `crate::sse4a`): every run then gives one
-/// result. AMD documents those bits as undefined; without the switch they
-/// are left as they were.
-pub(crate) unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16], zero_high: bool) -> Option<usize> {
+/// the saved XMM registers; returns the instruction's length.
+unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     // SAFETY: the caller's code bytes are readable up to the instruction's end.
     let b = |i: usize| unsafe { code.add(i).read() };
     let prefix = b(0);
@@ -938,15 +459,9 @@ pub(crate) unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16], zero_high: bo
         }
         let target = if immediate { src } else { dst };
         xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
-        if zero_high {
-            xmm[target].High = 0;
-        }
     } else {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
-        if zero_high {
-            xmm[dst].High = 0;
-        }
     }
     Some(len)
 }
@@ -957,12 +472,9 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
         return -1; // EXCEPTION_CONTINUE_EXECUTION
     }
     // SAFETY: as above.
-    let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
-    if FATAL.contains(&code) {
-        let to_file =
-            code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);
+    if FATAL.contains(&unsafe { (*(*info).ExceptionRecord).ExceptionCode }) {
         // SAFETY: as above.
-        unsafe { report("first-chance exception", info, to_file) };
+        unsafe { report("first-chance exception", info, false) };
     }
     EXCEPTION_CONTINUE_SEARCH
 }
@@ -1099,9 +611,9 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
     }
     if to_file {
-        let end = report_end();
-        eprint!("{end}");
-        text.push_str(&end);
+        let said = title_output();
+        eprint!("{said}");
+        text.push_str(&said);
         append_to_log(&text);
     }
     #[cfg(feature = "diagnostics")]
@@ -1543,21 +1055,6 @@ mod tests {
     }
 
     #[test]
-    fn the_host_line_names_the_cpu_and_windows() {
-        // e.g. "  host: AMD EPYC 7763 64-Core Processor, Windows 10.0.26100\n"
-        let line = host();
-        let framed = line.starts_with("  host: ") && line.ends_with('\n');
-        assert!(framed, "{line:?}");
-        let inner = line.trim_start_matches("  host: ").trim_end();
-        let (cpu, windows) = inner.rsplit_once(", Windows ").expect(&line);
-        let named = !cpu.is_empty() && cpu == cpu.trim() && !cpu.contains('\0');
-        assert!(named, "{line:?}");
-        let version: Vec<u32> = windows.split('.').filter_map(|n| n.parse().ok()).collect();
-        assert!(version.len() == 3 && version[0] >= 10, "{line:?}");
-        println!("{line}");
-    }
-
-    #[test]
     fn clzero_zeroes_its_line_on_any_cpu() {
         report_crashes();
         #[repr(align(64))]
@@ -1801,124 +1298,6 @@ mod tests {
     }
 
     #[test]
-    fn emulated_clzero_loop_stops_when_the_limit_is_on_a_line_boundary() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // clzero; add rax, 0x40; cmp rax, r10; jb, with r10 exactly two lines
-        // on: the loop ends when rax reaches the limit (`>=`, not `>`).
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R10 = start + 128;
-        let code = [
-            0x0f, 0x01, 0xfc, 0x48, 0x83, 0xc0, 0x40, 0x4c, 0x39, 0xd0, 0x72, 0xf4,
-        ];
-        assert!(emulate_in(&code, 0, &mut context));
-        assert_eq!((context.Rip, context.Rax), (12, start + 128));
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 128, start + 128)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, false, false]);
-    }
-
-    #[test]
-    fn emulated_clzero_second_loop_with_extended_registers() {
-        #[repr(align(64))]
-        struct Lines([u8; 256]);
-        // mov rax, r9; add r9, 0x40; clzero; cmp r9, r12; jb. `a` = r9 needs
-        // REX.R in the mov and REX.B in the add and in the cmp; `b` = r12
-        // needs REX.R in the cmp.
-        let mut mem = Lines([0xff; 256]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start;
-        context.R9 = start + 64;
-        context.R12 = start + 192;
-        let code = [
-            0x4c, 0x89, 0xc8, 0x49, 0x83, 0xc1, 0x40, 0x0f, 0x01, 0xfc, 0x4d, 0x39, 0xe1, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.R9),
-            (15, start + 128, start + 192)
-        );
-        assert_eq!(
-            context.EFlags & CMP_FLAGS,
-            native_compare(start + 192, start + 192)
-        );
-        let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-        assert_eq!(zeroed, [true, true, true, false]);
-        // Every `a` in r9..r15 (r12 as the limit, so skip it as `a`).
-        for a in [9_u8, 10, 11, 13, 14, 15] {
-            let mut mem = Lines([0xff; 256]);
-            let start = mem.0.as_mut_ptr() as u64;
-            // SAFETY: an all-zero context is valid.
-            let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-            context.Rax = start;
-            *gpr(&mut context, a) = start + 64;
-            context.R12 = start + 192;
-            let n = a & 7;
-            let code = [
-                0x4c,
-                0x89,
-                0xc0 | n << 3,
-                0x49,
-                0x83,
-                0xc0 | n,
-                0x40,
-                0x0f,
-                0x01,
-                0xfc,
-                0x4d,
-                0x39,
-                0xe0 | n,
-                0x72,
-                0xf1,
-            ];
-            assert!(emulate_in(&code, 7, &mut context), "r{a}");
-            assert_eq!(context.Rip, 15, "r{a}");
-            assert_eq!(*gpr(&mut context, a), start + 192, "r{a}");
-            assert_eq!(context.Rax, start + 128, "r{a}");
-            let zeroed: Vec<bool> = (0..4).map(|i| mem.0[i * 64] == 0).collect();
-            assert_eq!(zeroed, [true, true, true, false], "r{a}");
-        }
-    }
-
-    #[test]
-    fn emulated_clzero_loops_with_rax_as_the_limit_are_one_line() {
-        #[repr(align(64))]
-        struct Lines([u8; 192]);
-        let zeroed = |l: &Lines| [l.0[0] == 0, l.0[64] == 0, l.0[128] == 0];
-        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, rax; jb: the limit
-        // would be the line just zeroed, not a loop: one line, the next
-        // instruction, flags untouched.
-        let mut mem = Lines([0xff; 192]);
-        let start = mem.0.as_mut_ptr() as u64;
-        // SAFETY: an all-zero context is valid.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
-        context.Rax = start + 64;
-        context.Rdx = start + 128;
-        context.EFlags = 0x202;
-        let code = [
-            0x48, 0x89, 0xd0, 0x48, 0x83, 0xc2, 0x40, 0x0f, 0x01, 0xfc, 0x48, 0x39, 0xc2, 0x72,
-            0xf1,
-        ];
-        assert!(emulate_in(&code, 7, &mut context));
-        assert_eq!(
-            (context.Rip, context.Rax, context.Rdx),
-            (10, start + 64, start + 128)
-        );
-        assert_eq!(context.EFlags, 0x202);
-        assert_eq!(zeroed(&mem), [false, true, false]);
-    }
-
-    #[test]
     fn emulated_rdpru_reads_known_counters_and_keeps_flags() {
         let cases = [(0, true), (1, true), (2, false), (0x1_0000_0000, true)];
         let starts = [0x202, 0x202 | CMP_FLAGS];
@@ -2062,215 +1441,5 @@ mod tests {
             assert_eq!(instruction_bytes(end as usize), "0f 01 fd");
             VirtualFree(page.cast(), 0, MEM_RELEASE);
         }
-    }
-
-    /// A page of ours, as a title's code page is: readable and executable,
-    /// not writable, holding `code` at `at`.
-    unsafe fn code_page(code: &[u8], at: usize) -> *mut u8 {
-        use windows_sys::Win32::System::Memory::{
-            MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READ, PAGE_READWRITE, VirtualAlloc, VirtualProtect,
-        };
-        // SAFETY: a page of ours, written before it is made executable.
-        unsafe {
-            let page = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
-            assert!(!page.is_null());
-            // Something else than zeros around: a byte that is touched shows.
-            for i in 0..0x1000 {
-                page.add(i).write((i as u8).wrapping_mul(7) | 1);
-            }
-            page.add(at).copy_from_nonoverlapping(code.as_ptr(), code.len());
-            let mut old = 0;
-            assert_ne!(VirtualProtect(page.cast(), 0x1000, PAGE_EXECUTE_READ, &mut old), 0);
-            page
-        }
-    }
-
-    fn protection(page: *mut u8) -> u32 {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
-        // SAFETY: a plain query of a page of ours.
-        unsafe {
-            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            assert_ne!(VirtualQuery(page.cast(), &mut info, size_of::<MEMORY_BASIC_INFORMATION>()), 0);
-            info.Protect
-        }
-    }
-
-    fn free(page: *mut u8) {
-        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-        // SAFETY: a page the test made.
-        unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
-    }
-
-    /// `VICTORY_REWRITE_WAITS`: the three bytes are the new instruction
-    /// wherever they lie in a cache line, nothing else changes, and the page
-    /// has the protection it had.
-    #[test]
-    fn a_wait_instruction_is_rewritten_in_place_and_nothing_else_is() {
-        use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READ;
-        for mwait in [false, true] {
-            let (was, to) = if mwait { (MWAITX, PAUSE_NOP) } else { (MONITORX, NOP3) };
-            for at in [0usize, 1, 5, 40, 55, 56, 57, 58, 59, 60, 61, 64, 120, 125, 0x7c0 + 61] {
-                // SAFETY: a page of ours; the rewrite touches three bytes.
-                unsafe {
-                    let page = code_page(&was, at);
-                    let before: Vec<u8> = (0..0x1000).map(|i| page.add(i).read()).collect();
-                    let address = page as usize + at;
-                    assert!(rewrite_wait(address, mwait), "at {at}");
-                    let after: Vec<u8> = (0..0x1000).map(|i| page.add(i).read()).collect();
-                    assert_eq!(after[at..at + 3], to, "at {at}");
-                    for i in (0..0x1000).filter(|i| !(at..at + 3).contains(i)) {
-                        assert_eq!(after[i], before[i], "byte {i} changed, rewriting at {at}");
-                    }
-                    assert_eq!(protection(page), PAGE_EXECUTE_READ, "at {at}");
-                    // Done already (by another thread that took the same
-                    // exception): it stays done, and nothing else is written.
-                    assert!(rewrite_wait(address, mwait));
-                    free(page);
-                }
-            }
-        }
-    }
-
-    /// Three bytes that cross a cache line are not rewritten (no atomic
-    /// write covers them), nor bytes that are not the instruction.
-    #[test]
-    fn a_wait_instruction_across_a_line_or_not_there_is_left_alone() {
-        for at in [62usize, 63, 126, 127] {
-            // SAFETY: a page of ours.
-            unsafe {
-                let page = code_page(&MWAITX, at);
-                assert!(!rewrite_wait(page as usize + at, true), "at {at}");
-                assert_eq!(page.add(at).cast::<[u8; 3]>().read(), MWAITX);
-                free(page);
-            }
-        }
-        // An mwaitx where a monitorx was refused, and the reverse.
-        // SAFETY: a page of ours.
-        unsafe {
-            let page = code_page(&MWAITX, 8);
-            assert!(!rewrite_wait(page as usize + 8, false));
-            assert_eq!(page.add(8).cast::<[u8; 3]>().read(), MWAITX);
-            free(page);
-            let page = code_page(&MONITORX, 8);
-            assert!(!rewrite_wait(page as usize + 8, true));
-            assert_eq!(page.add(8).cast::<[u8; 3]>().read(), MONITORX);
-            free(page);
-        }
-    }
-
-    /// The rewritten instructions run on the CPU as they are, change no
-    /// register the title's loop uses (rax, rcx, rdx, the flags) and
-    /// return: this is what the exception path would have done, without it.
-    #[test]
-    fn the_rewritten_wait_instructions_run_and_change_no_register() {
-        for (code, mwait) in [(MONITORX, false), (MWAITX, true)] {
-            let program = [code[0], code[1], code[2], 0xc3]; // the instruction, ret
-            // SAFETY: a page of ours; after the rewrite the code is a nop or
-            // a pause, then ret.
-            unsafe {
-                let page = code_page(&program, 0x80);
-                let at = page as usize + 0x80;
-                assert!(rewrite_wait(at, mwait));
-                let (rax, rcx, rdx): (u64, u64, u64);
-                let flags: u64;
-                std::arch::asm!(
-                    "xor r10, r10",
-                    "cmp r10, 1", // sets the carry flag and others
-                    "call r9",
-                    "pushfq",
-                    "pop r8",
-                    in("r9") at,
-                    out("r8") flags,
-                    inout("rax") 0x1111_2222_3333_4444u64 => rax,
-                    inout("rcx") 0x5555_6666_7777_8888u64 => rcx,
-                    inout("rdx") 0x9999_aaaa_bbbb_ccccu64 => rdx,
-                    out("r10") _,
-                    clobber_abi("C"),
-                );
-                assert_eq!((rax, rcx, rdx), (0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999_aaaa_bbbb_ccccu64));
-                assert_eq!(flags & u64::from(CMP_FLAGS), u64::from(cmp_flags(0, 1)));
-                free(page);
-            }
-        }
-    }
-
-    /// The emulation, given the exception of a wait instruction: with the
-    /// rewrite it leaves `Rip` where it was (the CPU runs the new bytes);
-    /// without it, or when it cannot rewrite, it skips the instruction.
-    #[test]
-    fn a_refused_wait_instruction_is_rewritten_or_skipped() {
-        for (code, mwait) in [(MONITORX, false), (MWAITX, true)] {
-            for (rewrite, rewritten) in [
-                (Rewrite::Off, false),
-                (Rewrite::Monitor, !mwait),
-                (Rewrite::Both, true),
-            ] {
-                // SAFETY: a page of ours; a record and a context of zeros.
-                unsafe {
-                    let page = code_page(&code, 0x100);
-                    let at = page as u64 + 0x100;
-                    let mut record: EXCEPTION_RECORD = std::mem::zeroed();
-                    record.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
-                    let mut context: CONTEXT = std::mem::zeroed();
-                    context.Rip = at;
-                    let mut pointers = EXCEPTION_POINTERS { ExceptionRecord: &mut record, ContextRecord: &mut context };
-                    assert!(emulate_amd_only_as(&mut pointers, rewrite));
-                    let bytes = page.add(0x100).cast::<[u8; 3]>().read();
-                    if rewritten {
-                        assert_eq!(context.Rip, at, "{rewrite:?}, mwaitx {mwait}: the new bytes run from here");
-                        assert_eq!(bytes, if mwait { PAUSE_NOP } else { NOP3 });
-                    } else {
-                        assert_eq!(context.Rip, at + 3, "{rewrite:?}, mwaitx {mwait}: skipped");
-                        assert_eq!(bytes, code);
-                    }
-                    free(page);
-                }
-            }
-        }
-    }
-
-    /// The faults are counted per address and kind, a line names the busiest,
-    /// and what it counted is not counted again.
-    /// Taking the frame line takes the counts of every test that counts:
-    /// the tests that read it one at a time.
-    static LINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn faults_at_wait_instructions_are_counted_by_address() {
-        let _line = LINE.lock().unwrap_or_else(|e| e.into_inner());
-        // An address no instruction of a test lies at.
-        let (monitor, mwait) = (0x7ff0_dead_0040usize, 0x7ff0_dead_0080usize);
-        for _ in 0..7000 {
-            count_wait(monitor, false);
-        }
-        for _ in 0..6000 {
-            count_wait(mwait, true);
-        }
-        let line = wait_fault_line(2.0).expect("a line for what was counted");
-        assert!(line.contains("monitorx at 0x7ff0dead0040: 3500"), "{line}");
-        assert!(line.contains("mwaitx at 0x7ff0dead0080: 3000"), "{line}");
-        // Taken: the same addresses count from zero.
-        count_wait(monitor, false);
-        let line = wait_fault_line(1.0).expect("a line");
-        assert!(line.contains("monitorx at 0x7ff0dead0040: 1,") || line.contains("monitorx at 0x7ff0dead0040: 1)"), "{line}");
-    }
-
-    /// The SSE4a faults are counted by address and kind, apart from the waits, and the line
-    /// says how many were left to the exception.
-    #[test]
-    fn faults_at_sse4a_instructions_are_counted_by_address_and_kind() {
-        let _line = LINE.lock().unwrap_or_else(|e| e.into_inner());
-        let (extrq, insertq) = (0x7ff0_dead_0100usize, 0x7ff0_dead_0140usize);
-        for _ in 0..4000 {
-            count_sse4a(extrq, false, true);
-        }
-        for _ in 0..2000 {
-            count_sse4a(insertq, true, false);
-        }
-        let line = wait_fault_line(2.0).expect("a line for what was counted");
-        assert!(line.contains("extrq at 0x7ff0dead0100: 2000"), "{line}");
-        assert!(line.contains("insertq at 0x7ff0dead0140: 1000"), "{line}");
-        assert!(line.contains("SSE4a instructions the CPU refused"), "{line}");
-        assert!(!line.contains("monitorx at 0x7ff0dead0100"), "{line}");
     }
 }
