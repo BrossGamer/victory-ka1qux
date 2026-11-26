@@ -90,10 +90,20 @@
 //!   element size). A write at byte `x` of the view sets bit `first +
 //!   ((offset + x) >> 16)` for its first and its last byte, at most
 //!   [`VIEW_WRITE_BITS`] − 1; first bit [`VIEW_MARK_NONE`]: nothing. The
-//!   lanes of a wave that set bits of one bitmap dword do it with one
-//!   atomic, skipped where the bits are already set. Both
-//!   root views exist only in programs that write through such views:
-//!   others are as without marks. Root UAVs and title memory by address
+//!   bitmap lives in system memory (the host reads and clears it after each
+//!   submission), so each lane's load of its dword crosses the bus. The
+//!   lanes of a wave whose bits are in the dword of the wave's leading
+//!   lane (its first active lane; in a pixel shader the first that is no
+//!   helper) leave the load to that lane, which ORs the bits of all of them
+//!   in with one atomic, skipped where they are already set; lanes of other
+//!   dwords set their own (after upstream pull requests #2755 and #2958).
+//!   `VICTORY_WAVE_MARKS=0` has every lane load the dword and set its own
+//!   bit; `all-equal` is the form before #2958, the first lane alone where
+//!   all lanes' bits share one dword and every lane its own where not. The
+//!   translation, and so the shader cache key, depends on the switch. (This
+//!   tree has no marks for heap-direct texture reads, the other half of
+//!   #2958.) Both root views exist only in programs that write through
+//!   such views: others are as without marks. Root UAVs and title memory by address
 //!   are not marked (the host declares what they write). Every such
 //!   store and atomic is counted where its DXIL operation is emitted, and
 //!   every mark where it is made; a lowering whose counts differ (a path
