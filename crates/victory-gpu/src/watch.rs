@@ -820,6 +820,13 @@ pub(crate) fn armed_take(at: usize) -> Option<Armed> {
     guards().armed.remove(&(at / BLOCK))
 }
 
+/// Whether the 64 KiB block of title memory at `at` shows a physical page
+/// that is guarded together with its other views: a write into one opens
+/// them all ([`writing_held`]).
+pub(crate) fn aliased(at: usize) -> bool {
+    guards().aliased.contains(&(at / BLOCK))
+}
+
 /// The submission's copy-back is done: nothing is armed any more.
 pub(crate) fn disarm() {
     let mut g = guards();
