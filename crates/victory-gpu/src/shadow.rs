@@ -1765,6 +1765,7 @@ fn workers() -> &'static Workers {
         let n = wide_worker_count(std::thread::available_parallelism().map_or(4, |n| n.get()));
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::cores::prefer(&format!("victory-wide-{i}"), crate::cores::Kind::Pool, false);
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -6108,8 +6109,8 @@ mod window_tests {
     /// and the view that asks for what a window holds takes that window.
     #[test]
     fn a_root_constant_buffer_view_has_a_small_window_and_a_root_srv_the_cell() {
-        use super::{RootKind, find_root};
         let _one = crate::address_space();
+        use super::{RootKind, find_root};
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         if crate::host::host().is_none() || std::env::var_os("VICTORY_CBV_WINDOW").is_some_and(|v| v == "0") {
             eprintln!("window_tests: skipped, no host device or VICTORY_CBV_WINDOW=0");
@@ -6118,10 +6119,10 @@ mod window_tests {
         // SAFETY: a plain allocation of our own, never freed here.
         let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * WINDOW as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
         assert_ne!(base, 0);
-        let cell = (base + WINDOW - 1) & !(WINDOW - 1);
         // Memory another test freed may be at these addresses, with a window
         // of its own still in the table.
         super::LOOSE.write().unwrap_or_else(|e| e.into_inner()).retain(|&(start, len), _| start + len <= base || start >= base + 3 * WINDOW);
+        let cell = (base + WINDOW - 1) & !(WINDOW - 1);
         let cbv = find_root(cell + 0x12_3100, RootKind::Cbv).expect("a window");
         assert!(cbv.window);
         assert_eq!((cbv.start, cbv.len), (cell + 0x12_0000, 2 * CBV_GRID));
@@ -6578,8 +6579,8 @@ mod lookup_tests {
     /// buffer taken out. (After fxceless/victory-fork pull request #1224.)
     #[test]
     fn remembered_answers_follow_the_table() {
-        use windows_sys::Win32::System::Memory::{
         let _one = crate::address_space();
+        use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
         if crate::host::host().is_none() {

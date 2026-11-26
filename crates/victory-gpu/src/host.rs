@@ -4394,6 +4394,7 @@ fn land_after_submission() {
         std::thread::Builder::new()
             .name("victory-land".to_owned())
             .spawn(move || {
+                crate::cores::prefer("victory-land", crate::cores::Kind::Pool, false);
                 while asked.recv().is_ok() {
                     // One landing for all the asks so far.
                     while asked.try_recv().is_ok() {}
@@ -4445,7 +4446,9 @@ fn late_helper() {
     let Some(host) = host() else {
         return;
     };
-    crate::framelog::keep_on_fast_cores("victory-late-wait");
+    if !crate::cores::prefer("victory-late-wait", crate::cores::Kind::Pool, true) {
+        crate::framelog::keep_on_fast_cores("victory-late-wait");
+    }
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         tracing::warn!("no event for the thread that settles submissions sent ahead");
@@ -4575,7 +4578,9 @@ fn relay_worker() {
     let Some(host) = host() else {
         return;
     };
-    crate::framelog::keep_on_fast_cores("victory-relay");
+    if !crate::cores::prefer("victory-relay", crate::cores::Kind::Busy, true) {
+        crate::framelog::keep_on_fast_cores("victory-relay");
+    }
     // SAFETY: a plain event of our own.
     let Ok(event) = (unsafe { CreateEventW(None, false, false, None) }) else {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));

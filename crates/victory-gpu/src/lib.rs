@@ -67,6 +67,8 @@ pub mod list;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
+mod cores;
+#[cfg(windows)]
 mod heapprint;
 #[cfg(windows)]
 mod plaincopy;

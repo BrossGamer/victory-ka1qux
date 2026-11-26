@@ -492,7 +492,9 @@ fn wake() {
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
-    crate::framelog::keep_on_fast_cores("victory-submit");
+    if !crate::cores::prefer("victory-submit", crate::cores::Kind::Lane, true) {
+        crate::framelog::keep_on_fast_cores("victory-submit");
+    }
     loop {
         {
             let mut work = lock(&WORK.0);
@@ -1048,6 +1050,10 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    // The title's thread that submits is asked once to stay on P cores
+    // (`VICTORY_P_CORES=1`).
+    #[cfg(windows)]
+    crate::cores::this_title_thread();
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
