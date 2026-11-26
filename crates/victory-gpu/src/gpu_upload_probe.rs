@@ -282,6 +282,22 @@ fn gpu_upload_probe() {
         }
         let size = size();
         let phase = std::env::var("VICTORY_PROBE_PHASE").unwrap_or_else(|_| "all".into());
+        if supported {
+            // Which flags and states the device takes for a buffer there
+            // (the windows' buffers allow unordered access, so that a view
+            // of that kind over one can be made).
+            for (what, flags, state) in [
+                ("no flags, common", D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON),
+                ("no flags, generic read", D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ),
+                ("unordered access, common", D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON),
+                ("unordered access, copy destination", D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST),
+            ] {
+                match gpu.make(D3D12_HEAP_TYPE_GPU_UPLOAD, 16 << 20, flags, state) {
+                    Ok(_) => println!("a GPU upload buffer of 16 MB with {what}: made"),
+                    Err(e) => println!("a GPU upload buffer of 16 MB with {what}: refused: {e}"),
+                }
+            }
+        }
 
         if phase == "all" || phase == "commit" {
             println!("--- what a buffer of {} MB costs ---", mb(size as i64));
