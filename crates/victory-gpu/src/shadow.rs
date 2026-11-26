@@ -2846,13 +2846,16 @@ impl Shadow {
     /// address) as written through views of this copy: in the parts of the
     /// page the submission armed, the bytes that differ from `before` (the
     /// page's 64 KiB before the submission) are the shaders' and go into
-    /// title memory, and the copy takes the title's others. Returns the
+    /// title memory, and the copy takes the title's others. Only the runs of
+    /// bytes whose value differs from the title's are written (the stretch
+    /// from the first to the last with `VICTORY_MARKED_RUNS=0`). Returns the
     /// bytes written.
     pub(crate) fn copy_back_marked(&self, page: usize, before: &[u8]) -> usize {
         let marked = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let mut written = 0;
         let mut title = Vec::new();
+        let mut runs: Vec<(usize, usize)> = Vec::new();
         for (a, e) in marked {
             let (from, to) = (a.max(page).max(start), e.min(page + PAGE).min(end));
             if from >= to {
@@ -2874,18 +2877,40 @@ impl Shadow {
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
+            #[cfg(test)]
+            if let Some((thread, hook)) = AFTER_TITLE_READ.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+                && *thread == std::thread::current().id()
+            {
+                hook();
+            }
             // The card's byte where the copy changed, else the title's.
+            // The runs of bytes the card's value changed in title memory:
+            // only those go back, so a title write made after the read above,
+            // anywhere the card changed nothing, is not put back to the
+            // bytes read (after upstream VIctory #2918).
             let mut differs = 0u8;
-            for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+            runs.clear();
+            for (i, ((t, h), o)) in title.iter_mut().zip(host.iter_mut()).zip(old).enumerate() {
                 let gpu = if *h != *o { 0xffu8 } else { 0 };
                 let merged = (*t & !gpu) | (*h & gpu);
                 differs |= merged ^ *t;
+                if merged != *t {
+                    match runs.last_mut() {
+                        Some(last) if last.0 + last.1 == i => last.1 += 1,
+                        _ => runs.push((i, 1)),
+                    }
+                }
                 *t = merged;
                 *h = merged;
             }
             if differs != 0 {
-                self.put_back(from, &title[..n], None);
-                written += n;
+                if marked_runs() {
+                    self.put_back(from, &title[..n], Some(&runs));
+                    written += runs.iter().map(|&(_, len)| len).sum::<usize>();
+                } else {
+                    self.put_back(from, &title[..n], None);
+                    written += n;
+                }
             }
             // A snapshot of a declared range over the same bytes (one that
             // kept its snapshot, or with `VICTORY_VIEW_MARKS=check`) takes
@@ -4768,6 +4793,21 @@ fn window_of(address: u64, end: u64, grid: u64) -> (u64, u64) {
     (start, end.next_multiple_of(grid) - start)
 }
 
+/// Whether a marked copy-back ([`Shadow::copy_back_marked`]) writes only the
+/// runs of bytes the card changed (`VICTORY_MARKED_RUNS=0`: the stretch from
+/// the first to the last changed byte, with the title's bytes read between
+/// them, as before).
+fn marked_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MARKED_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Tests only: run between a marked copy-back's read of title memory and its
+/// write, where a title write can land.
+#[cfg(test)]
+static AFTER_TITLE_READ: std::sync::Mutex<Option<(std::thread::ThreadId, Box<dyn FnMut() + Send>)>> =
+    std::sync::Mutex::new(None);
+
 /// `VICTORY_BACK_QUIET=1`: see [`Shadow::write_quietly`]. Off by default.
 fn quiet_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5180,6 +5220,56 @@ mod marked_tests {
         assert_eq!((read(10), read(20), read(5000)), (0xaa, 0x55, 0), "the card's, the title's, nothing outside");
         // The title's own write reaches the copy by its next refresh (the
         // write tracking saw it), as after any copy-back.
+        copy.marked.lock().unwrap().clear();
+        drop(copy);
+        super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
+        drop(memory);
+    }
+
+    /// The title writes between where the card changed two bytes of a marked
+    /// page, after the copy-back read title memory there: only the card's
+    /// bytes go back, so the title's write stays (the stretch from the first
+    /// to the last changed byte, written with the bytes read, put the old
+    /// byte back over it). After upstream VIctory #2918.
+    #[test]
+    fn a_marked_copy_back_leaves_a_title_write_made_between_the_cards_bytes() {
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        if !super::marked_runs() {
+            return; // turned off for this run
+        }
+        let memory = vec![0u8; 3 * PAGE];
+        let page = (memory.as_ptr() as usize).next_multiple_of(PAGE);
+        let title = |at: usize| (page + at) as *mut u8;
+        let copy = exact(page as u64, 2 * PAGE as u64).unwrap();
+        assert!(copy.update(page, 2 * PAGE) > 0);
+        let before = vec![0u8; PAGE];
+        copy.marked.lock().unwrap().push((page, page + PAGE));
+        // The card changes bytes 10, 11 and 4000; the title writes byte 2000
+        // once the copy-back has read the title's bytes.
+        // SAFETY: the copy's mapping, 2 pages.
+        unsafe {
+            copy.data.add(10).write(0xaa);
+            copy.data.add(11).write(0xab);
+            copy.data.add(4000).write(0xbb);
+        }
+        let address = title(2000) as usize;
+        *super::AFTER_TITLE_READ.lock().unwrap() = Some((
+            std::thread::current().id(),
+            // SAFETY: a byte of our memory, alive for the test.
+            Box::new(move || unsafe { (address as *mut u8).write(0x77) }),
+        ));
+        let written = copy.copy_back_marked(page, &before);
+        *super::AFTER_TITLE_READ.lock().unwrap() = None;
+        assert_eq!(written, 3, "the card's three bytes, in two runs");
+        // SAFETY: bytes of our memory.
+        let read = |at: usize| unsafe { title(at).read() };
+        assert_eq!(
+            (read(10), read(11), read(2000), read(4000)),
+            (0xaa, 0xab, 0x77, 0xbb),
+            "the card's bytes, and the title's write between them"
+        );
         copy.marked.lock().unwrap().clear();
         drop(copy);
         super::EXACT.lock().unwrap().map.remove(&(page as u64, 2 * PAGE as u64));
