@@ -2315,6 +2315,10 @@ enum Step {
     Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
+    /// Queue-timeline tile mappings (`UpdateTileMappings`), run right
+    /// before the list is executed on the queue, after the lists of the
+    /// same submission ahead of it ([`HostList::defer_tiles`]).
+    Tiles(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
     /// whether through views of the heap by shaders that mark the pages
     /// they write (`crate::marks`).
@@ -2343,6 +2347,9 @@ struct Deferred {
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// The last card-written source copied into each aliased host texture
+    /// in this list ([`HostList::alias_source_changed`]).
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Title-written textures whose staging buffer is copied into the host
     /// texture in this list's prelude if refreshed or not uploaded yet.
     texture_uploads: Vec<(
@@ -2402,6 +2409,7 @@ impl Deferred {
             kept,
             refreshed,
             textures,
+            texture_aliases,
             texture_uploads,
             filled_root_cbvs,
             writes,
@@ -2418,6 +2426,7 @@ impl Deferred {
         kept.clear();
         refreshed.clear();
         textures.clear();
+        texture_aliases.clear();
         texture_uploads.clear();
         filled_root_cbvs.clear();
         writes.clear();
@@ -3628,7 +3637,7 @@ fn blocked_by(
                     }
                 }
                 Step::Run(_) => return Some(WHY_RUN),
-                Step::GpuWrite(..) | Step::Host(_) => {}
+                Step::GpuWrite(..) | Step::Host(_) | Step::Tiles(_) => {}
             }
         }
     }
@@ -6989,13 +6998,22 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        // The tile mappings of a list go to the queue after the lists ahead
+        // of it ([`HostList::defer_tiles`]).
+        let has_tiles: Vec<bool> = runs.iter().map(|l| l.has_tile_steps()).collect();
+        let segments = tile_segments(&has_tiles, &firsts, lists.len());
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             card_fed();
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
+                for (tiles, range) in &segments {
+                    if let Some(k) = *tiles {
+                        runs[k].run_tile_steps();
+                    }
+                    self.queue.ExecuteCommandLists(&lists[range.clone()]);
+                }
                 self.queue.Signal(&self.fence, *submitted)
             };
             self.card_sent();
@@ -7035,17 +7053,19 @@ impl Host {
         }
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timed = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let timed = false;
+        let groups: Vec<Vec<(Option<usize>, std::ops::Range<usize>)>> = if timed {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
+                .enumerate()
+                .map(|(i, (&a, &b))| vec![(has_tiles[i].then_some(i), a..b)])
                 .collect()
         } else {
-            vec![&lists[..]]
+            vec![segments]
         };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
         submitting(2, runs.len());
         if crate::host::late() {
             card_fed();
@@ -7055,7 +7075,12 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                for (tiles, range) in group {
+                    if let Some(k) = *tiles {
+                        runs[k].run_tile_steps();
+                    }
+                    self.queue.ExecuteCommandLists(&lists[range.clone()]);
+                }
                 self.card_sent();
                 let waited = self
                     .queue
@@ -8570,6 +8595,18 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether `source` is not the last card-written texture the list
+    /// copied into the aliased host texture `view` (nor was any copied into
+    /// it yet): the copy is owed. An upload of the same view from title
+    /// memory earlier in the list uses up its first use, and the shader then
+    /// read the uploaded bytes instead of the card's (fork pull request
+    /// #1241).
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -8582,6 +8619,41 @@ impl HostList {
     /// As [`HostList::defer`], for work that writes only host memory.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// As [`HostList::defer_host`], for work that changes what tiles a
+    /// reserved texture has (`UpdateTileMappings` on the queue). That call
+    /// is made in the queue's order: run with the other steps, before any
+    /// list of the submission is executed, it put the tiles under the
+    /// texture ahead of the lists that come before this one, and they read
+    /// what the tiles' last owner left (fork pull request #784; the band of
+    /// pieces of other pictures at the foot of the frame, issue #1047). Run
+    /// here when this list is reached instead: the submission goes to the
+    /// queue in pieces, split before each list but the first that has such
+    /// work ([`tile_segments`]). `VICTORY_TILE_STEPS_ORDERED=0`: as
+    /// [`HostList::defer_host`], as before.
+    pub(crate) fn defer_tiles(&self, work: impl Fn() + Send + 'static) {
+        let step = if tile_steps_ordered() {
+            Step::Tiles(Box::new(work))
+        } else {
+            Step::Host(Box::new(work))
+        };
+        self.deferred().copies.push(step);
+    }
+
+    /// Whether the list has work to run when it is reached
+    /// ([`HostList::defer_tiles`]).
+    fn has_tile_steps(&self) -> bool {
+        self.deferred().copies.iter().any(|step| matches!(step, Step::Tiles(_)))
+    }
+
+    /// Runs the list's work for the queue's order ([`HostList::defer_tiles`]).
+    fn run_tile_steps(&self) {
+        for step in &self.deferred().copies {
+            if let Step::Tiles(work) = step {
+                work();
+            }
+        }
     }
 
     /// Brings a texture's staging buffer up to date when the list is
@@ -8705,11 +8777,47 @@ impl HostList {
                     }
                     continue;
                 }
+                // Run when the submission reaches the list ([`tile_segments`]).
+                Step::Tiles(_) => continue,
             };
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
         }
     }
+}
+
+/// Whether the work that gives textures their tiles is run in the queue's
+/// order ([`HostList::defer_tiles`]); `VICTORY_TILE_STEPS_ORDERED=0` runs it
+/// with the other steps of the submission, ahead of all its lists.
+fn tile_steps_ordered() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TILE_STEPS_ORDERED").is_none_or(|v| v != "0"))
+}
+
+/// The pieces a submission goes to the queue in, so that the tile mappings
+/// of a list are made after the lists ahead of it ([`HostList::defer_tiles`]):
+/// per piece, the run whose tile work is done before it is sent (if any) and
+/// the range of command lists. `has_tiles`: per run, whether it has such
+/// work; `firsts`: where each run's lists start; `total`: the lists in all
+/// (a last one for the compare of the card's copies, and the like, goes with
+/// the last run's). A new piece begins at each run but the first that has
+/// tile work; with none, the submission is one piece, as it was.
+fn tile_segments(has_tiles: &[bool], firsts: &[usize], total: usize) -> Vec<(Option<usize>, std::ops::Range<usize>)> {
+    let Some(&first) = has_tiles.first() else {
+        return vec![(None, 0..total)];
+    };
+    let mut out = Vec::new();
+    let mut tiles = first.then_some(0);
+    let mut from = 0;
+    for k in 1..has_tiles.len() {
+        if has_tiles[k] {
+            out.push((tiles, from..firsts[k]));
+            tiles = Some(k);
+            from = firsts[k];
+        }
+    }
+    out.push((tiles, from..total));
+    out
 }
 
 mod fills;
@@ -11365,3 +11473,8 @@ mod root_cbv_fill_tests {
         }
     }
 }
+
+/// The tile mappings of a list reach the queue after the lists ahead of it
+/// in the submission; the tests are in a file of their own.
+#[cfg(test)]
+mod tile_order_tests;
