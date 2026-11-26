@@ -145,6 +145,8 @@ mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
+#[cfg(all(test, windows))]
+mod resinfo_tests;
 mod sampler;
 mod shader;
 #[cfg(all(test, windows))]

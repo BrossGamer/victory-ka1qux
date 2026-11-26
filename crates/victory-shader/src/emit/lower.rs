@@ -1236,6 +1236,13 @@ pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
             .any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
 }
 
+/// `VICTORY_RESINFO_BEYOND=0` leaves a size query at a level past the last as
+/// the host driver answers it (the size of the last level) instead of 0.
+fn resinfo_beyond_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RESINFO_BEYOND").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_NORM_QUOTIENT=0` converts the codes of normalized buffer formats
 /// by the host's division, as before ([`Lower::norm_quotient`]).
 fn norm_exact_on() -> bool {
@@ -11134,11 +11141,27 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("an image result");
             };
+            // A level past the last has no size on the console or in D3D12's
+            // definition: every channel reads 0 (the reference device does
+            // that), where the host driver gives the size of the last level.
+            // Past the last is at or above the level count, the query's own
+            // fourth channel (a UAV has one level, and is asked level 0).
+            let beyond = if !uav && resinfo_beyond_on() {
+                let levels = self.s.m.extract(c, d, 3);
+                Some(self.s.m.cmp(c, pred::IUGE, mip, levels))
+            } else {
+                None
+            };
+            let zero = self.s.m.i32(0);
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                 let x = if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
-                    self.s.m.extract(c, d, ch)
+                    let x = self.s.m.extract(c, d, ch);
+                    match beyond {
+                        Some(beyond) => self.s.m.select(c, beyond, zero, x),
+                        None => x,
+                    }
                 };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
