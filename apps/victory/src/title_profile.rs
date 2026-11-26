@@ -27,6 +27,10 @@
 //! scale = 41 56 ?? ...
 //! scale.loads = 0x28 0x32
 //! scale.slot = 0x64
+//! # Optional, any number: bytes written at an offset of the scale function
+//! # (on bytes its pattern fixes), `{mode}` being the preset's quality mode
+//! # (1 quality, 2 balanced, 3 performance), for code that records the mode.
+//! scale.edit = 0x1a b8 {mode} 00 00 00 ...
 //! ```
 //!
 //! The idea (patterns found at launch, written only when found exactly once,
@@ -54,6 +58,14 @@ struct ScalePlace {
     pattern: Vec<Option<u8>>,
     loads: Vec<usize>,
     slot: usize,
+    edits: Vec<(usize, Vec<Edit>)>,
+}
+
+/// A byte of an edit: given, or the preset's quality mode.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edit {
+    Byte(u8),
+    Mode,
 }
 
 fn number(text: &str) -> Result<usize> {
@@ -86,11 +98,33 @@ pub fn parse_pattern(text: &str) -> Result<Vec<Option<u8>>> {
     Ok(pattern)
 }
 
+/// `<offset> <byte>...`: bytes written at `offset` of the scale function,
+/// each a hex byte or `{mode}` (the preset's `FFX_UPSCALE_QUALITY_MODE`: 1,
+/// 2 or 3), for code that records which mode the title renders in.
+fn parse_edit(text: &str) -> Result<(usize, Vec<Edit>)> {
+    let mut words = text.split_whitespace();
+    let at = number(words.next().context("scale.edit needs an offset")?)?;
+    let bytes = words
+        .map(|w| {
+            if w == "{mode}" {
+                Ok(Edit::Mode)
+            } else {
+                u8::from_str_radix(w, 16)
+                    .map(Edit::Byte)
+                    .with_context(|| format!("not a hex byte or {{mode}}: {w}"))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(!bytes.is_empty(), "scale.edit needs bytes");
+    Ok((at, bytes))
+}
+
 impl Profile {
     pub fn parse(text: &str) -> Result<Self> {
         let mut build = None;
         let (mut picker, mut scale) = (None, None);
         let (mut loads, mut slot) = (None, None);
+        let mut edits = Vec::new();
         for (n, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -122,9 +156,14 @@ impl Profile {
                     );
                 }
                 "scale.slot" => slot = Some(number(value).with_context(at)?),
+                "scale.edit" => edits.push(parse_edit(value).with_context(at)?),
                 other => bail!("{}: unknown key {other}", at()),
             }
         }
+        ensure!(
+            scale.is_some() || edits.is_empty(),
+            "scale.edit needs the scale pattern"
+        );
         let scale = match (scale, loads, slot) {
             (None, None, None) => None,
             (Some(pattern), Some(loads), Some(slot)) => {
@@ -133,10 +172,20 @@ impl Profile {
                     slot + 4 <= pattern.len() && loads.iter().all(|l| l + 8 <= pattern.len()),
                     "scale.loads and scale.slot must lie inside the scale pattern"
                 );
+                for (at, bytes) in &edits {
+                    // What is overwritten is code the pattern pins down, not an open byte.
+                    ensure!(
+                        pattern
+                            .get(*at..*at + bytes.len())
+                            .is_some_and(|window| window.iter().all(Option::is_some)),
+                        "scale.edit at {at:#x} must lie on fixed bytes of the scale pattern"
+                    );
+                }
                 Some(ScalePlace {
                     pattern,
                     loads,
                     slot,
+                    edits,
                 })
             }
             _ => bail!("scale, scale.loads and scale.slot go together"),
@@ -175,10 +224,11 @@ pub enum Outcome {
 }
 
 /// Changes the title's code in `image` for the upscaler picker to answer
-/// FidelityFX and (if the profile has it) the render scale to be `scale`.
+/// FidelityFX and (if the profile has it) the render scale to be `scale`,
+/// with `mode` (the preset's quality mode) where the profile's edits name it.
 /// Everything is found before anything is written; with a place missing or
 /// ambiguous nothing is written.
-pub fn apply(image: &mut PreparedImage, profile: &Profile, scale: f32) -> Outcome {
+pub fn apply(image: &mut PreparedImage, profile: &Profile, scale: f32, mode: u32) -> Outcome {
     if let Some(build) = &profile.build
         && *build != image.original_hash.to_hex().as_str()
     {
@@ -206,6 +256,14 @@ pub fn apply(image: &mut PreparedImage, profile: &Profile, scale: f32) -> Outcom
                 patch_scale(&mut bytes, &place.loads, place.slot, scale),
                 "the render scale at {rva:#x} is not the code the profile describes"
             );
+            for (at, edit) in &place.edits {
+                for (i, byte) in edit.iter().enumerate() {
+                    bytes[at + i] = match byte {
+                        Edit::Byte(b) => *b,
+                        Edit::Mode => u8::try_from(mode).context("the quality mode is a byte")?,
+                    };
+                }
+            }
             patches.push(Patch {
                 what: format!("render scale {scale}"),
                 rva,
@@ -464,7 +522,7 @@ mod tests {
         code.extend(instance(SCALE, 0x00));
         code.extend([0x90; 9]);
         let mut image = image(&code);
-        let outcome = apply(&mut image, &profile, 0.5);
+        let outcome = apply(&mut image, &profile, 0.5, 1);
         assert_eq!(outcome, Outcome::Applied { scale: true });
         // The picker answers 7.
         assert_eq!(
@@ -490,20 +548,20 @@ mod tests {
         // The scale missing.
         let mut image1 = image(&[picker.clone(), vec![0x90; 8]].concat());
         let before = image1.bytes.clone();
-        assert!(matches!(apply(&mut image1, &profile, 0.5), Outcome::Skipped(why) if why.contains("render scale")));
+        assert!(matches!(apply(&mut image1, &profile, 0.5, 1), Outcome::Skipped(why) if why.contains("render scale")));
         assert_eq!(image1.bytes, before);
         // The picker twice.
         let mut image2 = image(&[picker.clone(), vec![0x90; 3], picker.clone(), scale.clone()].concat());
         let before = image2.bytes.clone();
-        assert!(matches!(apply(&mut image2, &profile, 0.5), Outcome::Skipped(why) if why.contains("matches 2 places")));
+        assert!(matches!(apply(&mut image2, &profile, 0.5, 1), Outcome::Skipped(why) if why.contains("matches 2 places")));
         assert_eq!(image2.bytes, before);
         // Already patched (no padding left): the code is not what the profile
         // describes.
         let mut once = image(&[picker, scale].concat());
-        assert_eq!(apply(&mut once, &profile, 0.5), Outcome::Applied { scale: true });
+        assert_eq!(apply(&mut once, &profile, 0.5, 1), Outcome::Applied { scale: true });
         let patched = once.bytes[0x200..].to_vec();
         let mut again = image(&patched);
-        assert!(matches!(apply(&mut again, &profile, 0.25), Outcome::Skipped(_)));
+        assert!(matches!(apply(&mut again, &profile, 0.25, 1), Outcome::Skipped(_)));
     }
 
     #[test]
@@ -514,21 +572,77 @@ mod tests {
         code.extend(instance(SCALE, 0x00));
         let mut image = image(&code);
         let before = image.bytes.clone();
-        assert!(matches!(apply(&mut image, &profile, 0.5), Outcome::Skipped(why) if why.contains("another build")));
+        assert!(matches!(apply(&mut image, &profile, 0.5, 1), Outcome::Skipped(why) if why.contains("another build")));
         assert_eq!(image.bytes, before);
         // For this one, it applies.
         let own = format!("build = {}\n{PROFILE}", image.original_hash.to_hex());
         assert_eq!(
-            apply(&mut image, &Profile::parse(&own).unwrap(), 0.5),
+            apply(&mut image, &Profile::parse(&own).unwrap(), 0.5, 1),
             Outcome::Applied { scale: true }
         );
+    }
+
+    #[test]
+    fn an_edit_writes_the_presets_mode_where_the_pattern_pins_the_code() {
+        let profile = Profile::parse(&format!("{PROFILE}scale.edit = 2 AA {{mode}} BB\n")).unwrap();
+        let mut code = instance(PICKER, 0x11);
+        let scale_at = code.len();
+        code.extend(instance(SCALE, 0x00));
+        let mut image = image(&code);
+        assert_eq!(
+            apply(&mut image, &profile, 0.5, 3),
+            Outcome::Applied { scale: true }
+        );
+        let base = 0x200 + scale_at;
+        assert_eq!(image.bytes[base + 2..base + 5], [0xAA, 3, 0xBB]);
+        // The bytes around it are the pattern's own.
+        assert_eq!(image.bytes[base..base + 2], [0x11, 0x22]);
+        assert_eq!(image.bytes[base + 5], 0x66);
+        for (bad, why) in [
+            // Offsets 12 to 15 of the scale pattern are open bytes.
+            ("scale.edit = 12 AA\n", "fixed bytes"),
+            ("scale.edit = 0x20 AA BB CC DD EE\n", "fixed bytes"),
+            ("scale.edit = 2\n", "needs bytes"),
+            ("scale.edit = 2 zz\n", "not a hex byte"),
+        ] {
+            let error = format!("{:#}", Profile::parse(&format!("{PROFILE}{bad}")).unwrap_err());
+            assert!(error.contains(why), "{bad:?}: {error}");
+        }
+        let alone = "picker = 55 48 89 E5 ?? ?? 90 90 ?? 5D C3\nscale.edit = 2 AA\n";
+        assert!(format!("{:#}", Profile::parse(alone).unwrap_err()).contains("needs the scale pattern"));
     }
 
     #[test]
     fn a_picker_alone_is_applied_without_the_scale() {
         let profile = Profile::parse("picker = 55 48 89 E5 ?? ?? 90 90 ?? 5D C3").unwrap();
         let mut image = image(&instance(PICKER, 0x11));
-        assert_eq!(apply(&mut image, &profile, 0.5), Outcome::Applied { scale: false });
+        assert_eq!(apply(&mut image, &profile, 0.5, 1), Outcome::Applied { scale: false });
+    }
+
+    /// The user's own profile against the user's own title: the executable
+    /// (`VICTORY_TITLE_IMAGE`) is read and patched in memory only, nothing
+    /// runs. Skipped unless both it and `VICTORY_FSR_PROFILE` are set.
+    #[test]
+    fn a_users_profile_applies_to_a_users_title() {
+        let (Some(image), Some(profile)) = (
+            std::env::var_os("VICTORY_TITLE_IMAGE"),
+            std::env::var_os("VICTORY_FSR_PROFILE"),
+        ) else {
+            return;
+        };
+        let profile = Profile::parse(&std::fs::read_to_string(profile).unwrap()).unwrap();
+        let prepared = victory_loader::prepare(&std::fs::read(image).unwrap()).unwrap();
+        println!("build {}", prepared.original_hash.to_hex());
+        for scale in [2.0f32 / 3.0, 1.0 / 1.7, 0.5] {
+            let mut copy = PreparedImage {
+                info: prepared.info.clone(),
+                bytes: prepared.bytes.clone(),
+                original_hash: prepared.original_hash,
+            };
+            let outcome = apply(&mut copy, &profile, scale, 1);
+            assert_eq!(outcome, Outcome::Applied { scale: true }, "{outcome:?}");
+            assert_ne!(copy.bytes, prepared.bytes);
+        }
     }
 
     #[test]

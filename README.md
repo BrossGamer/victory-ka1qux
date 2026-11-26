@@ -199,11 +199,23 @@ downloaded, and none of them ships here)
   replaced by `mov eax, 7; ret`), and, for the render scale, `scale` (a pattern
   of the function), `scale.loads` (offsets in the match of its two
   `vmovss xmm, [rip+disp32]` loads) and `scale.slot` (the offset of four `0xCC`
-  padding bytes that take the new scale). Each pattern must match exactly once
+  padding bytes that take the new scale), and any number of `scale.edit = <offset>
+  <bytes>` (`{mode}` standing for the preset's quality mode, 1 to 3, for code
+  that records it). Each pattern must match exactly once
   in the executable sections or nothing is written; the patched copy is in
   memory only. The idea is Marvisak/VIctory PR 1793's; the log's `fsr` lines say
   what was done, and the first dispatch says whether the title renders at the
   preset's size.
+- `VICTORY_FRAME_GEN=1` (diagnostics builds): AMD's frame generation, from
+  `amd_fidelityfx_framegeneration_dx12.dll` in the same folder as the upscaler.
+  The presenter's swap chain becomes AMD's proxy, and each frame the title
+  upscales on the host feeds it that upscale's depth and motion vectors
+  (FSR 3 frame generation, which needs no camera matrices; the title's HUD is
+  interpolated with the scene, and only an RGBA8 swap chain works). Ported from
+  Marvisak/VIctory pull request 1917 (AwkGrep256), whose generated frames in the
+  world were not confirmed on hardware either; the log's `FidelityFX frame
+  generation` lines say whether it ran and how many frames it made. Not run
+  here yet.
 - Series S mode presents the world and the interface as two planes; they are
   blended into one 1080p image (from Linox-IDK/LNX-victory), or one plane is
   shown alone with `VICTORY_PRESENT_PLANE=<n>`.
@@ -410,7 +422,8 @@ repository.
   launch), **[Linox-IDK/LNX-victory](https://github.com/Linox-IDK/LNX-victory)**
   (the Series S plane composition) and DexNom/VIctory (the host FidelityFX
   module's context checks and input preparation); the module itself is
-  upstream's. AMD's FidelityFX SDK (MIT) names the API's descriptions.
+  upstream's; the frame generation is Marvisak/VIctory pull request 1917's.
+  AMD's FidelityFX SDK (MIT) names the API's descriptions.
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.

@@ -89,7 +89,7 @@ fn select_fsr(
         .with_context(|| format!("reading the title profile {}", path.display()))?;
     let profile = crate::title_profile::Profile::parse(&text)
         .with_context(|| format!("the title profile {}", path.display()))?;
-    match crate::title_profile::apply(prepared, &profile, preset.scale()) {
+    match crate::title_profile::apply(prepared, &profile, preset.scale(), preset.quality_mode()) {
         crate::title_profile::Outcome::Applied { scale } => println!(
             "fsr            {}: the title picks FidelityFX{}",
             preset.name(),
