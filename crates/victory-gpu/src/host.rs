@@ -4847,6 +4847,14 @@ fn join_copies() -> bool {
 /// that continue the one before ([`join_copies`]).
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame-rate line: the microseconds the submitting thread
+/// spent deciding and recording the lists' preludes (`HostList::prelude`),
+/// the lists asked, and the preludes recorded. What recording them on several
+/// threads could save is at most this (upstream VIctory pull request #2908,
+/// whose own measurement has threads paying off only from 2,048 barriers in a
+/// submission's preludes).
+static PRELUDE_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// With `VICTORY_REUSE_ROOT_CBV=1`, since the last frame-rate line: the
 /// fills recorded for unaligned root constant buffer views, and how many of
 /// those bindings were given a fill made already instead
@@ -6983,7 +6991,12 @@ impl Host {
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
+            let preluding = std::time::Instant::now();
+            let prelude = list.prelude();
+            PRELUDE_STATS[0].fetch_add(preluding.elapsed().as_micros() as u64, Ordering::Relaxed);
+            PRELUDE_STATS[1].fetch_add(1, Ordering::Relaxed);
+            if let Some(prelude) = prelude {
+                PRELUDE_STATS[2].fetch_add(1, Ordering::Relaxed);
                 lists.push(Some(prelude));
             }
             lists.push(list.list.cast().ok());
@@ -10088,6 +10101,15 @@ impl Meter {
         crate::lazy::line(frames);
         crate::awake::line(frames);
         fill_line(frames);
+        {
+            let [us, asked, made] = [0, 1, 2].map(|i| PRELUDE_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if asked > 0.0 {
+                tracing::info!(
+                    "list preludes per frame on the submitting thread: {:.2} ms for {asked:.0} lists, {made:.0} of them with a prelude",
+                    us / 1e3
+                );
+            }
+        }
         if let Some(host) = host() {
             host.drain_messages();
         }
