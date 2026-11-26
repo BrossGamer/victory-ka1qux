@@ -106,7 +106,7 @@ fn blocks(from: usize, len: usize) -> (usize, usize) {
 }
 
 /// Whether a copy from there faulted lately.
-fn faulted_lately(from: usize, len: usize) -> bool {
+pub(crate) fn faulted_lately(from: usize, len: usize) -> bool {
     let now = now_ms();
     let emptied = EMPTIED.load(Relaxed);
     if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
@@ -120,7 +120,7 @@ fn faulted_lately(from: usize, len: usize) -> bool {
 }
 
 /// A copy from there faulted.
-fn note_fault(from: usize, len: usize) {
+pub(crate) fn note_fault(from: usize, len: usize) {
     let (first, last) = blocks(from, len);
     RECENT[first & 1023].store(first, Relaxed);
     RECENT[last & 1023].store(last, Relaxed);

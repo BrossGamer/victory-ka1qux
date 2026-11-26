@@ -196,6 +196,8 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    // With `VICTORY_SYNC_IN_PLACE=1`: the fingerprints of a page's records.
+    let mut prints: Vec<u64> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
@@ -210,11 +212,36 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        // Records of 32 bytes (view heaps), fingerprinted where they are.
+        let in_place = step == 32 && page_at_once() && crate::heapprint::on();
         for (range_from, range_end) in written.take(start as usize, end as usize) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
+                // Each record read once where it is (`crate::heapprint`):
+                // the records that lie whole in the page, as the page's
+                // version below takes them. A page that is not all there,
+                // or that faulted lately, goes the way below.
+                if in_place {
+                    let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    let first = slots.start.max(((from - start as usize) as u64).div_ceil(step));
+                    let last = slots.end.min((to - start as usize) as u64 / step);
+                    if first >= last {
+                        pages += 1;
+                        page += crate::watch::PAGE;
+                        continue;
+                    }
+                    let at = (start + first * step) as usize;
+                    if crate::heapprint::prints(at, (last - first) as usize, &mut prints) {
+                        pages += 1;
+                        let (seen, made) = host.mirror_copied_prints(first..last, (start, step), &prints);
+                        looked += seen;
+                        mirrored += made;
+                        page += crate::watch::PAGE;
+                        continue;
+                    }
+                }
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
@@ -272,6 +299,15 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [left_alone, locked] = host::spanned::COUNT.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed));
+    if host::spanned::quick() && left_alone + locked > 0 {
+        tracing::info!(
+            "writes of slots per frame (VICTORY_SPANS_QUICK=1): {:.0} of no placed texture view that left the spans alone              (their slot in none), {:.0} that took their lock",
+            left_alone as f64 / frames,
+            locked as f64 / frames
+        );
+    }
+    crate::heapprint::line(frames);
     if pages == 0 {
         return;
     }

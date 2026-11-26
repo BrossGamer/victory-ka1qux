@@ -14,6 +14,7 @@ use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
 mod listed;
+pub(crate) mod spanned;
 #[cfg(feature = "diagnostics")]
 pub(crate) use listed::line as list_views_line;
 pub(crate) use listed::{WordsHash, list_views};
@@ -214,6 +215,10 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed` ([`spanned::Mask`], also held by
+    /// it): a write of any other view of a slot not in it needs nothing of
+    /// `placed` (`VICTORY_SPANS_QUICK`).
+    spanned: spanned::Mask,
     /// Levels on demand: the slots that show a texture made level by level
     /// ([`TiledSlots`]), and whether there is one (the gate for every other
     /// heap and for a run without the switch).
@@ -408,6 +413,10 @@ pub(crate) struct Spans {
     /// them starts ([`HostHeap::recover_displaced`]).
     displaced: std::collections::BTreeMap<u32, u64>,
     displaced_next: u32,
+    /// The slots in `by_slot` or `first` (and no others), as a bit each,
+    /// for [`HostHeap::note_buffer`] to tell without this one's lock that a
+    /// slot is in neither (`VICTORY_SPANS_QUICK`).
+    mask: spanned::Mask,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -543,12 +552,14 @@ impl Spans {
         let desc = crate::resource::placed_description(desc);
         self.spans.entry((start, end)).or_insert_with(|| (desc, Default::default())).1.insert(index);
         self.by_slot.insert(index, (start, end));
+        self.mask.put(index);
         stale
     }
 
     /// The view in slot `index` starts at level `first` of its texture.
     fn shows(&mut self, index: u32, first: u32) {
         self.first.insert(index, first);
+        self.mask.put(index);
     }
 
     /// The spans that start at `start`, whatever their end.
@@ -583,6 +594,7 @@ impl Spans {
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         self.first.remove(&index);
+        self.mask.remove(index);
         let Some(at) = self.by_slot.remove(&index) else {
             return;
         };
@@ -1649,18 +1661,6 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-impl Drop for HostHeap {
-    /// What [`stale_after_flights`] and the bake watch keep of this heap
-    /// goes with it: another heap made at the same place is not this one.
-    fn drop(&mut self) {
-        let key = std::ptr::from_ref(self) as usize;
-        if STALE_LATER_ANY.load(std::sync::atomic::Ordering::Relaxed) {
-            STALE_LATER.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 != key);
-        }
-        if let Some(named) = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            named.retain(|&(heap, _), _| heap != key);
-        }
-    }
 /// With `VICTORY_DYNAMIC_BIG=1` and a host view heap that is not capped
 /// (`null`, the last slot of the heap, is [`UNCAPPED_VIEWS`] - 1 and the
 /// title's `count` slots and these fit before it): 2^19 dynamic slots, where
@@ -1688,6 +1688,18 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     DYNAMIC
 }
 
+impl Drop for HostHeap {
+    /// What [`stale_after_flights`] and the bake watch keep of this heap
+    /// goes with it: another heap made at the same place is not this one.
+    fn drop(&mut self) {
+        let key = std::ptr::from_ref(self) as usize;
+        if STALE_LATER_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            STALE_LATER.lock().unwrap_or_else(|e| e.into_inner()).retain(|e| e.0 != key);
+        }
+        if let Some(named) = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            named.retain(|&(heap, _), _| heap != key);
+        }
+    }
 }
 
 impl HostHeap {
@@ -1721,6 +1733,7 @@ impl HostHeap {
         } else {
             victory_shader::emit::view_heap_limit()
         };
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1733,7 +1746,6 @@ impl HostHeap {
             let size = null + 1;
             let fitted = if count + extra <= null {
                 count
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
@@ -1805,6 +1817,7 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize, size))
             })
             .flatten();
+        let spanned = spanned::Mask::new(count as usize);
         let h = HostHeap {
             heap,
             cpu,
@@ -1836,8 +1849,10 @@ impl HostHeap {
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
+            spanned: spanned.clone(),
             placed: {
                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                spans.lock().unwrap_or_else(|e| e.into_inner()).mask = spanned;
                 if !sampler {
                     PLACED_SPANS
                         .lock()
@@ -3100,8 +3115,15 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // A write of no placed texture view of a slot that is in no span has
+        // nothing to forget: the lock is not taken (`VICTORY_SPANS_QUICK`).
+        // (Whether a slot is in the spans changes only by writes of it.)
+        let stale = if placed_view.is_none() && spanned::quick() && !self.spanned.may_hold(index) {
+            spanned::COUNT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            spanned::COUNT[1].fetch_add(1, Relaxed);
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first)| {
                 Some((resource, start, start.saturating_add(placed.bytes(resource, first)?), first))
@@ -3508,6 +3530,49 @@ impl HostHeap {
                 }
                 *last = print;
                 due.push((index as u32, handle));
+            }
+        }
+        for &(index, handle) in &due {
+            self.mirror_as(index, handle, false, sync_makes());
+        }
+        (looked, due.len() as u64)
+    }
+
+    /// [`HostHeap::mirror_copied_page`] for records fingerprinted where they
+    /// are (`crate::heapprint`, `VICTORY_SYNC_IN_PLACE=1`): title slots
+    /// `slots` (all of whose records lie whole in the page), the print of
+    /// slot `slots.start + i` being `prints[i]`. The same records are
+    /// mirrored: a record of zeros is told by its print
+    /// ([`zero_record_print`]) where the page's version looks at its bytes.
+    pub(crate) fn mirror_copied_prints(&self, slots: std::ops::Range<u64>, (start, step): (u64, u64), prints: &[u64]) -> (u64, u64) {
+        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let zero = zero_record_print();
+        let mut looked = 0u64;
+        let mut due: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if copied.is_empty() {
+                copied.resize(self.count as usize, 0);
+            }
+            for (index, &print) in slots.zip(prints) {
+                looked += 1;
+                // None past the host heap's slots, as `mirror_copied`.
+                let Some(last) = copied.get_mut(index as usize) else {
+                    continue;
+                };
+                // The record last seen, or a slot never looked at that
+                // holds nothing: as it was.
+                if *last == print || (*last == 0 && print == zero) {
+                    continue;
+                }
+                // A table's slot lately: left to its draws, and looked at
+                // again next time.
+                if !tables && self.tabled_lately(index as u32, frame) {
+                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                *last = print;
+                due.push((index as u32, start + index * step));
             }
         }
         for &(index, handle) in &due {
@@ -4248,6 +4313,13 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The print ([`record_print`], and 1) of a record of 32 zero bytes: a slot
+/// never looked at whose record has it holds nothing.
+pub(crate) fn zero_record_print() -> u64 {
+    static ZERO: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ZERO.get_or_init(|| record_print(&[0u8; 32]) | 1)
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -7554,7 +7626,47 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
 
 #[cfg(test)]
 mod record_print_tests {
-    use super::record_print;
+    use super::{HostHeap, record_print, zero_record_print};
+
+    /// The pass that fingerprints the records where they are
+    /// (`mirror_copied_prints`) mirrors the records the page's version
+    /// (`mirror_copied_page`) does, round after round: new records, the
+    /// same again, one changed, one zeroed, a record of zeros never seen.
+    #[test]
+    fn prints_and_pages_mirror_the_same_records() {
+        let (Some(by_page), Some(by_prints)) = (HostHeap::new(false, 64), HostHeap::new(false, 64)) else {
+            return; // no host GPU
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Title memory of our own: 64 slots of 32 bytes.
+        let mut title = vec![0u8; 64 * 32];
+        for byte in &mut title[..40 * 32] {
+            *byte = next() as u8 | 1;
+        }
+        let (from, step) = (title.as_ptr() as usize, 32u64);
+        let both = |title: &[u8]| {
+            let prints: Vec<u64> = title.chunks_exact(32).map(|r| record_print(r) | 1).collect();
+            let page = by_page.mirror_copied_page(0..64, (from as u64, step), from, title);
+            let at_once = by_prints.mirror_copied_prints(0..64, (from as u64, step), &prints);
+            assert_eq!(page, at_once);
+            page
+        };
+        assert_eq!(both(&title), (64, 40), "40 new records, 24 that hold nothing");
+        assert_eq!(both(&title), (64, 0), "all as last seen");
+        title[3 * 32 + 5] ^= 0x40;
+        title[50 * 32 + 9] = 7;
+        title[7 * 32..8 * 32].fill(0);
+        assert_eq!(both(&title), (64, 3), "one changed, one new, one zeroed");
+        assert_eq!(both(&title), (64, 0));
+        assert_ne!(record_print(&title[7 * 32..8 * 32]) | 1, 0);
+        assert_eq!(record_print(&title[7 * 32..8 * 32]) | 1, zero_record_print());
+    }
 
     /// Equal records print alike; a record that differs in any one byte,
     /// or in its length, prints otherwise.
