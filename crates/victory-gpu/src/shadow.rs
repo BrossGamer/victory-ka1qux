@@ -77,6 +77,10 @@ pub(crate) struct Shadow {
     /// Asks for the copy that gave no length (root views: they read from
     /// their address to the copy's end, whatever lies there).
     unsized_asks: AtomicU64,
+    /// What those asks were (`RootKind` bits: a root constant buffer view, a
+    /// root shader resource view, a root unordered access view), for the
+    /// memory line.
+    ask_kinds: std::sync::atomic::AtomicU8,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -2590,6 +2594,35 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// For the memory line, of the windows alive that were asked for without a
+/// length, by who asked: root constant buffer views only, those and root
+/// shader resource or unordered access views, those only, and asks that
+/// named no kind. Each as the windows, their bytes and the bytes of their
+/// pages ever copied.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn window_root_kinds() -> [[u64; 3]; 4] {
+    let mut out = [[0u64; 3]; 4];
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for s in loose.values() {
+        if s.unsized_asks.load(Ordering::Relaxed) == 0 {
+            continue;
+        }
+        let kinds = s.ask_kinds.load(Ordering::Relaxed);
+        let group = match (kinds & 1 != 0, kinds & 6 != 0) {
+            (true, false) => 0,
+            (true, true) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        out[group][0] += 1;
+        out[group][1] += s.len;
+        out[group][2] += (pages * PAGE as u64).min(s.len);
+    }
+    out
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2768,6 +2801,7 @@ impl Shadow {
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
+            ask_kinds: std::sync::atomic::AtomicU8::new(0),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -4604,7 +4638,80 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    lookup(address, len, false)
+    lookup(address, len, false, false)
+}
+
+/// What a root view of the title is (it has an address and no size).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RootKind {
+    /// A constant buffer view: at most [`CBV_MOST`] bytes are read.
+    Cbv,
+    /// A shader resource view: it may read on to the end of its memory.
+    Srv,
+    /// An unordered access view: likewise.
+    Uav,
+}
+
+impl RootKind {
+    fn bit(self) -> u8 {
+        match self {
+            RootKind::Cbv => 1,
+            RootKind::Srv => 2,
+            RootKind::Uav => 4,
+        }
+    }
+}
+
+/// The copy of the memory a root view of `kind` at `address` reads: as
+/// [`find`] with no length, except that a constant buffer view outside any
+/// buffer object gets a window of its own size ([`cbv_windows`]) and not
+/// the 4 MiB cell its address is in.
+pub(crate) fn find_root(address: u64, kind: RootKind) -> Option<Arc<Shadow>> {
+    let shadow = lookup(address, 1, false, kind == RootKind::Cbv && cbv_windows())?;
+    shadow.ask_kinds.fetch_or(kind.bit(), Ordering::Relaxed);
+    Some(shadow)
+}
+
+/// The most a constant buffer view reads (Direct3D 12's limit, 4,096
+/// vectors of 16 bytes).
+const CBV_MOST: u64 = 64 << 10;
+
+/// The grid the windows of root constant buffer views are cut on.
+const CBV_GRID: u64 = 64 << 10;
+
+/// How many such small windows a 4 MiB cell holds before the next ask in it
+/// takes the cell's own window, which holds them all ([`cbv_pick`]).
+const CBV_CELL_MANY: usize = 8;
+
+/// Whether a root constant buffer view outside title buffers gets a window
+/// of 64 to 128 KiB, enough for the 64 KiB it can read, in place of the
+/// whole 4 MiB cell its address is in (`VICTORY_CBV_WINDOW=0`: the cell, as
+/// before). Such a view can never read past 64 KiB, but with no size of its
+/// own it was given the window of a root view without a length, which
+/// reaches to the end of its cell: 4 MiB of host memory, committed whole,
+/// for the 64 KiB read.
+///
+/// shortcut: a window made this way is another copy than the cell's, so the
+/// same memory may be in two windows (each brought up to date on its own);
+/// an existing window that holds the 64 KiB is taken in preference, and a
+/// cell with [`CBV_CELL_MANY`] small windows already takes its own.
+fn cbv_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_WINDOW").is_none_or(|v| v != "0"))
+}
+
+/// The window (start, bytes) a root constant buffer view at `address` takes
+/// among `map`'s: one that holds the 64 KiB it can read if there is one,
+/// else a window of its own on the 64 KiB grid, or the 4 MiB cell's when
+/// the cell holds many small ones already.
+fn cbv_pick<V>(map: &BTreeMap<(u64, u64), V>, address: u64) -> (u64, u64) {
+    let end = address.saturating_add(CBV_MOST);
+    if let Some((&key, _)) = map.range(..=(address, u64::MAX)).rev().take(16).find(|(k, _)| k.0 + k.1 >= end) {
+        return key;
+    }
+    let cell = address & !(WINDOW - 1);
+    let small = map.range((cell, 0)..(cell + WINDOW, 0)).filter(|(k, _)| k.1 < WINDOW).take(CBV_CELL_MANY).count();
+    window_of(address, end, if small >= CBV_CELL_MANY { WINDOW } else { CBV_GRID })
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has
@@ -4629,10 +4736,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     if !fine() {
         return find(address, len);
     }
-    lookup(address, len, true)
+    lookup(address, len, true, false)
 }
 
-fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+fn lookup(address: u64, len: u64, any: bool, cbv: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     // The copy is there for nearly every ask: found under the shared lock.
     {
@@ -4644,7 +4751,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some(_) => {}
             None => {
                 drop(map);
-                return loose(address, end, len <= 1, any);
+                return loose(address, end, len <= 1, any, cbv);
             }
         }
     }
@@ -4657,7 +4764,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
-        return loose(address, end, len <= 1, any);
+        return loose(address, end, len <= 1, any, cbv);
     };
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
@@ -4866,12 +4973,14 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Read shared by the asks that find their window there, as [`BUFFERS`] is.
 static LOOSE: RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = RwLock::new(BTreeMap::new());
 
-fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
+fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
     // The window the ask takes, among those `map` holds.
     let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
-        if unsized_ask && tails() {
+        if cbv {
+            cbv_pick(map, address)
+        } else if unsized_ask && tails() {
             let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
             longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
         } else if any && fine() && !unsized_ask {
@@ -4910,7 +5019,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    // (Not the small window of a constant buffer view: a heap for 64 KiB.)
+    if (!cbv || len >= WINDOW)
+        && let Some(placed) = crate::inplace::place_for(start, len, true)
+    {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -5283,7 +5395,78 @@ mod exact_tests {
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{Arc, CBV_CELL_MANY, CBV_GRID, CBV_MOST, WINDOW, cbv_pick, cover, grid, holder, longest_tail, tail_of, window_of};
+    use std::collections::BTreeMap;
+
+    /// A root constant buffer view reads 64 KiB at most: its window is the
+    /// 64 KiB cells that hold them (64 or 128 KiB), an existing window that
+    /// holds them is taken instead, and a cell with many small windows
+    /// already takes its own 4 MiB window.
+    #[test]
+    fn a_constant_buffer_view_takes_a_window_as_big_as_what_it_reads() {
+        let cell = 0xd_1200_0000u64;
+        let mut map: BTreeMap<(u64, u64), ()> = BTreeMap::new();
+        // Nothing there: 64 KiB cells, enough for the 64 KiB from the ask.
+        let ask = cell + 0x12_3100;
+        let (start, len) = cbv_pick(&map, ask);
+        assert_eq!((start, len), (cell + 0x12_0000, 2 * CBV_GRID));
+        assert!(start <= ask && start + len >= ask + CBV_MOST);
+        // On the grid itself it needs one cell only.
+        assert_eq!(cbv_pick(&map, cell + 0x3_0000), (cell + 0x3_0000, CBV_GRID));
+        // A window that holds the range is taken, whatever its size.
+        map.insert((cell + 0x10_0000, 0x10_0000), ());
+        assert_eq!(cbv_pick(&map, ask), (cell + 0x10_0000, 0x10_0000));
+        // One that holds a part only is not.
+        map.clear();
+        map.insert((cell + 0x12_0000, CBV_GRID), ());
+        assert_eq!(cbv_pick(&map, ask), (cell + 0x12_0000, 2 * CBV_GRID));
+        // With many small windows in the cell, the cell's own.
+        map.clear();
+        for i in 0..CBV_CELL_MANY as u64 {
+            map.insert((cell + 4 * i * CBV_GRID, 2 * CBV_GRID), ());
+        }
+        assert_eq!(cbv_pick(&map, cell + 0x3e_0000 + 0x100), (cell, WINDOW));
+        // Small windows of other cells do not count.
+        let elsewhere = cell + 2 * WINDOW;
+        assert_eq!(cbv_pick(&map, elsewhere + 0x100), (elsewhere, 2 * CBV_GRID));
+        // The window always holds the 64 KiB asked from the address.
+        for ask in [cell + 0x1_0000, cell + 0x3f_ff00, cell + 0x30_1234] {
+            map.clear();
+            let (start, len) = cbv_pick(&map, ask);
+            assert!(start <= ask && start + len >= ask + CBV_MOST, "{ask:#x}");
+        }
+    }
+
+    /// On a host device: a root constant buffer view outside buffers is a
+    /// window of its own size, a root shader resource view the 4 MiB cell,
+    /// and the view that asks for what a window holds takes that window.
+    #[test]
+    fn a_root_constant_buffer_view_has_a_small_window_and_a_root_srv_the_cell() {
+        use super::{RootKind, find_root};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() || std::env::var_os("VICTORY_CBV_WINDOW").is_some_and(|v| v == "0") {
+            eprintln!("window_tests: skipped, no host device or VICTORY_CBV_WINDOW=0");
+            return;
+        }
+        // SAFETY: a plain allocation of our own, never freed here.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * WINDOW as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let cell = (base + WINDOW - 1) & !(WINDOW - 1);
+        let cbv = find_root(cell + 0x12_3100, RootKind::Cbv).expect("a window");
+        assert!(cbv.window);
+        assert_eq!((cbv.start, cbv.len), (cell + 0x12_0000, 2 * CBV_GRID));
+        assert!(cbv.left(cell + 0x12_3100) >= CBV_MOST);
+        // The same memory asked for again takes the same window.
+        let again = find_root(cell + 0x12_3200, RootKind::Cbv).expect("a window");
+        assert!(Arc::ptr_eq(&cbv, &again));
+        // A root shader resource view in another cell reads to the cell's end.
+        let srv = find_root(cell + WINDOW + 0x4_1100, RootKind::Srv).expect("a window");
+        assert_eq!((srv.start, srv.len), (cell + WINDOW, WINDOW));
+        // Its cell holds the 64 KiB a constant buffer view asks for there.
+        let held = find_root(cell + WINDOW + 0x8_0100, RootKind::Cbv).expect("a window");
+        assert!(Arc::ptr_eq(&srv, &held));
+        assert_eq!(held.ask_kinds.load(std::sync::atomic::Ordering::Relaxed), 3);
+    }
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.

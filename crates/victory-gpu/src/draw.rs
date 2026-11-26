@@ -878,7 +878,8 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .map_or(u64::MAX, |mb| mb << 20)
     });
-    let shadow = crate::shadow::find(address, 1)?;
+    let kind = if srv { crate::shadow::RootKind::Srv } else { crate::shadow::RootKind::Cbv };
+    let shadow = crate::shadow::find_root(address, kind)?;
     let len = shadow
         .left(address)
         .min(if srv { limit } else { 1 << 16 });
@@ -1790,7 +1791,7 @@ impl State {
                 .map_or(u64::MAX, |mb| mb << 20)
         });
         let find = |a: u64| {
-            let s = crate::shadow::find(a, 1)?;
+            let s = crate::shadow::find_root(a, crate::shadow::RootKind::Uav)?;
             // SAFETY: a live buffer.
             let flags = unsafe { s.buffer.GetDesc() }.Flags;
             if flags.0 & UNORDERED == 0 {
@@ -1907,11 +1908,11 @@ impl State {
             std::ptr::from_ref(heap) as usize,
             address.unwrap_or(0) | u64::from(biased) << 63,
         );
-        self.forget_moved_root(false, key, || address.and_then(|a| crate::shadow::find(a, 1)));
+        self.forget_moved_root(false, key, || address.and_then(|a| crate::shadow::find_root(a, crate::shadow::RootKind::Srv)));
         let (index, shadow) = match self.root_srv_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
-                let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
+                let shadow = address.and_then(|a| crate::shadow::find_root(a, crate::shadow::RootKind::Srv).map(|s| (a, s)));
                 let Some(index) = host.dynamic(1) else {
                     return false;
                 };
