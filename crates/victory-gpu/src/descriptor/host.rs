@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+mod debug_null;
 mod listed;
 #[cfg(feature = "diagnostics")]
 pub(crate) use listed::line as list_views_line;
@@ -2902,6 +2903,7 @@ impl HostHeap {
             GONE_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return false;
         }
+        let _why = debug_null::because(debug_null::Why::Gone);
         self.unmake(&mut made, index);
         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
@@ -2920,6 +2922,7 @@ impl HostHeap {
             }
             due
         };
+        let _why = debug_null::because(debug_null::Why::Stale);
         for (slot, key) in due {
             if made.get(slot as usize) == Some(&key) {
                 self.unmake(made, slot);
@@ -3643,7 +3646,10 @@ impl HostHeap {
                         STALE_LATER_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
                         BAKE_SLOTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    _ => self.unmake(&mut made, stale),
+                    _ => {
+                        let _why = debug_null::because(debug_null::Why::Stale);
+                        self.unmake(&mut made, stale)
+                    }
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -5375,6 +5381,11 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         return null_view(at);
     }
     let Some(host) = host() else { return };
+    // `VICTORY_DEBUG_NULL_VIEWS=1`: a checkerboard where a texture is
+    // missing; `VICTORY_NEUTRAL_NULL_VIEWS=1`: a grey texel.
+    if debug_null::view(true, words[1], at) {
+        return;
+    }
     // One mip, one slice or cube, plane 0: fields a null view still checks.
     let mut w = [0u32; 10];
     w[1] = words[1];
@@ -5400,6 +5411,9 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// page faults (2026-11-24, run w10), so they are not the cause.
 fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
+    if debug_null::view(false, D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32, at) {
+        return;
+    }
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
