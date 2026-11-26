@@ -1138,7 +1138,32 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         TARGETS_SET[0].fetch_add(1, Ordering::Relaxed);
-        self.host_targets = Some(now);
+        // The recorded `OMSetRenderTargets` names these textures. Nothing
+        // else holds them for the list until a draw runs with them
+        // (`HostList::transition`), and a title may bind targets, not draw
+        // (or bind others first), and release them before the list is
+        // submitted: the card would find a destroyed resource in it. The
+        // list keeps them until its reset (after Marvisak/VIctory pull
+        // request 3128). A texture the host list had bound just before is
+        // kept already (`host_targets` is cleared whenever the host list is
+        // not the one the targets were set on).
+        let before = self.host_targets.replace(now);
+        let bound = |texture: &ID3D12Resource| {
+            let raw = texture.as_raw() as usize;
+            before
+                .as_ref()
+                .is_some_and(|(keys, depth)| keys.iter().chain(depth).any(|key| key.0 == raw))
+        };
+        for texture in views.iter().filter_map(|(texture, _)| *texture) {
+            if !bound(texture) {
+                list.keep(texture);
+            }
+        }
+        if let Some((texture, _)) = &dsv
+            && !bound(texture)
+        {
+            list.keep(*texture);
+        }
         let rtvs: Vec<_> = views.iter().map(|(texture, desc)| host.rtv(*texture, desc.as_ref())).collect();
         let dsv = dsv.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
@@ -5373,5 +5398,132 @@ mod tests {
         );
         // Zero threads along any axis is a no-op.
         assert_eq!(dispatch_dimensions([0, 1, 1], [64, 1, 1], 0x20), None);
+    }
+
+    /// `OMSetRenderTargets` records references to the bound render target
+    /// and depth host textures straight onto the host list. Even when no
+    /// draw runs with them (dropped draws, later target switches) and the
+    /// title releases the resources before the list is submitted, the list
+    /// keeps both until its reset (after Marvisak/VIctory pull request 3128,
+    /// whose test this is).
+    #[test]
+    fn render_and_depth_targets_stay_alive_until_list_reset() {
+        type Release = extern "system" fn(This) -> u32;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _ = host.log_messages();
+
+        let null = std::ptr::null();
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        let res_iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let make_cpu_heap = |kind: u32| -> This {
+            // SAFETY: HeapDesc is repr(C) [kind, count, flags, nodes].
+            let desc: crate::descriptor::HeapDesc = unsafe { std::mem::transmute([kind, 4u32, 0, 0]) };
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(null, &desc, &heap_iid, &mut heap),
+                crate::object::S_OK
+            );
+            heap
+        };
+        let make_target = |format: u32, flags: u32| -> This {
+            let heap_props: [u32; 5] = [1, 0, 0, 0, 0];
+            // A 16 x 16 texture: dimension 3, alignment, width, height, one
+            // slice and one mip, format, one sample, layout, flags.
+            let desc: [u32; 14] = [3, 0, 0, 0, 16, 0, 16, 1 | (1 << 16), format, 1, 0, 0, flags, 0];
+            let mut out = null;
+            assert_eq!(
+                crate::resource::create_committed(
+                    null,
+                    heap_props.as_ptr().cast(),
+                    0,
+                    desc.as_ptr().cast(),
+                    0,
+                    null.cast(),
+                    &res_iid,
+                    &mut out,
+                ),
+                crate::object::S_OK
+            );
+            out
+        };
+        let release = |o: This| crate::object::slot::<Release>(o, 0x10)(o);
+        let com_refs = |r: &ID3D12Resource| -> u32 {
+            // SAFETY: `r` is a live COM object; one reference is added and released.
+            unsafe {
+                let raw = r.as_raw();
+                let unknown = &*(raw as *const *const windows::core::IUnknown_Vtbl);
+                ((**unknown).AddRef)(raw);
+                ((**unknown).Release)(raw)
+            }
+        };
+
+        let rtv_heap = make_cpu_heap(2);
+        let dsv_heap = make_cpu_heap(3);
+        let rtv = crate::descriptor::heap(rtv_heap).start;
+        let dsv = crate::descriptor::heap(dsv_heap).start;
+
+        // Bind a render target and a depth target, release both title
+        // resources with nothing else holding them, switch away, submit: the
+        // debug layer, if on, flags a deleted resource at `Close` or
+        // `ExecuteCommandLists` when the list did not keep them.
+        let rt1 = make_target(28, 1); // R8G8B8A8_UNORM, allow render target
+        let ds1 = make_target(40, 2); // D32_FLOAT, allow depth stencil
+        crate::descriptor::create_rtv(null, rt1, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds1, std::ptr::null(), dsv);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_targets(&list, &[rtv], dsv);
+        state.set_targets(&list, &[], 0);
+        assert_eq!(release(rt1), 0);
+        assert_eq!(release(ds1), 0);
+        list.close();
+        assert_eq!(host.log_messages(), None, "released bound targets must not break the list");
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None, "a list whose bound targets were released must run");
+        list.reset();
+
+        // The list holds one more reference to each host texture across the
+        // title's release, and gives it up at its reset.
+        let rt2 = make_target(28, 1);
+        let ds2 = make_target(40, 2);
+        crate::descriptor::create_rtv(null, rt2, std::ptr::null(), rtv);
+        crate::descriptor::create_dsv(null, ds2, std::ptr::null(), dsv);
+        state.reset(null);
+        let probe_rt = crate::resource::host_resource(rt2).expect("host target").clone();
+        let probe_ds = crate::resource::host_resource(ds2).expect("host depth").clone();
+        let unbound = (com_refs(&probe_rt), com_refs(&probe_ds));
+        state.set_targets(&list, &[rtv], dsv);
+        let bound = (com_refs(&probe_rt), com_refs(&probe_ds));
+        assert!(bound.0 > unbound.0 && bound.1 > unbound.1, "binding keeps the targets");
+        // The same targets set again are not kept again.
+        state.set_targets(&list, &[rtv], dsv);
+        assert_eq!((com_refs(&probe_rt), com_refs(&probe_ds)), bound);
+        assert_eq!(release(rt2), 0);
+        assert_eq!(release(ds2), 0);
+        assert!(com_refs(&probe_rt) > 1, "the list keeps the bound render target until its reset");
+        assert!(com_refs(&probe_ds) > 1, "the list keeps the bound depth target until its reset");
+        state.set_targets(&list, &[], 0);
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(host.log_messages(), None);
+        list.reset();
+        assert_eq!(com_refs(&probe_rt), 1, "the reset gives up the render target");
+        assert_eq!(com_refs(&probe_ds), 1, "the reset gives up the depth target");
+        drop((probe_rt, probe_ds));
+
+        assert_eq!(release(rtv_heap), 0);
+        assert_eq!(release(dsv_heap), 0);
     }
 }
