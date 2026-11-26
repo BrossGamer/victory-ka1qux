@@ -340,6 +340,15 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out
 }
 
+/// Whether a comparison sampler keeps the min/max reduction bits it had
+/// (`VICTORY_SAMPLER_REDUCTION=0`: the comparison bit is or-ed in, as
+/// before, and a minimum reduction becomes a maximum one). Off by default:
+/// the reduction is replaced by the comparison one.
+fn keep_reduction_bits() -> bool {
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_REDUCTION").is_some_and(|v| v == "0"))
+}
+
 /// `VICTORY_SHADER_OPT`'s value; every pass when it is unset or
 /// unreadable. Pure, for testing.
 fn parse_shader_opt(value: Option<&str>) -> u32 {
@@ -863,7 +872,17 @@ fn emit_program(
             .map(|(n, &w)| {
                 let mut s = StaticSampler::from_words(w);
                 if l.cmp_samplers >> n & 1 != 0 {
-                    s.filter |= 0x80;
+                    // D3D12_FILTER_REDUCTION_TYPE occupies bits 7..=8
+                    // (0x180); clear a minimum or maximum reduction
+                    // before setting COMPARISON (0x80): or-ed in, a
+                    // minimum (0x100) became a maximum (0x180).
+                    // (After Marvisak/VIctory #2983. `VICTORY_SAMPLER_REDUCTION=0`:
+                    // or-ed in, as before.)
+                    s.filter = if keep_reduction_bits() {
+                        s.filter | 0x80
+                    } else {
+                        (s.filter & !0x180) | 0x80
+                    };
                 }
                 s
             })
@@ -1142,6 +1161,105 @@ mod tests {
         assert!(!lower::early_depth(&ps(0x1150), &[]));
         assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
         assert!(!lower::early_depth(&StageIo::None, &[]));
+    }
+
+    /// An immediate sampler used for a comparison sample takes the
+    /// comparison reduction (0x080) in place of any reduction it had: a
+    /// minimum (0x100) or a maximum (0x180) reduction sampler used with
+    /// `image_sample_c_lz` is a comparison sampler on the host, not a
+    /// maximum one (0x100 | 0x80 = 0x180). (After Marvisak/VIctory #2983,
+    /// whose test also uses the sampler for a plain sample: here one
+    /// sampler used both ways is one static sampler, a comparison one, so
+    /// the test samples with comparison only.)
+    #[test]
+    fn immediate_comparison_sampler_clears_min_max_reduction_bits() {
+        // Reduction in SQ_IMG_SAMP_WORD0 bits 29..30: 1 minimum, 2 maximum.
+        for reduction_bits in [1u32 << 29, 2u32 << 29] {
+            let words = [
+                0xBE81_0380u32, // s_mov_b32 s1, 0
+                0xF40C_0000,
+                0xFA00_0000,    // s_load_dwordx8 s[0:7], s[0:1], null
+                0xBE88_03FF,    // s_mov_b32 s8, <literal>
+                reduction_bits, // SQ_IMG_SAMP_WORD0 with min/max reduction
+                0xBE89_0380,    // s_mov_b32 s9, 0
+                0xBE8A_0380,    // s_mov_b32 s10, 0
+                0xBE8B_0380,    // s_mov_b32 s11, 0
+                0x7E00_02F0,    // v_mov_b32 v0, 0.5 (comparison reference)
+                0x7E02_02F0,    // v_mov_b32 v1, 0.5 (u)
+                0x7E04_02F0,    // v_mov_b32 v2, 0.5 (v)
+                0xBF8C_0070,    // s_waitcnt vmcnt(0) lgkmcnt(0)
+                0xF0BC_0108,
+                0x0040_0400,    // image_sample_c_lz v4, v[0:2], s[0:7], s[8:11]
+                0xBF8C_3F70,    // s_waitcnt vmcnt(0)
+                0xF800_180F,
+                0x0404_0404,    // exp mrt0, v4, v4, v4, v4 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 5,
+                layout: vec![crate::native::RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![crate::native::UsedResource {
+                    kind: crate::native::ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 8,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let output = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[output], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+
+            assert_eq!(out.static_samplers.len(), 1);
+            // Point filtering throughout (the words' filter fields are 0):
+            // nothing in the filter but the comparison reduction.
+            assert_eq!(
+                out.static_samplers[0].filter, 0x80,
+                "reduction bits {reduction_bits:#x}: the comparison sampler has the comparison reduction alone"
+            );
+            #[cfg(windows)]
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut out.dxil.clone()).unwrap();
+            }
+        }
     }
 
     /// A wave64 compute program that writes only EXEC's high dword
