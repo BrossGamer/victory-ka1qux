@@ -1101,6 +1101,17 @@ fn relook(
     (looks, found)
 }
 
+/// Whether due texture slots are served in turns, a slot looked at before
+/// and one never looked at ([`TextureQueue::due`]): `VICTORY_TEXTURE_TURNS=1`.
+/// Off by default: the slots looked at before all go first, as before.
+/// (PR #1246 of victory-fork, where it is on and `VICTORY_FAIR_DUE=0`
+/// turns it off; measured there on an 8 GB card in the opening cutscene,
+/// not here.)
+fn texture_turns() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_TURNS").is_some_and(|v| v == "1"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -1153,7 +1164,19 @@ impl TextureQueue {
     /// class is first cut to the entries that can make the list (a
     /// selection, which keeps the order the full sorts gave: write numbers
     /// are unique).
+    ///
+    /// With `VICTORY_TEXTURE_TURNS=1` ([`texture_turns`]) the first two
+    /// classes are served in turns instead, a slot looked at before first
+    /// (PR #1246 of victory-fork): with all of them first, a backlog of
+    /// thousands of slots streaming in a part at a time fills every pass,
+    /// and slots never looked at wait hundreds of frames. A pass that takes
+    /// only part of the backlog then reaches both.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_in(frame, max, texture_turns())
+    }
+
+    /// [`TextureQueue::due`] with the order of the first two classes given.
+    fn due_in(&self, frame: u64, max: usize, turns: bool) -> Vec<(u32, u64)> {
         if max == 0 {
             return Vec::new();
         }
@@ -1172,15 +1195,25 @@ impl TextureQueue {
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
-        if again.len() > max {
-            again.select_nth_unstable_by(max, newest_first);
-            again.truncate(max);
+        // How many of each class the list takes: the retries first and all
+        // they can have, or (in turns) half and half, the room one class
+        // does not use going to the other.
+        let (again_take, take) = if turns {
+            let half = again.len().min(max.div_ceil(2));
+            let fresh_take = fresh.len().min(max - half);
+            (again.len().min(max - fresh_take), fresh_take)
+        } else {
+            let all = again.len().min(max);
+            (all, fresh.len().min(max - all))
+        };
+        if again.len() > again_take {
+            again.select_nth_unstable_by(again_take, newest_first);
+            again.truncate(again_take);
         }
         again.sort_unstable_by(newest_first);
-        let mut order = again;
         // The fresh ones: the newest and the oldest in turns, the newest
         // first, as many as there is room for.
-        let take = (max - order.len()).min(fresh.len());
+        let mut fresh_order = Vec::new();
         if take > 0 {
             let (new_count, old_count) = (take.div_ceil(2), take / 2);
             if new_count < fresh.len() {
@@ -1194,11 +1227,28 @@ impl TextureQueue {
             }
             let oldest = &mut rest[oldest_at..];
             oldest.sort_unstable_by(|a, b| newest_first(b, a));
-            order.reserve(take);
+            fresh_order.reserve(take);
             for (position, &entry) in newest.iter().enumerate() {
-                order.push(entry);
-                order.extend(oldest.get(position).copied());
+                fresh_order.push(entry);
+                fresh_order.extend(oldest.get(position).copied());
             }
+        }
+        // The retries ahead of the fresh ones, or one retry and one fresh
+        // slot in turns, a retry first.
+        let mut order = Vec::with_capacity(again.len() + fresh_order.len());
+        if turns {
+            let (mut retries, mut fresh_slots) = (again.into_iter(), fresh_order.into_iter());
+            loop {
+                let (retry, new) = (retries.next(), fresh_slots.next());
+                if retry.is_none() && new.is_none() {
+                    break;
+                }
+                order.extend(retry);
+                order.extend(new);
+            }
+        } else {
+            order.extend(again);
+            order.extend(fresh_order);
         }
         // The first found changed first (the frame of the look, then the
         // slot's write).
@@ -6054,6 +6104,12 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// [`TextureQueue::due`] as it was before it selected what it sorts:
     /// every class sorted whole, the list cut at `max` at the end.
     fn due_full_sort(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        due_full_sort_in(q, frame, max, false)
+    }
+
+    /// [`due_full_sort`], with the retries and the fresh slots in turns if
+    /// `turns` ([`TextureQueue::due_in`]).
+    fn due_full_sort_in(q: &TextureQueue, frame: u64, max: usize, turns: bool) -> Vec<(u32, u64)> {
         let mut again = Vec::new();
         let mut fresh = Vec::new();
         let mut stale = Vec::new();
@@ -6068,15 +6124,34 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         again.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
         fresh.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.2));
         stale.sort_unstable_by_key(|&(found, _, write)| (found, write));
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        let mut order: Vec<(u32, u64)> = Vec::new();
+        let retries: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        if !turns {
+            order.extend(retries.iter().copied());
+        }
+        // The newest and the oldest fresh slot in turns.
+        let mut fresh_order: Vec<(u32, u64)> = Vec::new();
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && order.len() + fresh_order.len() < max {
+            fresh_order.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && order.len() + fresh_order.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                fresh_order.push((fresh[old].1, fresh[old].2));
             }
+        }
+        if turns {
+            let (mut retries, mut news) = (retries.into_iter(), fresh_order.into_iter());
+            while order.len() < max {
+                let (a, b) = (retries.next(), news.next());
+                if a.is_none() && b.is_none() {
+                    break;
+                }
+                order.extend(a);
+                order.extend(b);
+            }
+        } else {
+            order.extend(fresh_order);
         }
         order.extend(stale.iter().map(|&(_, index, write)| (index, write)));
         order.truncate(max);
@@ -6120,6 +6195,59 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
                 }
             }
         }
+    }
+
+    /// The same in turns ([`TextureQueue::due_in`] with `turns`): the
+    /// selection hands out what the full sorts do, for every mix of retries
+    /// and fresh slots and every limit.
+    #[test]
+    fn bounded_texture_selection_in_turns_matches_full_sort() {
+        for repeat_every in [1, 2, 3, 17, 1000] {
+            let q = due_fixture(73, repeat_every);
+            for frame in [0, 1, 2, 3] {
+                for max in 0..=80 {
+                    assert_eq!(
+                        q.due_in(frame, max, true),
+                        due_full_sort_in(&q, frame, max, true),
+                        "in turns, every {repeat_every}th a retry, frame {frame}, at most {max}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Slots looked at before and slots never looked at are served in
+    /// turns, one looked at before first: a pass that can take only some
+    /// of a backlog of slots streaming in a part at a time still reaches
+    /// the slots never looked at. (The case of PR #1246 of victory-fork.)
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        // Slots 100..110 looked at before (their memory not there yet).
+        for i in 0..10u32 {
+            q.written(100 + i, 1, 0, false);
+        }
+        for i in 0..10u32 {
+            let w = q.due_in(u64::MAX, 100, true).iter().find(|d| d.0 == 100 + i).unwrap().1;
+            q.later(100 + i, w, 1, 1);
+        }
+        // Slots 1..4 never looked at.
+        for i in 1..4u32 {
+            q.written(i, 2, 0, false);
+        }
+        let order: Vec<u32> = q.due_in(10, 6, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 6);
+        assert!(order[0] >= 100, "a slot looked at before comes first: {order:?}");
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3, "every fresh slot is reached: {order:?}");
+        // As the retries alone fill a pass of six without it.
+        let order: Vec<u32> = q.due_in(10, 6, false).into_iter().map(|d| d.0).collect();
+        assert!(order.iter().all(|&i| i >= 100), "the slots looked at before fill the pass: {order:?}");
+        // The room a class does not use goes to the other.
+        let order: Vec<u32> = q.due_in(10, 12, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(order.len(), 12);
+        assert_eq!(order.iter().filter(|&&i| i < 100).count(), 3);
+        let all: Vec<u32> = q.due_in(10, 100, true).into_iter().map(|d| d.0).collect();
+        assert_eq!(all.len(), 13);
     }
 
     /// The two over a full streaming queue: 40,000 slots, 4,096 taken

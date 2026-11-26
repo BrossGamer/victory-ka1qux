@@ -2690,7 +2690,16 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
-        let most = (4000 / took).clamp(16, 256);
+        // `VICTORY_RELOOK_MS`: those milliseconds, 4,000 unless said (the
+        // fork's PR #1246 takes 20,000, up to 1,024 frames, which it
+        // measured with its queue of 20,000 slots waiting for memory at the
+        // opening cutscene's 4 frames a second: thousands of queries a
+        // second, most of the pass's time).
+        static RELOOK_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let relook = *RELOOK_MS.get_or_init(|| {
+            std::env::var("VICTORY_RELOOK_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(4000)
+        });
+        let most = (relook / took).clamp(16, if relook > 4000 { 1024 } else { 256 });
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
