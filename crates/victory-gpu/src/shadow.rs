@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod quiet;
 mod under;
 pub(crate) use under::{on as under_fused, stats as under_stats};
 
@@ -128,6 +129,9 @@ pub(crate) struct Shadow {
     /// cut to its run of pages and a root view with no length is given it
     /// all the same, `VICTORY_UNSIZED_RUN=1`).
     unified: u8,
+    /// Whether shaders have been declared to write the window and never
+    /// have (`VICTORY_QUIET_WINDOWS`), for a window that is a copy.
+    quiet: quiet::Quiet,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2007,6 +2011,16 @@ static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    if quiet::rules().mode != quiet::Mode::Off {
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        let mut now = [0u64; 2];
+        for s in loose.values().filter(|s| s.quiet.is_quiet()) {
+            now[0] += 1;
+            now[1] += s.len;
+        }
+        drop(loose);
+        quiet::line(frames, now);
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -3040,6 +3054,7 @@ impl Shadow {
             fallback: Mutex::default(),
             own_view: None,
             unified: 0,
+            quiet: quiet::Quiet::new(),
         }
     }
 
@@ -3275,6 +3290,26 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         self.gpu_writes_marked(list, address, len, false);
+    }
+
+    /// [`Shadow::gpu_writes_marked`] for what a draw or a dispatch may
+    /// store through a root view or a buffer view of the copy: not made at
+    /// all for a window that has been compared many times with nothing
+    /// written (`VICTORY_QUIET_WINDOWS=1`, see `quiet`). The page tables of
+    /// title memory by address (`crate::memory`) and the copies of buffer
+    /// regions declare through [`Shadow::gpu_writes`] and always do.
+    pub(crate) fn gpu_writes_viewed(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
+        if !marked && self.window && self.card.is_none() && self.place.is_none() && self.uploaded == 0 {
+            let rules = quiet::rules();
+            if rules.mode != quiet::Mode::Off {
+                let from = address as usize;
+                let to = from.saturating_add(len.min(self.left(address)) as usize);
+                if self.quiet.declared(&rules, from, to) == quiet::Verdict::Hold {
+                    return;
+                }
+            }
+        }
+        self.gpu_writes_marked(list, address, len, marked);
     }
 
     /// [`Shadow::gpu_writes`]; `marked`: through views of the heap by a
@@ -3532,6 +3567,11 @@ impl Shadow {
             // view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+            // What a window that shaders are declared to write gave back
+            // (`VICTORY_QUIET_WINDOWS`).
+            if self.window && self.card.is_none() {
+                self.quiet.compared(&quiet::rules(), start + from, start + to, written);
+            }
         }
         written
     }

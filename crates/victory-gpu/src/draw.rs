@@ -1905,7 +1905,7 @@ impl State {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
-                s.gpu_writes(list, a, len);
+                s.gpu_writes_viewed(list, a, len, false);
             }
         };
         if !crate::pipeline::host::bounded_root_srvs() {
@@ -4801,7 +4801,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
                 // Through a view of the heap: marked if the shader marks.
-                shadow.gpu_writes_marked(list, address, len, MARKED.get());
+                shadow.gpu_writes_viewed(list, address, len, MARKED.get());
             } else {
                 #[cfg(feature = "diagnostics")]
                 {
