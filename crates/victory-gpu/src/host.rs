@@ -10004,6 +10004,15 @@ impl Meter {
                 );
             }
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            let [set, kept] = [0, 1].map(|i| crate::draw::TARGETS_SET[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if set + kept > 0.0 {
+                tracing::info!(
+                    "render target sets per frame (VICTORY_BIND_CACHE=1): {set:.0} made on the host list,                      {kept:.0} left out for the host list having the same views"
+                );
+            }
+        }
         {
             let buried = BURIED_ASIDE.swap(0, Ordering::Relaxed) as f64 / frames;
             if buried > 0.0 {

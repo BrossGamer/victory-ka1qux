@@ -360,6 +360,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -1839,5 +1848,29 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// `VICTORY_BIND_CACHE=1` leaves the render targets alone when the host
+    /// list has the same views: records with the same resource, description
+    /// and "described" flag have one key, and no two views of a different
+    /// kind do.
+    #[cfg(windows)]
+    #[test]
+    fn render_target_records_have_one_key_per_view() {
+        let resource = 0x1000usize as This;
+        let record = |described, resource, desc| RtvRecord { tag: RTV_TAG, described, resource, desc };
+        let base = record(1, resource, [28, 4, 0, 0, 1, 0]);
+        assert_eq!(base.key(), record(1, resource, [28, 4, 0, 0, 1, 0]).key());
+        // Each word of the description, the flag and the resource tell views apart.
+        for word in 0..6 {
+            let mut desc = [28, 4, 0, 0, 1, 0];
+            desc[word] += 1;
+            assert_ne!(base.key(), record(1, resource, desc).key(), "description word {word}");
+        }
+        assert_ne!(base.key(), record(0, resource, [28, 4, 0, 0, 1, 0]).key());
+        assert_ne!(base.key(), record(1, 0x2000usize as This, [28, 4, 0, 0, 1, 0]).key());
+        // (The flag is the key's first word and does not hide a description
+        // word that is equal to it: [1, 1, ..] and [1, 2, ..] differ.)
+        assert_ne!(record(1, resource, [1, 1, 0, 0, 0, 0]).key(), record(1, resource, [1, 2, 0, 0, 0, 0]).key());
     }
 }
