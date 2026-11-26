@@ -215,6 +215,30 @@ unsafe fn emulate_amd_only(info: *mut EXCEPTION_POINTERS) -> bool {
 /// [`emulate_amd_only`] with the `VICTORY_REWRITE_WAITS` setting given (see
 /// [`rewrite_waits`]).
 unsafe fn emulate_amd_only_as(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -> bool {
+    // SAFETY: forwarded from the caller.
+    if unsafe { emulate_amd_only_now(info, rewrite) } {
+        return true;
+    }
+    // An instruction this thread faulted on, which another thread has
+    // rewritten since: the bytes there are legal, so the exception is no
+    // crash, and the thread goes on to run them from the same place
+    // ([`note_patched`]).
+    // SAFETY: the system passes valid exception pointers.
+    let (illegal, at) = unsafe {
+        (
+            (*(*info).ExceptionRecord).ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION,
+            (*(*info).ContextRecord).Rip as usize,
+        )
+    };
+    if illegal && is_patched(at) {
+        STALE_FAULTS.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// [`emulate_amd_only_as`] without that last chance.
+unsafe fn emulate_amd_only_now(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -> bool {
     // SAFETY: the system passes valid exception pointers; the faulting
     // instruction's bytes are readable, as the CPU just fetched them.
     unsafe {
@@ -273,9 +297,15 @@ unsafe fn emulate_amd_only_as(info: *mut EXCEPTION_POINTERS, rewrite: Rewrite) -
                     context.Rip += len as u64;
                     return true;
                 }
-                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters) else {
+                let rewrite = rewrite_sse4a();
+                let Some(len) = sse4a(code, &mut context.Anonymous.FltSave.XmmRegisters, rewrite) else {
                     return false;
                 };
+                // After the first fault at a place with its field in the
+                // instruction, a jump to the same work in SSE2 takes the place
+                // of the instruction's first bytes (`VICTORY_REWRITE_SSE4A=1`).
+                let replaced = rewrite && crate::sse4a::replace(context.Rip as usize);
+                count_sse4a(context.Rip as usize, bytes[0] == 0xf2, replaced);
                 context.Rip += len as u64;
                 return true;
             }
@@ -346,14 +376,12 @@ unsafe fn rewrite_wait(at: usize, mwait: bool) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
     use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    static REWRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static PROTECT_FAILED: AtomicBool = AtomicBool::new(false);
     let (was, to) = if mwait { (MWAITX, PAUSE_NOP) } else { (MONITORX, NOP3) };
     let line_start = at & !63;
     if at + 3 > line_start + 64 || PROTECT_FAILED.load(Ordering::Relaxed) {
         return false;
     }
-    let _alone = REWRITING.lock().unwrap_or_else(|e| e.into_inner());
+    let _alone = CODE_PATCH.lock().unwrap_or_else(|e| e.into_inner());
     // The eight bytes inside the line that cover the three.
     let word = at.min(line_start + 56);
     let shift = at - word;
@@ -394,7 +422,94 @@ unsafe fn rewrite_wait(at: usize, mwait: bool) -> bool {
             FlushInstructionCache(GetCurrentProcess(), at as *const _, 3);
         }
     }
+    if done {
+        note_patched(at);
+    }
     done
+}
+
+/// One thread at a time changes the title's code ([`rewrite_wait`], and
+/// `crate::sse4a` for `VICTORY_REWRITE_SSE4A`): two changing one page's
+/// protection would put it back wrong.
+pub(crate) static CODE_PATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// A change of a page's protection failed: no code is changed after.
+pub(crate) static PROTECT_FAILED: AtomicBool = AtomicBool::new(false);
+
+const PATCHED_SLOTS: usize = 4096;
+/// The addresses of the title's instructions that were changed in place
+/// (nothing is ever taken out), for a thread that faulted on the old bytes
+/// and reads the new ones when its handler runs: the new bytes are legal
+/// instructions, so no exception at such an address is a crash, and the
+/// thread is let go on to run them. Open addressing, no lock and no
+/// allocation: the exception handler reads it on any thread.
+static PATCHED: [AtomicUsize; PATCHED_SLOTS] = [const { AtomicUsize::new(0) }; PATCHED_SLOTS];
+/// Exceptions let go on that way since the start.
+static STALE_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+fn patched_start(at: usize) -> usize {
+    (at.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) % PATCHED_SLOTS
+}
+
+/// The instruction at `at` was changed in place and now holds legal bytes.
+pub(crate) fn note_patched(at: usize) {
+    let mut i = patched_start(at);
+    for _ in 0..PATCHED_SLOTS {
+        match PATCHED[i].compare_exchange(0, at, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(seen) if seen == at => return,
+            Err(_) => i = (i + 1) % PATCHED_SLOTS,
+        }
+    }
+}
+
+/// Whether [`note_patched`] was told of `at`.
+fn is_patched(at: usize) -> bool {
+    let mut i = patched_start(at);
+    for _ in 0..PATCHED_SLOTS {
+        match PATCHED[i].load(Ordering::Acquire) {
+            0 => return false,
+            seen if seen == at => return true,
+            _ => i = (i + 1) % PATCHED_SLOTS,
+        }
+    }
+    false
+}
+
+/// Whether `extrq` and `insertq` with their field in the instruction are
+/// replaced, after their first fault, by a jump to the same work in SSE2
+/// (`VICTORY_REWRITE_SSE4A=1`; off by default; `crate::sse4a`). Intel CPUs
+/// have no SSE4a: each one is an exception, 191 to 491 a second in a
+/// title's gameplay on one i9, 442 a second at one place (upstream VIctory
+/// #3042). With it on, the emulation also zeroes the destination's high
+/// quadword ([`sse4a`]), as the SSE2 code does.
+fn rewrite_sse4a() -> bool {
+    #[cfg(test)]
+    if FORCE_SSE4A.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REWRITE_SSE4A").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test turns the rewriting on for its own thread (the exceptions
+    /// it takes are handled on it), so that tests that run other code on
+    /// other threads see none of it.
+    static FORCE_SSE4A: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Turns [`rewrite_sse4a`] on for this thread, in a test.
+#[cfg(test)]
+pub(crate) fn force_rewrite_sse4a(on: bool) {
+    FORCE_SSE4A.set(on);
+}
+
+/// [`emulate_amd_only`], for the tests of `crate::sse4a`.
+#[cfg(test)]
+pub(crate) unsafe fn emulate_amd_only_for_test(info: *mut EXCEPTION_POINTERS) -> bool {
+    // SAFETY: forwarded from the caller.
+    unsafe { emulate_amd_only(info) }
 }
 
 /// `lock cmpxchg` of eight bytes at `at` (inside one cache line, so atomic
@@ -435,7 +550,16 @@ static REWRITTEN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Counts a fault at the wait instruction at `at`. No lock and no
 /// allocation: the exception handler takes this on any thread.
 fn count_wait(at: usize, mwait: bool) {
-    let tag = at | (usize::from(mwait) << 63);
+    count_tag(at | (usize::from(mwait) << 63));
+}
+
+/// The kinds of instruction the table [`WAITS`] counts, in the two top bits
+/// of a tag (an address has none of them): 0 `monitorx`, 1 `extrq`, 2
+/// `mwaitx`, 3 `insertq`.
+const KIND_SHIFT: u32 = 62;
+
+fn count_tag(tag: usize) {
+    let at = tag & !(3 << KIND_SHIFT);
     let mut i = (at.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 40) % WAIT_SLOTS;
     for _ in 0..WAIT_SLOTS {
         let slot = &WAITS[i];
@@ -455,10 +579,29 @@ fn count_wait(at: usize, mwait: bool) {
     WAITS_LOST.fetch_add(1, Ordering::Relaxed);
 }
 
-/// The frame line for the console's wait instructions: how many faults they
-/// took per frame since the last line, at how many addresses, and which
-/// addresses took the most. `None` while there were none. For the frame
-/// lines of the layer (`victory_gpu::add_frame_line_source`).
+/// Since the last frame line: `extrq` and `insertq` taken by an exception
+/// (of any form), and of those the ones left to the exception for good (the
+/// field in a register, no room for a jump, or the switch off).
+static SSE4A_FAULTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static SSE4A_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a fault at the `extrq` (or `insertq`) at `at` that was emulated,
+/// and whether its place holds a jump to SSE2 code now. No lock and no
+/// allocation: the exception handler takes this on any thread.
+fn count_sse4a(at: usize, insert: bool, replaced: bool) {
+    count_tag(at | (1 << KIND_SHIFT) | (usize::from(insert) << 63));
+    SSE4A_FAULTS[usize::from(insert)].fetch_add(1, Ordering::Relaxed);
+    if !replaced {
+        SSE4A_LEFT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The frame line for the instructions of the console's CPU that this one
+/// refused: the wait instructions, and SSE4a's `extrq` and `insertq`. How
+/// many faults they took per frame since the last line, at how many
+/// addresses, and which addresses took the most. `None` while there were
+/// none. For the frame lines of the layer
+/// (`victory_gpu::add_frame_line_source`).
 pub fn wait_fault_line(frames: f64) -> Option<String> {
     let mut seen: Vec<(usize, u64)> = Vec::new();
     for slot in &WAITS {
@@ -468,32 +611,67 @@ pub fn wait_fault_line(frames: f64) -> Option<String> {
         }
     }
     let lost = WAITS_LOST.swap(0, Ordering::Relaxed);
+    // Waits: kinds 0 and 2; SSE4a: 1 and 3.
+    let (mut sse4a_seen, mut seen): (Vec<_>, Vec<_>) = seen.into_iter().partition(|&(tag, _)| tag >> KIND_SHIFT & 1 != 0);
     let total: u64 = seen.iter().map(|(_, hits)| hits).sum::<u64>() + lost;
-    if total == 0 {
-        return None;
+    let mut lines = Vec::new();
+    if total != 0 {
+        seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
+        let top: Vec<String> = seen
+            .iter()
+            .take(4)
+            .map(|&(tag, hits)| {
+                format!(
+                    "{} at {:#x}: {:.0}",
+                    if tag >> 63 != 0 { "mwaitx" } else { "monitorx" },
+                    tag & !(1 << 63),
+                    hits as f64 / frames
+                )
+            })
+            .collect();
+        let [monitorx, mwaitx] = [0, 1].map(|i| REWRITTEN[i].load(Ordering::Relaxed));
+        lines.push(format!(
+            "the console's wait instructions the CPU refused, taken by an exception each, per frame: {:.0} at {} addresses ({}); \
+             VICTORY_REWRITE_WAITS=1 rewrites them in place ({monitorx} monitorx and {mwaitx} mwaitx rewritten so far, {:?})",
+            total as f64 / frames,
+            seen.len(),
+            top.join(", "),
+            rewrite_waits()
+        ));
     }
-    seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
-    let top: Vec<String> = seen
-        .iter()
-        .take(4)
-        .map(|&(tag, hits)| {
-            format!(
-                "{} at {:#x}: {:.0}",
-                if tag >> 63 != 0 { "mwaitx" } else { "monitorx" },
-                tag & !(1 << 63),
-                hits as f64 / frames
-            )
-        })
-        .collect();
-    let [monitorx, mwaitx] = [0, 1].map(|i| REWRITTEN[i].load(Ordering::Relaxed));
-    Some(format!(
-        "the console's wait instructions the CPU refused, taken by an exception each, per frame: {:.0} at {} addresses ({}); \
-         VICTORY_REWRITE_WAITS=1 rewrites them in place ({monitorx} monitorx and {mwaitx} mwaitx rewritten so far, {:?})",
-        total as f64 / frames,
-        seen.len(),
-        top.join(", "),
-        rewrite_waits()
-    ))
+    let [extrq, insertq] = [0, 1].map(|i| SSE4A_FAULTS[i].swap(0, Ordering::Relaxed));
+    let left = SSE4A_LEFT.swap(0, Ordering::Relaxed);
+    let stale = STALE_FAULTS.load(Ordering::Relaxed);
+    if extrq + insertq != 0 {
+        sse4a_seen.sort_by_key(|&(_, hits)| std::cmp::Reverse(hits));
+        let top: Vec<String> = sse4a_seen
+            .iter()
+            .take(4)
+            .map(|&(tag, hits)| {
+                format!(
+                    "{} at {:#x}: {:.0}",
+                    if tag >> 63 != 0 { "insertq" } else { "extrq" },
+                    tag & !(3 << KIND_SHIFT),
+                    hits as f64 / frames
+                )
+            })
+            .collect();
+        let [replaced_extrq, replaced_insertq] = [0, 1].map(|i| crate::sse4a::REPLACED[i].load(Ordering::Relaxed));
+        lines.push(format!(
+            "SSE4a instructions the CPU refused, taken by an exception each, per frame: {:.0} extrq and {:.0} insertq at {} addresses \
+             ({}), {:.0} of them left to the exception (the field in a register, no room for a jump, or the switch off); \
+             VICTORY_REWRITE_SSE4A=1 replaces the ones with their field in the instruction by SSE2 code after their first fault \
+             ({replaced_extrq} extrq and {replaced_insertq} insertq replaced so far, {stale} faults let go on at a place another \
+             thread had replaced, {})",
+            extrq as f64 / frames,
+            insertq as f64 / frames,
+            sse4a_seen.len(),
+            top.join(", "),
+            left as f64 / frames,
+            if rewrite_sse4a() { "on" } else { "off" }
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("; "))
 }
 
 /// `clwb m8` (`66 [rex] 0f ae /6`, a memory operand), which Intel CPUs before
@@ -718,8 +896,13 @@ fn cmp_flags(a: u64, b: u64) -> u32 {
 const CMP_FLAGS: u32 = 0x8d5;
 
 /// SSE4a's `extrq`/`insertq` (register forms, the only ones there are) on
-/// the saved XMM registers; returns the instruction's length.
-unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
+/// the saved XMM registers; returns the instruction's length. With
+/// `zero_high` the destination's high quadword is zeroed, as AMD's CPUs do
+/// and as the SSE2 code that takes the instruction's place does
+/// (`VICTORY_REWRITE_SSE4A=1`, `crate::sse4a`): every run then gives one
+/// result. AMD documents those bits as undefined; without the switch they
+/// are left as they were.
+pub(crate) unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16], zero_high: bool) -> Option<usize> {
     // SAFETY: the caller's code bytes are readable up to the instruction's end.
     let b = |i: usize| unsafe { code.add(i).read() };
     let prefix = b(0);
@@ -755,9 +938,15 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
         }
         let target = if immediate { src } else { dst };
         xmm[target].Low = (xmm[target].Low >> at_bit) & mask;
+        if zero_high {
+            xmm[target].High = 0;
+        }
     } else {
         let value = (xmm[src].Low & mask) << at_bit;
         xmm[dst].Low = xmm[dst].Low & !(mask << at_bit) | value;
+        if zero_high {
+            xmm[dst].High = 0;
+        }
     }
     Some(len)
 }
@@ -2042,8 +2231,13 @@ mod tests {
 
     /// The faults are counted per address and kind, a line names the busiest,
     /// and what it counted is not counted again.
+    /// Taking the frame line takes the counts of every test that counts:
+    /// the tests that read it one at a time.
+    static LINE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn faults_at_wait_instructions_are_counted_by_address() {
+        let _line = LINE.lock().unwrap_or_else(|e| e.into_inner());
         // An address no instruction of a test lies at.
         let (monitor, mwait) = (0x7ff0_dead_0040usize, 0x7ff0_dead_0080usize);
         for _ in 0..7000 {
@@ -2059,5 +2253,24 @@ mod tests {
         count_wait(monitor, false);
         let line = wait_fault_line(1.0).expect("a line");
         assert!(line.contains("monitorx at 0x7ff0dead0040: 1,") || line.contains("monitorx at 0x7ff0dead0040: 1)"), "{line}");
+    }
+
+    /// The SSE4a faults are counted by address and kind, apart from the waits, and the line
+    /// says how many were left to the exception.
+    #[test]
+    fn faults_at_sse4a_instructions_are_counted_by_address_and_kind() {
+        let _line = LINE.lock().unwrap_or_else(|e| e.into_inner());
+        let (extrq, insertq) = (0x7ff0_dead_0100usize, 0x7ff0_dead_0140usize);
+        for _ in 0..4000 {
+            count_sse4a(extrq, false, true);
+        }
+        for _ in 0..2000 {
+            count_sse4a(insertq, true, false);
+        }
+        let line = wait_fault_line(2.0).expect("a line for what was counted");
+        assert!(line.contains("extrq at 0x7ff0dead0100: 2000"), "{line}");
+        assert!(line.contains("insertq at 0x7ff0dead0140: 1000"), "{line}");
+        assert!(line.contains("SSE4a instructions the CPU refused"), "{line}");
+        assert!(!line.contains("monitorx at 0x7ff0dead0100"), "{line}");
     }
 }

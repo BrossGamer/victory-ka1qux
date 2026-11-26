@@ -1996,6 +1996,111 @@ mod remap_tests {
     }
 }
 
+/// A texture over memory the write watch answers for and memory it cannot
+/// answer for (upstream VIctory #3041, FIND-17: a refresh that read only the
+/// written pages of the first left the texture at its first zeros when the
+/// second was written late). Here the write watch answers for a whole
+/// range or not at all, and a texture it cannot answer for is hashed whole
+/// at every look, so the late write is found; this keeps it so.
+#[cfg(test)]
+mod mixed_memory_tests {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows_sys::Win32::System::Memory::*;
+
+    const RUN: usize = 0x1_0000;
+    const WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Two adjacent runs of `RUN` bytes: the first or the second (`watched`
+    /// says which) write-watched, the other plain committed memory.
+    fn pair(watched_first: bool) -> Option<usize> {
+        for _ in 0..64 {
+            // SAFETY: a probe for a free range of addresses, released at once.
+            let probe = unsafe { VirtualAlloc(std::ptr::null(), 2 * RUN, MEM_RESERVE, PAGE_READWRITE) };
+            if probe.is_null() {
+                return None;
+            }
+            // SAFETY: the probe above.
+            unsafe { VirtualFree(probe, 0, MEM_RELEASE) };
+            let kind = |watched: bool| MEM_RESERVE | MEM_COMMIT | if watched { WRITE_WATCH } else { 0 };
+            // SAFETY: fixed addresses of the probe, which another thread may
+            // have taken meanwhile (then it is tried again).
+            let first = unsafe { VirtualAlloc(probe, RUN, kind(watched_first), PAGE_READWRITE) };
+            if first.is_null() {
+                continue;
+            }
+            // SAFETY: as above.
+            let second = unsafe { VirtualAlloc(probe.wrapping_byte_add(RUN), RUN, kind(!watched_first), PAGE_READWRITE) };
+            if !second.is_null() {
+                return Some(first as usize);
+            }
+            // SAFETY: the first run, ours.
+            unsafe { VirtualFree(first, 0, MEM_RELEASE) };
+        }
+        None
+    }
+
+    /// A linear 128x256 RGBA8 texture, 512-byte rows, across the pair: rows
+    /// 0..128 in the first run, 128..256 in the second. A late write to
+    /// either run is staged, an unchanged texture is not read again.
+    fn late_writes_are_staged(watched_first: bool) {
+        let Some(base) = pair(watched_first) else {
+            return;
+        };
+        let description = [3, 0, 0, 0, 128, 0, 256, 0x1_0001, 28, 1, 0, 1, 0, 0];
+        let made = crate::resource::texture_at(base as u64, &description).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            Some((resource, super::staging(resource, host_texture, 0)?))
+        });
+        // `None`: no GPU to make the host texture on (and then no host).
+        assert!(made.is_some() || crate::host::host().is_none(), "no staging buffer though there is a GPU");
+        if let Some((resource, staging)) = made {
+            let footprint = staging.footprints[0];
+            let pitch = footprint.Footprint.RowPitch as usize;
+            assert!(pitch >= 512);
+            let staged = |row: usize| {
+                // SAFETY: a byte of the mapped staging buffer's first subresource.
+                unsafe { staging.data.add(footprint.Offset as usize + row * pitch).read_volatile() }
+            };
+            let write = |row: usize, byte: u8| {
+                // SAFETY: a byte of the committed memory of the texture.
+                unsafe { ((base + row * 512) as *mut u8).write_volatile(byte) }
+            };
+            staging.refresh();
+            assert_eq!((staged(0), staged(128)), (0, 0), "the initial zeros");
+            staging.dirty.store(false, Relaxed);
+            staging.refresh();
+            assert!(!staging.dirty.load(Relaxed), "unchanged memory is not staged again");
+            // A late write to each run in turn.
+            for (row, byte) in [(0, 0x11), (128, 0x22), (255, 0x33)] {
+                write(row, byte);
+                staging.refresh();
+                assert!(staging.dirty.load(Relaxed), "the write to row {row} was not staged");
+                assert_eq!(staged(row), byte, "row {row}");
+                staging.dirty.store(false, Relaxed);
+                staging.refresh();
+                assert!(!staging.dirty.load(Relaxed), "row {row} staged again, unchanged");
+            }
+            drop(staging);
+            super::unstage(resource);
+        }
+        // SAFETY: the two runs of `pair`, released once each.
+        unsafe {
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+            VirtualFree((base + RUN) as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn a_late_write_to_the_plain_part_of_a_texture_is_staged() {
+        late_writes_are_staged(true);
+    }
+
+    #[test]
+    fn a_late_write_to_the_watched_part_of_a_texture_is_staged() {
+        late_writes_are_staged(false);
+    }
+}
+
 #[cfg(test)]
 mod title_memory_tests {
     use super::{mapped_bytes, with_title};

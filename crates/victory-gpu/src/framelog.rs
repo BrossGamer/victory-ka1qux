@@ -72,6 +72,16 @@ pub enum T {
     PipelineWaitUs,
     /// Writes taken by the guards on view memory.
     GuardFaults,
+    /// What those faults cost the title's threads, summed over them: the
+    /// time in the handler, all of it, and of it the waiting to take the
+    /// guards' lock (`crate::watch`).
+    GuardFaultUs,
+    GuardWaitUs,
+    /// The bytes an armed block keeps from before its first write, read
+    /// with the lock released and kept, and those thrown away because the
+    /// block changed meanwhile (then read under the lock, as before).
+    GuardSaves,
+    GuardSavesAgain,
     /// The title's frame waits: time slept, on every thread.
     PaceUs,
     /// DirectStorage requests finished, their destination bytes, and the
@@ -413,7 +423,8 @@ fn text(f: &Frame) -> String {
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
-         faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
+         faults: {:.0} page, {:.0} guard ({:.1} ms in the handler, {:.1} waiting for the guards' lock; {:.0} saves read \
+         unlocked, {:.0} read again) | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -462,6 +473,10 @@ fn text(f: &Frame) -> String {
         ms(T::DiskUs),
         s(S_PAGE_FAULTS),
         t(T::GuardFaults),
+        ms(T::GuardFaultUs),
+        ms(T::GuardWaitUs),
+        t(T::GuardSaves),
+        t(T::GuardSavesAgain),
         s(S_PROCESS_USER) / 1e3,
         s(S_PROCESS_KERNEL) / 1e3,
         ms(T::PaceUs),

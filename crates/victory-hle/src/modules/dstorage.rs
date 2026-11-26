@@ -558,6 +558,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let (watched_first, watched_first_bytes) = super::xmem::watched_first_taken();
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -569,6 +570,8 @@ impl Lanes {
                 waiting,
                 shown_requests = SHOWN[0].swap(0, Ordering::Relaxed),
                 shown_mb = SHOWN[1].swap(0, Ordering::Relaxed) >> 20,
+                watched_first,
+                watched_first_mb = watched_first_bytes >> 20,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -1118,7 +1121,10 @@ fn into_destination(
     let count = (offset + len).div_ceil(PAGE);
     let pages = page_list(list, count);
     // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    // place through one view. The GPU side is told where the title shows
+    // them before the first byte is written, and the window keeps its
+    // hold until it is dropped (`xmem::write_physical` does the same for
+    // the pages that take a buffer's copy, once per attempt).
     if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
         let filled = fill(window.bytes());
         drop(window);

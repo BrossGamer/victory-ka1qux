@@ -834,6 +834,9 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // The GPU side hears of the write before it happens, and keeps the
+    // guarded blocks over the pages open until it is done ([`will_write`]).
+    let _writing = will_write(pages, offset, data.len());
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = View::map(slice, *n) else {
@@ -853,12 +856,23 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The GPU side's hold on the title addresses that show the bytes,
+    /// taken before the window can be written and kept until it is dropped
+    /// (after the view: the write is over by then).
+    _writing: Vec<victory_gpu::Writing>,
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         &mut self.view.bytes()[within..within + len]
+    }
+
+    /// Title addresses (runs of them) the GPU side was told of before the
+    /// window was handed out.
+    #[cfg(test)]
+    fn watched(&self) -> usize {
+        self._writing.len()
     }
 }
 
@@ -874,11 +888,62 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    // Mapped first: a window never handed out tells nothing.
+    let view = View::map(slice, *n)?;
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
+        _writing: will_write(pages, offset, len),
     })
+}
+
+/// How the GPU side hears of writes into physical pages through our own
+/// views: before they happen (`VICTORY_DSTORAGE_WATCH_FIRST`, on unless
+/// `0`; `0` is the order of before, told only when the bytes are there,
+/// [`pages_written`]).
+fn watch_first() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_WATCH_FIRST").is_none_or(|v| v != "0"))
+}
+
+/// Since the start (taken by [`watched_first_taken`]): writes into physical
+/// pages that were told before they began, at some title address; the
+/// bytes of those writes, at all the addresses.
+static WATCHED_FIRST: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// What [`WATCHED_FIRST`] counted since the last call: writes told before
+/// they began, and their bytes.
+pub(crate) fn watched_first_taken() -> (u64, u64) {
+    (WATCHED_FIRST[0].swap(0, Ordering::Relaxed), WATCHED_FIRST[1].swap(0, Ordering::Relaxed))
+}
+
+/// Bytes `[offset, offset + len)` of `pages` are about to be written
+/// through a view of our own: the GPU side is told at every title address
+/// that shows them ([`shown_at`]), as for a kernel write into title memory
+/// (`victory_gpu::kernel_will_write`; upstream #3037). The write goes
+/// through another view than the title's, so no guard faults at the title's
+/// addresses. Told only after the bytes were there, nothing kept the
+/// blocks over the pages from being copied and guarded again while the
+/// write was under way, armed blocks had no bytes from before to keep, and
+/// the textures there were not due: one uploaded before the write kept the
+/// bytes it had (zeros, or part of the data) until a later look found the
+/// change. Told before, the blocks stay open, and are not guarded again,
+/// until what this returns is dropped, the armed ones keep their bytes from
+/// before, and the textures there are due at the next pass. Drop it when
+/// the bytes are there; then [`pages_written`] says so. Call without the
+/// page table's lock.
+fn will_write(pages: &[usize], offset: usize, len: usize) -> Vec<victory_gpu::Writing> {
+    if !watch_first() {
+        return Vec::new();
+    }
+    let told = shown_at(pages, offset, len);
+    if told.is_empty() {
+        return Vec::new();
+    }
+    WATCHED_FIRST[0].fetch_add(1, Ordering::Relaxed);
+    WATCHED_FIRST[1].fetch_add(told.iter().map(|&(_, bytes)| bytes as u64).sum(), Ordering::Relaxed);
+    told.into_iter().map(|(at, bytes)| victory_gpu::kernel_will_write(at, bytes)).collect()
 }
 
 /// The title addresses that show bytes `[offset, offset + len)` of `pages`
@@ -1930,6 +1995,55 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
         }
         assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// A write into physical pages is told to the GPU side before it
+    /// begins, at every title address that shows the bytes (upstream
+    /// #3037): the window and the buffered write both take their hold
+    /// before a byte is written, and none where nothing shows the pages.
+    #[test]
+    fn writes_into_physical_pages_are_told_before_they_begin() {
+        let pages = allocate(3);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        // Mapped nowhere: nothing to tell, and the write still goes through.
+        assert!(will_write(&pages, 0, 3 * PAGE).is_empty());
+        {
+            let mut window = page_window(&pages, 0, 3 * PAGE).expect("one run");
+            assert_eq!(window.watched(), 0, "no title address shows them");
+            window.bytes().fill(0x21);
+        }
+        // All three at `a`; the last two at `b`, from its second page on
+        // (a page unmapped at either end, so that no run at `b` touches `a`).
+        let (a, b) = (reserve(3), reserve(4));
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let second = b.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
+        // The first page shows at `a` alone: one hold.
+        assert_eq!(will_write(&pages, 10, 100).len(), 1);
+        // The second shows at both: one hold at each, taken with the window
+        // and kept while it lives.
+        let mut window = page_window(&pages, PAGE + 3, PAGE).expect("one run");
+        assert_eq!(window.watched(), 2, "both addresses are told before the first byte");
+        window.bytes().fill(0x5a);
+        drop(window);
+        // SAFETY: both mapped read-write, and the window is gone.
+        unsafe {
+            assert_eq!(((a as usize + PAGE + 3) as *const u8).read(), 0x5a, "shown at a");
+            assert_eq!(((second as usize + 3) as *const u8).read(), 0x5a, "shown at b");
+        }
+        // The write from a buffer takes the same hold, in the write itself.
+        let data = vec![0x77u8; 2 * PAGE];
+        assert!(write_physical(&pages, PAGE, &data));
+        assert_eq!(will_write(&pages, PAGE, 2 * PAGE).len(), 2, "one run of addresses at each view");
+        for (at, n) in [(a, 3), (second, 2)] {
+            assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        }
+        assert!(will_write(&pages, 0, 3 * PAGE).is_empty(), "unmapped again");
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
