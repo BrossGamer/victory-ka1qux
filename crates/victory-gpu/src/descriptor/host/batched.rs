@@ -23,6 +23,11 @@
 //! 3. those slots are mirrored one after the other on this thread, as
 //!    [`HostHeap::mirror_as`] does for each, exactly as before.
 //!
+//! (With `VICTORY_MIRROR_FAST` the heaps that have changed pages are mirrored
+//! together, each by this, and the slots of a batch the short way:
+//! [`super::mirror_fast`]. The milliseconds of the line of this module are
+//! then those of all the heaps added, not the time of the frame's sync.)
+//!
 //! The slots mirrored, and what is made of each, are those of the pages'
 //! version. What differs is when a page is read: all of them before the
 //! first slot is mirrored, not each just before its own (a record the
@@ -266,10 +271,7 @@ impl HostHeap {
             }
         }
         let compared = Instant::now();
-        let makes = sync_makes();
-        for &(index, handle) in &due {
-            self.mirror_as(index, handle, false, makes);
-        }
+        self.mirror_due(&due, sync_makes());
         let us = |a: Instant, b: Instant| b.duration_since(a).as_micros() as u64;
         let jobs = pages.len().div_ceil(JOB_PAGES).min(JOBS_MOST);
         for (count, n) in COUNT.iter().zip([

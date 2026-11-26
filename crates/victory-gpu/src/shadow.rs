@@ -5312,7 +5312,33 @@ fn lookup(address: u64, len: u64, any: bool, cbv: bool) -> Option<Arc<Shadow>> {
     // A root constant buffer view's ask may be answered with a small window
     // of its own (`cbv`); such asks neither use nor fill the memory of
     // answers, so another kind of ask is never handed a window cut for one.
-    lookup_as(address, len, any, cbv, !cbv && lookup_cache())
+    lookup_as(address, len, any, cbv, !cbv && (lookup_cache() || ANSWERS_HERE.with(std::cell::Cell::get)))
+}
+
+thread_local! {
+    /// Set while an [`AnswersHere`] lives: this thread's asks use the memory
+    /// of answers whatever `VICTORY_SHADOW_CACHE` says.
+    static ANSWERS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, the asks of the thread that made it are answered from
+/// that thread's memory of answers ([`lookup_cache`]) as with
+/// `VICTORY_SHADOW_CACHE=1`, which is on for every thread or none: the
+/// mirroring of a frame's changed descriptor records asks some 60,000 times
+/// for the copies of the same few thousand buffers
+/// (`descriptor::host::mirror_fast`).
+pub(crate) struct AnswersHere(bool);
+
+impl AnswersHere {
+    pub(crate) fn begin() -> AnswersHere {
+        AnswersHere(ANSWERS_HERE.with(|on| on.replace(true)))
+    }
+}
+
+impl Drop for AnswersHere {
+    fn drop(&mut self) {
+        ANSWERS_HERE.with(|on| on.set(self.0));
+    }
 }
 
 /// [`lookup`], with the memory of answers ([`lookup_cache`]) or without.
