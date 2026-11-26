@@ -23,6 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
+#[cfg(windows)]
+pub mod descriptor_sites;
 pub mod prepare;
 pub mod resolve;
 #[cfg(windows)]
