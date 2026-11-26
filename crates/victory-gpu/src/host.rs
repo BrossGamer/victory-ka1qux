@@ -10019,6 +10019,7 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        crate::list::thin::line(frames);
         crate::lazy::line(frames);
         crate::awake::line(frames);
         fill_line(frames);

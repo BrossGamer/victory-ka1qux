@@ -61,7 +61,16 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        u64,
+        Option<std::sync::Arc<crate::resource::HostTexture>>,
+    ),
+    /// With `VICTORY_THIN=1`: a submission whose lists are being translated
+    /// by threads of ours ([`crate::list::thin`]); its parts, waits and host
+    /// lists are known when they are, and take its place in the line.
+    Thin(std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -162,10 +171,16 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     const COPY_SOURCE: u32 = 0x800;
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
+    // With lists written down (`VICTORY_THIN=1`) the lists of the frame are
+    // not translated yet: the state they leave the texture in is the one it
+    // is in when its turn in the line comes (read from the host texture
+    // then; the next frame's lists may be translated by then, which the
+    // title's use of the buffer it presents makes unlikely).
+    let (state, copy) = if crate::list::thin::on() { (u32::MAX, crate::resource::host_copy(resource)) } else { (state, None) };
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, copy)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -255,6 +270,22 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    // Lists whose calls were written down: their recordings stand in the
+    // queue's line, and become its parts when they are translated.
+    if crate::list::thin::on() {
+        let recordings = crate::list::thin::submitted(lists);
+        if recordings.is_empty() {
+            return;
+        }
+        lock(&queue(this).held).push(Held::Thin(recordings));
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
+        drop(waiting);
+        release_held(false);
+        return;
+    }
     let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
@@ -476,6 +507,15 @@ pub(crate) fn behind() -> bool {
         }
         on
     })
+}
+
+/// Lists in a queue's line may have been translated
+/// ([`crate::list::thin`]): the thread that runs the lines looks again.
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    if behind() {
+        wake();
+    }
 }
 
 /// Whether there is something for [`worker`] to look at.
@@ -799,10 +839,29 @@ fn release_held_now(all: bool) {
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
+                    // Lists not translated yet: the line stands there (the
+                    // thread that translates the last one moves it on).
+                    Some(Held::Thin(recordings)) if !all && !recordings.iter().all(|r| r.done()) => break,
                     Some(_) => {}
                 }
                 match held.remove(base) {
                     Held::Wait(..) | Held::Running => {}
+                    // Translated (forced: waited for): what the title's
+                    // submission is, as `submit_cut` makes it of lists that
+                    // were recorded in the call, in its place in the line.
+                    Held::Thin(recordings) => {
+                        recordings.iter().for_each(|r| r.wait());
+                        let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
+                        let mut place = base;
+                        for (waits, taken, order) in crate::list::detach_parts(&lists) {
+                            for wait in waits {
+                                held.insert(place, Held::Value(wait));
+                                place += 1;
+                            }
+                            held.insert(place, Held::Run(taken, order));
+                            place += 1;
+                        }
+                    }
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -910,7 +969,13 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, copy) => {
+                        // (Where its lists were not translated when the title
+                        // presented: the state they left it in.)
+                        let state = match &copy {
+                            Some(copy) if state == u32::MAX => copy.state.load(Ordering::Relaxed),
+                            _ => state,
+                        };
                         let show = || {
                             if let Some(host) = crate::host::host() {
                                 let _ = host.present(&texture, state, frame);
