@@ -24,6 +24,7 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod beside;
 mod quiet;
 mod under;
 pub(crate) use under::{on as under_fused, stats as under_stats};
@@ -3677,6 +3678,18 @@ impl Shadow {
     fn put_back(&self, at: usize, bytes: &[u8], runs: Option<&[(usize, usize)]>) {
         let n = bytes.len();
         let write = |runs: Option<&[(usize, usize)]>| {
+            // View memory, beside the guards (`VICTORY_COPY_BACK_BESIDE`):
+            // what could not be written so goes on the old way below.
+            let left;
+            let runs = if beside::mode() != 0 && self.guarded() {
+                left = self.write_beside(at, bytes, runs);
+                if left.is_empty() {
+                    return;
+                }
+                Some(&left[..])
+            } else {
+                runs
+            };
             if !self.write_quietly(at, bytes, runs) {
                 match runs {
                     Some(runs) => crate::host::write_mapped_runs(at, bytes.as_ptr(), runs),
