@@ -25,8 +25,9 @@
 //!
 //! What stays a copy: an ask whose pages are not consecutive in one
 //! section (scattered pages, holes), a root view with no length whose pages
-//! stop being consecutive before its window's end (its shader may read on),
-//! small private allocations, memory that is neither private nor a view,
+//! stop being consecutive before its window's end (its shader may read on;
+//! `VICTORY_UNSIZED_RUN=1` cuts the window to the run where the view has
+//! room ahead of it, [`unsized_run`]), small private allocations, memory that is neither private nor a view,
 //! asks that find the host's shared GPU memory nearly used, and anything
 //! shorter than [`least`]. [`Reason`] names each, the log counts them
 //! ([`tick`]), and a diagnostics build gives a census of the copies alive
@@ -138,6 +139,54 @@ fn least_for(kb: Option<u64>) -> u64 {
 fn small_most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
     *MOST.get_or_init(|| std::env::var("VICTORY_UNIFIED_SMALL_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024))
+}
+
+/// How far ahead of a root view with no length its run of pages must go
+/// for [`unsized_run`]: a window cut to the run is only given where the view
+/// has this much room (`VICTORY_UNSIZED_RUN_MIN_KB`, 1024).
+const RUNWAY_DEFAULT: u64 = 1 << 20;
+
+/// Whether a root view with no length may be given a window cut to its run
+/// of physical pages where the run ends before the end of its cell and the
+/// title's memory goes on (`VICTORY_UNSIZED_RUN=1`, off by default): the
+/// runway the view needs ahead of it, in bytes, or `None` when off.
+///
+/// A root view has no size: its shader reads from the address on and the
+/// host binds it a view of the copy from there to the end of the window, so
+/// a copy holds the whole cell (4 MiB each, 346 windows and 1.4 GB in a
+/// study of a normal run, all compared at every refresh). In place the
+/// window ends where the run does, and what a shader reads past the end
+/// reads zero (a bound view's out-of-range read; its stores are dropped).
+/// What the shader may read past the run cannot be known here: the view has
+/// no size, the translated shader no bound, and the runtime's views do not
+/// say where one of the title's allocations ends (a scattered allocation is
+/// several views at consecutive addresses and different pages, as two
+/// allocations next to each other are). So the rule is a bet, and it is kept
+/// to where it is the safer one: a view with a runway of
+/// `VICTORY_UNSIZED_RUN_MIN_KB` ahead of it (an object that began at the
+/// address and ends within a run longer than that is the common case; one
+/// that reaches across the end of a run, and the view near it, are not
+/// given a window), never a view with the host's root descriptors
+/// (`VICTORY_ROOT_SRV_DIRECT`: there a read past a copy reaches host memory
+/// that is not ours), and never a sized ask or a constant buffer view (a
+/// root constant buffer view reads 64 KiB at most and has its own windows).
+/// [`say`] counts the windows made this way and the title memory left past
+/// them; a diagnostics build's census says how many copies it would place.
+fn unsized_run() -> Option<u64> {
+    static RUN: OnceLock<Option<u64>> = OnceLock::new();
+    *RUN.get_or_init(|| {
+        if !std::env::var("VICTORY_UNSIZED_RUN").is_ok_and(|v| v.trim() == "1") {
+            return None;
+        }
+        if !crate::pipeline::host::bounded_root_srvs() {
+            tracing::warn!(
+                "VICTORY_UNSIZED_RUN=1 is not used with VICTORY_ROOT_SRV_DIRECT: root descriptors have no bound, and a read past a window in place reaches host memory"
+            );
+            return None;
+        }
+        let kb = std::env::var("VICTORY_UNSIZED_RUN_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        Some(kb.map_or(RUNWAY_DEFAULT, |kb| kb.saturating_mul(1024)))
+    })
 }
 
 /// The most window bytes in place at once (`VICTORY_UNIFIED_MB`, 8192).
@@ -259,6 +308,11 @@ pub(crate) struct Plan {
     /// It reaches where the title's memory ends (or its cell does), so a
     /// root view with no length may read to the end of it.
     pub(crate) reaches: bool,
+    /// Over physical pages, for a root view with no length
+    /// ([`unsized_run`]): the bytes of the title's memory past the window,
+    /// up to where the view would have read with a copy; 0 for any window
+    /// that reaches as far as a root view may read.
+    pub(crate) beyond: u64,
 }
 
 /// A window in place made, for `crate::shadow` to wrap.
@@ -284,12 +338,15 @@ pub(crate) fn plan(address: u64, need_end: u64, reach: bool) -> Result<Plan, Rea
 pub(crate) struct Rules {
     /// The shortest window in place, in bytes ([`least`]).
     pub(crate) least: u64,
+    /// The runway a root view with no length needs to be given a window cut
+    /// to its run ([`unsized_run`]); `None`: none is.
+    pub(crate) unsized_run: Option<u64>,
 }
 
 /// The rules the environment sets.
 fn rules() -> Rules {
     static RULES: OnceLock<Rules> = OnceLock::new();
-    *RULES.get_or_init(|| Rules { least: least() })
+    *RULES.get_or_init(|| Rules { least: least(), unsized_run: unsized_run() })
 }
 
 /// [`plan`] under `rules`.
@@ -308,8 +365,14 @@ pub(crate) fn plan_with(address: u64, need_end: u64, reach: bool, rules: Rules) 
         let mapped = inplace::mapped_end(address as usize, cell_hi as usize) as u64;
         let (lo, hi) = (run.start as u64, run.end as u64);
         let need = if reach { mapped.min(cell_end) } else { end };
+        let mut beyond = 0;
         if hi < need {
-            return Err(if reach { Reason::RootRunEnds } else { Reason::NotConsecutive });
+            match rules.unsized_run {
+                // A root view with no length, with room ahead of it in the
+                // run: the window is the run (see [`unsized_run`]).
+                Some(runway) if reach && hi.saturating_sub(address) >= runway => beyond = need - hi,
+                _ => return Err(if reach { Reason::RootRunEnds } else { Reason::NotConsecutive }),
+            }
         }
         if hi - lo < rules.least {
             return Err(Reason::Short);
@@ -322,6 +385,7 @@ pub(crate) fn plan_with(address: u64, need_end: u64, reach: bool, rules: Rules) 
             offset: run.offset,
             allocation: 0,
             reaches: hi >= mapped,
+            beyond,
         });
     }
     let (run_lo, run_hi, allocation) = committed_run(address)?;
@@ -337,7 +401,7 @@ pub(crate) fn plan_with(address: u64, need_end: u64, reach: bool, rules: Rules) 
     if hi - lo < rules.least {
         return Err(Reason::Short);
     }
-    Ok(Plan { start: lo, len: hi - lo, kind: Kind::Private, section: 0, offset: 0, allocation, reaches: true })
+    Ok(Plan { start: lo, len: hi - lo, kind: Kind::Private, section: 0, offset: 0, allocation, reaches: true, beyond: 0 })
 }
 
 /// The committed, read-write run of one private allocation around
@@ -462,6 +526,10 @@ static LET_GO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// of all windows made.
 static SMALL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static OPENED_US: AtomicU64 = AtomicU64::new(0);
+/// Since the start: windows made for root views with no length that end
+/// where their run of pages does ([`unsized_run`]), their bytes, and the
+/// bytes of the title's memory left past them.
+static CUT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static STAYED: AtomicU64 = AtomicU64::new(0);
 /// Asks left to a copy, by [`Reason`]: how often and the bytes of the cells
 /// they were for.
@@ -568,6 +636,11 @@ pub(crate) fn make(address: u64, need_end: u64, reach: bool) -> Option<Made> {
         SMALL[0].fetch_add(1, Ordering::Relaxed);
         SMALL[1].fetch_add(plan.len, Ordering::Relaxed);
     }
+    if plan.beyond != 0 {
+        CUT[0].fetch_add(1, Ordering::Relaxed);
+        CUT[1].fetch_add(plan.len, Ordering::Relaxed);
+        CUT[2].fetch_add(plan.beyond, Ordering::Relaxed);
+    }
     MADE[if physical { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
     MADE[if physical { 1 } else { 3 }].fetch_add(plan.len, Ordering::Relaxed);
     if !physical {
@@ -583,7 +656,7 @@ pub(crate) fn make(address: u64, need_end: u64, reach: bool) -> Option<Made> {
         placed,
         start: plan.start,
         len: plan.len,
-        bits: if physical { 1 } else { 2 } | if plan.reaches { 4 } else { 0 },
+        bits: if physical { 1 } else { 2 } | if plan.reaches { 4 } else { 0 } | if plan.beyond != 0 { 8 } else { 0 },
     })
 }
 
@@ -725,6 +798,23 @@ pub(crate) fn say() {
         left
     );
     say_costs(shared);
+    say_cut();
+}
+
+/// With `VICTORY_UNSIZED_RUN=1`: the windows given to root views with no
+/// length that end where their run of pages does.
+fn say_cut() {
+    let Some(runway) = unsized_run() else {
+        return;
+    };
+    tracing::info!(
+        "root views with no length given windows cut to their run of pages (VICTORY_UNSIZED_RUN=1, at least {} KiB of run ahead of the view):          {} made since the start ({} MB), {} MB of the title's memory left past them; asks left to copies because the run ends before the cell does: {}",
+        runway >> 10,
+        CUT[0].load(Ordering::Relaxed),
+        CUT[1].load(Ordering::Relaxed) >> 20,
+        CUT[2].load(Ordering::Relaxed) >> 20,
+        LEFT[Reason::RootRunEnds as usize][0].load(Ordering::Relaxed)
+    );
 }
 
 /// With `VICTORY_UNIFIED_LEAST_KB` below its default: what windows shorter
@@ -779,6 +869,10 @@ pub(crate) fn census() -> Vec<String> {
     // Windows left as shorter than the least that the least of 64 KiB would
     // place: how many, their bytes, the bytes in place.
     let mut shorter = [0u64; 3];
+    // Windows left because the run ends before the cell that the unsized
+    // rule would place: how many, their bytes, the bytes in place, the
+    // title's bytes past them.
+    let mut cut = [0u64; 4];
     for (start, len, lowest, highest, unsized_ask) in windows {
         // Asking the host about private memory takes a millisecond or so
         // for a big arena: a look is at most half a second long.
@@ -800,11 +894,20 @@ pub(crate) fn census() -> Vec<String> {
                 e[0] += 1;
                 e[1] += len;
                 if reason == Reason::Short
-                    && let Ok(plan) = plan_with(address, end, unsized_ask, Rules { least: GRAIN })
+                    && let Ok(plan) = plan_with(address, end, unsized_ask, Rules { least: GRAIN, unsized_run: None })
                 {
                     shorter[0] += 1;
                     shorter[1] += len;
                     shorter[2] += plan.len;
+                }
+                if reason == Reason::RootRunEnds
+                    && let Ok(plan) =
+                        plan_with(address, end, unsized_ask, Rules { least: rules().least, unsized_run: Some(RUNWAY_DEFAULT) })
+                {
+                    cut[0] += 1;
+                    cut[1] += len;
+                    cut[2] += plan.len;
+                    cut[3] += plan.beyond;
                 }
             }
         }
@@ -822,6 +925,13 @@ pub(crate) fn census() -> Vec<String> {
     for (reason, [n, bytes, _]) in tally {
         lines.push(format!("census,   left to a copy: {reason}: {n} windows, {} MB", mb(bytes)));
     }
+    lines.push(format!(
+        "census,   VICTORY_UNSIZED_RUN=1 would place {} of those left because the run of pages ends before the cell ({} MB of windows, {} MB in place, {} MB of title memory left past them)",
+        cut[0],
+        mb(cut[1]),
+        mb(cut[2]),
+        mb(cut[3])
+    ));
     lines.push(format!(
         "census,   VICTORY_UNIFIED_LEAST_KB=64 would place {} more ({} MB of windows, {} MB in place) of those left as shorter than the least",
         shorter[0],
@@ -888,6 +998,44 @@ mod tests {
         assert!(plan(ask, ask + 1, true).is_err());
     }
 
+    /// A root view with no length is given its run where the rule is on
+    /// and the view has room ahead of it; never a view near the run's end,
+    /// a sized ask, or a short run.
+    #[test]
+    fn a_root_view_may_be_given_its_run_with_the_unsized_rule() {
+        let base = 0x7_c800_0000usize;
+        let mib = 1usize << 20;
+        let section = 4444;
+        // 3.5 MiB of one section, then two pages of another: the run ends
+        // before the cell does and the title's memory goes on.
+        inplace::title_memory_view(base, 3 * mib, section, 0);
+        inplace::title_memory_view(base + 3 * mib, mib / 2, section, 3 * mib as u64);
+        inplace::title_memory_view(base + 3 * mib + mib / 2, 2 * K64, section + 1, 0);
+        let off = Rules { least: LEAST_DEFAULT, unsized_run: None };
+        let on = Rules { least: LEAST_DEFAULT, unsized_run: Some(RUNWAY_DEFAULT) };
+        let ask = base as u64 + 0x12_3456;
+        assert_eq!(plan_with(ask, ask + 1, true, off), Err(Reason::RootRunEnds));
+        let p = plan_with(ask, ask + 1, true, on).expect("a run with room ahead of the view");
+        assert_eq!((p.start, p.len, p.kind), (base as u64, (3 * mib + mib / 2) as u64, Kind::Physical));
+        assert_eq!(p.beyond, (2 * K64) as u64, "the two pages of the other section are left past it");
+        assert!(!p.reaches);
+        // Too near the run's end: its object may go on past it.
+        let near = base as u64 + (3 * mib + mib / 2) as u64 - 0x1_0000;
+        assert_eq!(plan_with(near, near + 1, true, on), Err(Reason::RootRunEnds));
+        // A sized ask that runs past the run's end stays a copy.
+        assert_eq!(plan_with(ask, base as u64 + (3 * mib + mib / 2) as u64 + 8, false, on), Err(Reason::NotConsecutive));
+        // The same view with less room needed.
+        let less = Rules { unsized_run: Some(K64 as u64), ..on };
+        assert!(plan_with(near, near + 1, true, less).is_ok());
+        // A run shorter than the least stays a copy whatever the rule.
+        assert_eq!(plan_with(ask, ask + 1, true, Rules { least: 4 * mib as u64, ..on }), Err(Reason::Short));
+        // The run where the title's memory ends is reached as before.
+        inplace::views_gone(base + 3 * mib + mib / 2, 2 * K64);
+        let p = plan_with(ask, ask + 1, true, on).expect("the title's memory ends with the run");
+        assert!(p.reaches && p.beyond == 0);
+        inplace::views_gone(base, 4 * mib);
+    }
+
     /// The least window in place is a knob: a run of two pages is a copy
     /// by default and a window in place with the least at the grain; the
     /// setting is kept between the grain and a cell.
@@ -898,12 +1046,12 @@ mod tests {
         inplace::title_memory_view(base, 2 * K64, section, 0);
         inplace::title_memory_view(base + 2 * K64, K64, section + 1, 0);
         let ask = base as u64 + 0x1234;
-        let by_default = Rules { least: LEAST_DEFAULT };
+        let by_default = Rules { least: LEAST_DEFAULT, unsized_run: None };
         assert_eq!(plan_with(ask, ask + 0x100, false, by_default), Err(Reason::Short));
-        let p = plan_with(ask, ask + 0x100, false, Rules { least: GRAIN }).expect("128 KiB is a window with the least at the grain");
+        let p = plan_with(ask, ask + 0x100, false, Rules { least: GRAIN, unsized_run: None }).expect("128 KiB is a window with the least at the grain");
         assert_eq!((p.start, p.len, p.kind), (base as u64, 2 * K64 as u64, Kind::Physical));
         // A single page of 64 KiB is a window with the least at the grain.
-        assert!(plan_with(base as u64 + 2 * K64 as u64 + 8, base as u64 + 2 * K64 as u64 + 16, false, Rules { least: GRAIN }).is_ok());
+        assert!(plan_with(base as u64 + 2 * K64 as u64 + 8, base as u64 + 2 * K64 as u64 + 16, false, Rules { least: GRAIN, unsized_run: None }).is_ok());
         assert_eq!(least_for(None), LEAST_DEFAULT);
         assert_eq!(least_for(Some(64)), 64 << 10);
         assert_eq!(least_for(Some(4)), GRAIN, "below the grain: the grain");

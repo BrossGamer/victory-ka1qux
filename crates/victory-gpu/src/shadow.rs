@@ -124,7 +124,9 @@ pub(crate) struct Shadow {
     own_view: Option<crate::inplace::OwnView>,
     /// Made in place by `crate::unified` (bit 0: over physical pages, bit
     /// 1: over private memory, bit 2: it reaches the end of its title
-    /// memory, so a root view with no length may be given it).
+    /// memory, so a root view with no length may be given it, bit 3: it is
+    /// cut to its run of pages and a root view with no length is given it
+    /// all the same, `VICTORY_UNSIZED_RUN=1`).
     unified: u8,
 }
 
@@ -5501,7 +5503,9 @@ fn in_place_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, need_e
         .rev()
         .take(32)
         .find(|((start, len), s)| {
-            s.place.is_some() && start + len >= need_end && (!reach || s.unified & 4 != 0 || start + len >= cell_end)
+            // Bit 4: it reaches where the title's memory ends; bit 8: cut to
+            // its run for root views with no length (`VICTORY_UNSIZED_RUN`).
+            s.place.is_some() && start + len >= need_end && (!reach || s.unified & 12 != 0 || start + len >= cell_end)
         })
         .map(|(_, s)| s)
 }
