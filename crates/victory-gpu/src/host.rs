@@ -8841,6 +8841,7 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -8853,6 +8854,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    crate::port::filled(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -8862,6 +8864,9 @@ impl HostList {
                     let run = fill_run(&steps[next - 1..]);
                     next += run.len() - 1;
                     let bytes = run.iter().map(|f| f.len).sum::<usize>();
+                    for f in &run {
+                        crate::port::filled(f.src, f.len);
+                    }
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, run.len() as u64);
@@ -10014,6 +10019,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::port::log(frames);
         late_line(frames);
         bake_line(frames);
         card_clock_line(frames, ms);

@@ -37,6 +37,10 @@ use crate::{HleExport, HleModule, hle_export};
 /// always built so that its tests run everywhere.
 mod census;
 
+/// The title's 32-bit graphics heap as one stretch of one section, for the
+/// GPU side to open as a host heap (`VICTORY_PORT_CONSTANTS=1`).
+mod port;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -170,6 +174,11 @@ pub extern "system" fn XMemVirtualAlloc(
     if base.is_null() && !at.is_null() {
         // New memory: nothing kept for these addresses is of it.
         victory_gpu::title_memory_reserved(at as usize, size);
+        // Renderer port 1: the title's 32-bit graphics heap is known by
+        // what it asks with, not by where it lies.
+        if victory_gpu::port_constants_on() {
+            port::reserved(at as usize, size, kind, flags);
+        }
     }
     if base.is_null() {
         tracing::debug!(
@@ -876,7 +885,12 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len).then(|| {
+            // A slice written through a view of ours is not fresh any more
+            // (`port::arrange`), mapped by the title or not.
+            slice.note_committed(n);
+            view
+        })
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -1121,6 +1135,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if !pages.is_null() && n > 0 && victory_gpu::port_constants_on() {
+        // Renderer port 1: pages mapped into the title's 32-bit graphics
+        // heap get the slices at their address's place in it.
+        // SAFETY: the title passes `n` page numbers.
+        port::arrange(address as usize, unsafe { std::slice::from_raw_parts(pages, n) });
+    }
     if !pages.is_null() && n > 0 && (pages_ordered() || cfg!(feature = "diagnostics")) {
         // SAFETY: the title passes `n` page numbers.
         let list = unsafe { std::slice::from_raw_parts(pages, n) };
@@ -1322,9 +1342,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
             return false;
         }
-        if lean {
-            slice.note_committed(pages);
-        }
+        // Noted whether or not `lean_remaps` reads it: renderer port 1
+        // (`port::arrange`) exchanges only slices no view has committed.
+        slice.note_committed(pages);
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);

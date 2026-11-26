@@ -5254,6 +5254,12 @@ fn lookup_as(address: u64, len: u64, any: bool, cbv: bool, cache: bool) -> Optio
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && size >= card_limits().0;
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5545,7 +5551,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
     }
     // In place, made before the lock is taken (the host calls take a
     // while); dropped if another thread made a window meanwhile.
-    let made = if unified { crate::unified::make(address, need_end, need_reach) } else { None };
+    // (Not where renderer port 1 has a region open: a window there is a
+    // buffer placed in the region's heap, below.)
+    let made = if unified && !crate::port::holds(address, need_end) { crate::unified::make(address, need_end, need_reach) } else { None };
     // A window in a GPU upload heap that an ask that may write takes out of
     // the table: dropped after the lock (what holds it keeps it).
     let mut swapped: Option<Arc<Shadow>> = None;
@@ -5564,6 +5572,17 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
         // stays for the lists and slots that have it (they only read it).
         crate::window_upload::swapped_for_a_plain_window();
         swapped = map.remove(&(start, len));
+    }
+    // Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`): in the title's 32-bit
+    // graphics heap, a buffer placed in the region's heap, whatever the
+    // window's cost to make, so also the small window of a constant buffer
+    // view (a window `crate::unified` made meanwhile is let go by the
+    // drop).
+    if let Some(placed) = crate::port::place_for(start, len, true) {
+        let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
     }
     if let Some(made) = made {
         use std::collections::btree_map::Entry;

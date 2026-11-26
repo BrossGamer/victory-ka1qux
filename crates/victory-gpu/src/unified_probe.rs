@@ -1060,3 +1060,115 @@ fn unified_windows_abandon_probe() {
         TerminateProcess(GetCurrentProcess(), 0);
     }
 }
+
+/// A probe, run by hand: exactly the path of `VICTORY_PORT_CONSTANTS=1`
+/// (`crate::port::place_in`: one view of ours on the whole stretch of the
+/// title's views of a section, ONE heap opened on it with
+/// `OpenExistingHeapFromAddress1`, several buffers placed in that heap),
+/// released in the order the code releases it (the buffers, the region's
+/// heap, then its view), then the title's views and the section; three
+/// rounds of `VICTORY_PROBE_MB` each. Prints the system's committed bytes
+/// at each step, and whether the GPU and the title's views see each
+/// other's bytes through two buffers of one heap. Run it once on the card
+/// before the first run of the game with the switch on.
+#[test]
+#[ignore = "a probe of the host device, run by hand"]
+fn unified_port_probe() {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile2};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 64 << 10;
+    let mib = |v: i64| v / (1 << 20);
+    let _one = crate::address_space();
+    // SAFETY: plain device, memory and heap calls on memory made here.
+    unsafe {
+        let Some(mut gpu) = Gpu::new() else {
+            println!("no host device");
+            return;
+        };
+        if gpu.device.cast::<ID3D12Device13>().is_err() {
+            println!("no ID3D12Device13 (OpenExistingHeapFromAddress1)");
+            return;
+        }
+        let size = size();
+        let start_all = committed() as i64;
+        for round in 1..=3u32 {
+            let before = committed() as i64;
+            let (section, base) = title_views(size);
+            for k in 0..size / PAGE {
+                crate::inplace::title_memory_view(base as usize + k * PAGE, PAGE, section as usize, (k * PAGE) as u64);
+            }
+            let made = committed() as i64;
+            let big = match crate::port::place_in(&gpu.device, base as u64 + 0x1230, (size - 4 * PAGE) as u64, &|_| true) {
+                Ok(placed) => placed,
+                Err(e) => {
+                    println!("round {round}: not placed: {e:?}");
+                    return;
+                }
+            };
+            let small = crate::port::place_in(&gpu.device, base as u64 + (size - PAGE) as u64 + 64, 4096, &|_| true).ok();
+            let open = committed() as i64;
+            // The GPU reads what the title wrote at its own views (across a
+            // view boundary), through the big buffer.
+            let at = 3 * PAGE as u64 - 2048;
+            let pattern: Vec<u8> = (0..4096u32).map(|i| (i * 7 + 3 + round) as u8).collect();
+            std::ptr::copy_nonoverlapping(pattern.as_ptr(), (base as u64 + 0x1230 + at) as *mut u8, 4096);
+            let back = gpu.committed(D3D12_HEAP_TYPE_READBACK, 4096).unwrap();
+            let ran = gpu.run(|l| l.CopyBufferRegion(&back, 0, &big.buffer, big.bias + at, 4096));
+            let mut p = std::ptr::null_mut();
+            let read = ran
+                && back.Map(0, None, Some(&mut p)).is_ok()
+                && std::slice::from_raw_parts(p.cast::<u8>(), 4096) == pattern.as_slice();
+            // The GPU writes through the small buffer, which is in the same
+            // heap: the title's view shows it.
+            let up = gpu.committed(D3D12_HEAP_TYPE_UPLOAD, 4096).unwrap();
+            let mut p = std::ptr::null_mut();
+            up.Map(0, None, Some(&mut p)).unwrap();
+            let other: Vec<u8> = (0..4096u32).map(|i| (i * 13 + 5) as u8).collect();
+            std::ptr::copy_nonoverlapping(other.as_ptr(), p.cast::<u8>(), 4096);
+            let (wrote, ran2) = match &small {
+                Some(small) => {
+                    let ran2 = gpu.run(|l| l.CopyBufferRegion(&small.buffer, small.bias, &up, 0, 4096));
+                    let seen = std::slice::from_raw_parts((base as u64 + (size - PAGE) as u64 + 64) as *const u8, 4096) == other.as_slice();
+                    (seen, ran2)
+                }
+                None => (false, false),
+            };
+            drop(back);
+            drop(up);
+            // As the copies holding them drop them: the buffers, then the
+            // region (its heap, and its view of ours once the host lets go).
+            drop((big, small));
+            crate::port::forget(base as usize, size);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            crate::inplace::retry_views();
+            let released = committed() as i64;
+            let ours = crate::inplace::own_views_mapped();
+            let process = GetCurrentProcess();
+            for k in 0..size / PAGE {
+                UnmapViewOfFile2(process, MEMORY_MAPPED_VIEW_ADDRESS { Value: base.add(k * PAGE).cast() }, 0);
+            }
+            crate::inplace::views_gone(base as usize, size);
+            CloseHandle(section);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let freed = committed() as i64;
+            println!(
+                "port round {round}: GPU reads the title's bytes {read} (ran {ran}); the title sees the GPU's through the second \
+                 buffer {wrote} (ran {ran2}); +{} MiB when the title's views were made; {:+} MiB with the region open and two \
+                 buffers in it; {:+} MiB after both were released (our views still mapped: {ours}); left after the title's \
+                 views and the section went: {:+} MiB",
+                mib(made - before),
+                mib(open - made),
+                mib(released - made),
+                mib(freed - before)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        crate::inplace::retry_views();
+        println!(
+            "port probe: left committed after all rounds: {:+} MiB; our views still mapped: {}",
+            mib(committed() as i64 - start_all),
+            crate::inplace::own_views_mapped()
+        );
+    }
+}
