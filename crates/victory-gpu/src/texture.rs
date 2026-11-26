@@ -1061,6 +1061,13 @@ impl Staging {
     /// `victory_formats::texture::Layout`.) A texture this cannot tell
     /// the levels of holds them all.
     fn held_levels(&self, [first, limit]: [u64; 2]) -> u32 {
+        // The staging buffer has no part for the levels below its own first
+        // (a view of the title's starts there: `staging`), so nothing writes
+        // them, and tiles given to a level hold what their last owner left
+        // until something does. Whatever the views in a span of placed views
+        // say (a slot a draw reads through a table has none), such a level
+        // is not held.
+        let first = first.max(u64::from(self.first));
         let mips = &self.layout.mips;
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
@@ -2021,6 +2028,36 @@ mod title_memory_tests {
         }
         // SAFETY: freeing our private reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// The levels below the first the staging buffer holds are never held,
+    /// whatever else says (their memory may be mapped: the next texture's,
+    /// for one), as those it holds are when their memory is.
+    #[test]
+    fn levels_below_the_staging_buffers_first_are_not_held() {
+        use windows_sys::Win32::System::Memory::*;
+        // 1024x1024 BC7, 11 levels, all of its memory mapped.
+        let rdesc = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
+        let total = crate::resource::placed_bytes(&rdesc).unwrap() as usize;
+        // SAFETY: a private allocation of our own, released at the end.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!base.is_null());
+        let every = (1u32 << 11) - 1;
+        let staged = crate::resource::texture_at(base as u64, &rdesc).and_then(|resource| {
+            let host_texture = crate::resource::host_resource(resource)?;
+            Some((resource, super::staging(resource, host_texture, 3)?))
+        });
+        // `None`: no GPU to make the host texture on.
+        if let Some((resource, staging)) = staged {
+            assert_eq!(staging.first, 3);
+            assert_eq!(staging.held_levels([0, u64::MAX]), every & !0b111);
+            // A view that says more: the levels it names.
+            assert_eq!(staging.held_levels([5, u64::MAX]), every & !0b11111);
+            drop(staging);
+            super::unstage(resource);
+        }
+        // SAFETY: the allocation above, released once.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
     }
 
     #[test]
