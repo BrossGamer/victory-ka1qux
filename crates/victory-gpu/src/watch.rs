@@ -612,6 +612,20 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Per block (its number folded onto the table), a count bumped under the
+/// guards' lock whenever the block stops being guarded: bytes read of a
+/// guarded block without the lock are still its bytes if, back under the
+/// lock, the block is guarded and its count did not move (blocks sharing a
+/// count only make the check fail more often). The fault handler reads the
+/// bytes of an armed block this way ([`keep_before_unlocked`]): the lock is
+/// not held across a 64 KiB read. After upstream VIctory #3035.
+static OPENED: [std::sync::atomic::AtomicU32; OPENED_COUNTS] = [const { std::sync::atomic::AtomicU32::new(0) }; OPENED_COUNTS];
+const OPENED_COUNTS: usize = 1 << 12;
+
+fn opened(block: usize) -> &'static std::sync::atomic::AtomicU32 {
+    &OPENED[block % OPENED_COUNTS]
+}
+
 /// Whether the block holding `start` is view memory the guards already
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
@@ -1603,6 +1617,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize, before: bool) -> Vec<usiz
     let blocks: Vec<usize> = g.protected.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        opened(block).fetch_add(1, Ordering::Relaxed);
         g.clean.remove(block);
         g.exposed.remove(&block);
     }
@@ -2151,6 +2166,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for &block in &blocks {
         g.protected.remove(&block);
+        opened(block).fetch_add(1, Ordering::Relaxed);
         g.clean.remove(block);
     }
     make_writable_runs(&blocks);
@@ -2186,9 +2202,29 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 
 /// Handles a write access violation at `at` if the block belongs to our guards
 /// or became writable concurrently.
+///
+/// Every title thread's write to a guarded block comes through here and
+/// takes the guards' lock: the frame line says how long that took
+/// (`faults:` in `crate::framelog`).
 pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
+    use crate::framelog::{T, add};
+    let entered = std::time::Instant::now();
+    let mut waited = std::time::Duration::ZERO;
     let mut g = guards();
-    if open_as(&mut g, at, at + 1, true, Some(instruction)) {
+    waited += entered.elapsed();
+    if save_unlocked() {
+        g = keep_before_unlocked(g, at / BLOCK, &mut waited);
+    }
+    let handled = write_fault_locked(&mut g, at, instruction);
+    drop(g);
+    add(T::GuardFaultUs, entered.elapsed().as_micros() as u64);
+    add(T::GuardWaitUs, waited.as_micros() as u64);
+    handled
+}
+
+/// [`handle_write_fault`] with the guards' lock held.
+fn write_fault_locked(g: &mut Guards, at: usize, instruction: usize) -> bool {
+    if open_as(g, at, at + 1, true, Some(instruction)) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
         crate::framelog::add(crate::framelog::T::GuardFaults, 1);
@@ -2206,7 +2242,7 @@ pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
         if make_writable_span(block, block + 1) {
             g.clean.remove(block);
             changed(block, block + 1);
-            touched(&mut g, block, false);
+            touched(g, block, false);
             static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
                 tracing::warn!(at = format_args!("{at:#x}"), "a read-only view block no guard knew of was opened on a write to it");
@@ -2215,6 +2251,74 @@ pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
         }
     }
     false
+}
+
+/// Whether the fault handler reads the bytes an armed block keeps with the
+/// guards' lock released ([`keep_before_unlocked`]);
+/// `VICTORY_GUARD_SAVE_UNLOCKED=0` reads them under it, as before.
+fn save_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_SAVE_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test does on this thread once the bytes are read and the
+    /// lock is still released ([`keep_before_unlocked`]).
+    static WHILE_UNLOCKED: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
+}
+
+/// The first write to an armed block that stays guarded saves its bytes
+/// from before ([`touched`]), and that 64 KiB read was made under the
+/// guards' lock: every other title thread's fault, every asking and every
+/// kernel write queued behind it. Here the bytes are read with the lock
+/// released, the lock taken again, and they are kept only if the block
+/// stayed guarded meanwhile, nothing opened it ([`OPENED`]), and it is still
+/// armed and untouched: a guarded block's bytes can change only once it is
+/// opened, and opening is under the lock. Otherwise nothing is kept and the
+/// bytes are read under the lock by [`touched`] as before. The bytes go only
+/// to the faulting block's own save, never to another view's. No protection
+/// call leaves the lock. `waited` adds the time spent waiting to take it
+/// again. After upstream VIctory #3035.
+fn keep_before_unlocked(
+    mut g: std::sync::MutexGuard<'static, Guards>,
+    block: usize,
+    waited: &mut std::time::Duration,
+) -> std::sync::MutexGuard<'static, Guards> {
+    use crate::framelog::{T, add};
+    use std::sync::atomic::Ordering::Relaxed;
+    if !matches!(g.armed.get(&block), Some(Armed::Untouched)) || !g.protected.contains(&block) {
+        return g;
+    }
+    // Room made before the submission: the handler allocates nothing.
+    let Some(mut bytes) = g.spare.pop() else {
+        return g;
+    };
+    let seen = opened(block).load(Relaxed);
+    drop(g);
+    // Through the kernel: this runs in the fault handler.
+    let read = crate::host::read_into_kernel((block * BLOCK) as *const u8, &mut bytes);
+    #[cfg(test)]
+    if let Some(change) = WHILE_UNLOCKED.take() {
+        change();
+    }
+    let retaking = std::time::Instant::now();
+    let mut g = guards();
+    *waited += retaking.elapsed();
+    if read
+        && g.protected.contains(&block)
+        && opened(block).load(Relaxed) == seen
+        && matches!(g.armed.get(&block), Some(Armed::Untouched))
+    {
+        g.armed.insert(block, Armed::Saved(bytes));
+        add(T::GuardSaves, 1);
+    } else {
+        if g.spare.len() < SPARE {
+            g.spare.push(bytes);
+        }
+        add(T::GuardSavesAgain, 1);
+    }
+    g
 }
 
 /// Whether a write fault in a read-only view block that no guard knows of
@@ -3433,5 +3537,262 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+}
+
+/// The fault handler's reads of armed blocks' bytes with the lock released
+/// (upstream VIctory #3035; its two concurrency tests, over our guards).
+#[cfg(test)]
+mod unlocked_save_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
+        UnmapViewOfFile,
+    };
+
+    /// A pagefile section of `blocks` blocks, mapped read-write once: view
+    /// memory the guards take, written from several threads.
+    struct Pool {
+        section: HANDLE,
+        at: usize,
+        blocks: usize,
+    }
+
+    impl Pool {
+        fn new(blocks: usize) -> Pool {
+            // SAFETY: a fresh pagefile section, mapped read-write.
+            let (section, at) = unsafe {
+                let section = CreateFileMappingW(
+                    -1isize as _,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    (blocks * BLOCK) as u32,
+                    std::ptr::null(),
+                );
+                assert!(!section.is_null());
+                (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, blocks * BLOCK).Value as usize)
+            };
+            assert_ne!(at, 0);
+            Pool { section, at, blocks }
+        }
+
+        fn block(&self, i: usize) -> usize {
+            self.at + i * BLOCK
+        }
+
+        fn end(&self) -> usize {
+            self.block(self.blocks)
+        }
+    }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            title_memory_remapped(self.at, self.blocks * BLOCK);
+            // SAFETY: our view and section.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.at as *mut _ });
+                CloseHandle(self.section);
+            }
+        }
+    }
+
+    /// Sets its flag when dropped, also while a failed assertion unwinds:
+    /// writer threads looping until the flag stop, and the test fails
+    /// instead of keeping `thread::scope` waiting for them.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Relaxed);
+        }
+    }
+
+    /// A writer: dwords at pseudo-random places of the pool until `stop`,
+    /// `spin` of work between two; a guarded block faults into the handler,
+    /// which opens it.
+    fn write_noise(at: usize, blocks: usize, who: u32, spin: std::time::Duration, stop: &AtomicBool) {
+        let mut x = 0x2545_f491_u32.wrapping_mul(who + 1);
+        while !stop.load(Relaxed) {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let to = at + (x as usize % blocks) * BLOCK + (x as usize >> 8 & 0xFFFC);
+            // SAFETY: a dword of the pool's view.
+            unsafe { (to as *mut u32).write_volatile(x | 1) };
+            let until = std::time::Instant::now() + spin;
+            while std::time::Instant::now() < until {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// The block's bytes now (read through the kernel: writers are at work).
+    fn bytes_of(at: usize) -> Vec<u8> {
+        let mut bytes = vec![0u8; BLOCK];
+        assert!(crate::host::read_into_kernel(at as *const u8, &mut bytes));
+        bytes
+    }
+
+    /// The bytes an armed block keeps are read with the lock released, and
+    /// kept only if the block stayed guarded meanwhile: not when something
+    /// opened it, not even when it was guarded again and armed again before
+    /// the lock was taken (a stale read would then pass for the bytes from
+    /// before the next write).
+    #[test]
+    fn bytes_read_without_the_lock_are_kept_only_if_the_block_stayed_guarded() {
+        // Another test's `disarm` may take the marks away between two steps:
+        // that attempt is made again.
+        'attempt: for _ in 0..50 {
+            let pool = Pool::new(2);
+            let (one, two) = (pool.block(0), pool.block(1));
+            // SAFETY: bytes of the pool's view.
+            unsafe {
+                ((one + 7) as *mut u8).write_volatile(0x41);
+                ((two + 7) as *mut u8).write_volatile(0x42);
+            }
+            assert!(guard(pool.at, pool.end()).is_some());
+            assert!(arm(one, one + BLOCK) && arm(two, two + BLOCK));
+            // Nothing happens meanwhile: kept.
+            let mut waited = std::time::Duration::ZERO;
+            let g = keep_before_unlocked(guards(), one / BLOCK, &mut waited);
+            match g.armed.get(&(one / BLOCK)) {
+                Some(Armed::Saved(bytes)) => assert_eq!(bytes[7], 0x41, "the byte from before"),
+                None => continue 'attempt,
+                _ => panic!("the bytes read without the lock were not kept"),
+            }
+            drop(g);
+            // The title writes the other block, a copy takes it and guards
+            // it again, and it is armed again, all while the read is under way.
+            WHILE_UNLOCKED.set(Some(Box::new(move || {
+                // SAFETY: the pool's view; the handler opens the block.
+                unsafe { ((two + 7) as *mut u8).write_volatile(0x99) };
+                armed_take(two);
+                assert!(guard(two, two + BLOCK).is_some_and(|written| !written.is_empty()));
+                assert!(arm(two, two + BLOCK));
+            })));
+            let g = keep_before_unlocked(guards(), two / BLOCK, &mut waited);
+            let state = g.armed.get(&(two / BLOCK)).map(|a| matches!(a, Armed::Untouched));
+            drop(g);
+            match state {
+                Some(untouched) => assert!(untouched, "the read of the bytes before the write was kept"),
+                None => continue 'attempt,
+            }
+            // The next write that faults keeps the bytes as they are now.
+            // SAFETY: the pool's view; the handler opens the block.
+            unsafe { ((two + 7) as *mut u8).write_volatile(0x77) };
+            match armed_take(two) {
+                Some(Armed::Saved(bytes)) => assert_eq!(bytes[7], 0x99, "the byte from before the write"),
+                None => continue 'attempt,
+                _ => panic!("the second write kept nothing"),
+            }
+            armed_take(one);
+            return;
+        }
+        panic!("the armed marks were taken away in all 50 attempts");
+    }
+
+    /// Writers on several threads and a taker copying what it takes: at the
+    /// end, every block the taker's copy disagrees with title memory on is
+    /// no longer clean (no write lost between a take's guard and its copy,
+    /// with saves of armed blocks going on), and no write faulted past the
+    /// handler (the process lives).
+    #[test]
+    fn concurrent_writes_and_takes_lose_no_write() {
+        const BLOCKS: usize = 16;
+        let pool = Pool::new(BLOCKS);
+        let p = pool.at;
+        let mut copy = vec![0u8; BLOCKS * BLOCK];
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let _stop = StopOnDrop(&stop);
+            for who in 0..12 {
+                let stop = &stop;
+                s.spawn(move || write_noise(p, BLOCKS, who, std::time::Duration::ZERO, stop));
+            }
+            // Enough rounds to catch a lost write or a stray fault in
+            // release; fewer in debug.
+            for round in 0..if cfg!(debug_assertions) { 200 } else { 3000 } {
+                for page in guard(p, p + BLOCKS * BLOCK).expect("view memory") {
+                    let at = page * PAGE;
+                    copy[at - p..at - p + BLOCK].copy_from_slice(&bytes_of(at));
+                }
+                for i in 0..BLOCKS {
+                    if (round + i) % 3 == 0 {
+                        arm(pool.block(i), pool.block(i + 1));
+                    }
+                    if round % 4 == 0 {
+                        armed_take(pool.block(i));
+                    }
+                }
+            }
+        });
+        for i in 0..BLOCKS {
+            let at = pool.block(i);
+            let held = &copy[at - p..at - p + BLOCK];
+            assert!(
+                bytes_of(at) == held || !clean(at / BLOCK),
+                "block {i} differs from its copy and is still clean"
+            );
+            armed_take(at);
+        }
+    }
+
+    /// Armed blocks and writers faulting on them on several threads:
+    /// whatever the guards saved of a block is the block as it was taken
+    /// (the copy's bytes then), never bytes a write put there after.
+    #[test]
+    fn saved_bytes_are_the_block_as_taken_under_concurrent_faults() {
+        const BLOCKS: usize = 16;
+        let pool = Pool::new(BLOCKS);
+        let p = pool.at;
+        let mut copy = vec![0u8; BLOCKS * BLOCK];
+        let stop = AtomicBool::new(false);
+        let (mut armed_blocks, mut saved) = (0usize, 0usize);
+        std::thread::scope(|s| {
+            let _stop = StopOnDrop(&stop);
+            for who in 0..12 {
+                let stop = &stop;
+                // Work between writes, as a title does: with none every block
+                // is written before it can be armed.
+                s.spawn(move || write_noise(p, BLOCKS, who, std::time::Duration::from_micros(40), stop));
+            }
+            for _ in 0..if cfg!(debug_assertions) { 200 } else { 2000 } {
+                // The copy takes what was written (guarding it again first),
+                // block by block, and arms each block it finds still clean.
+                let mut armed = Vec::new();
+                for i in 0..BLOCKS {
+                    let at = pool.block(i);
+                    for page in guard(at, at + BLOCK).expect("view memory") {
+                        assert_eq!(page * PAGE, at);
+                        copy[at - p..at - p + BLOCK].copy_from_slice(&bytes_of(at));
+                    }
+                    if arm(at, at + BLOCK) {
+                        armed.push(at);
+                    }
+                }
+                // A write of ours too: a block saved each round, however few
+                // of the writers' faults land between arming and looking.
+                for &at in &armed {
+                    // SAFETY: a dword of the pool's view; a guarded block faults.
+                    unsafe { ((at + 64) as *mut u32).write_volatile(1) };
+                }
+                std::thread::yield_now();
+                for at in armed {
+                    armed_blocks += 1;
+                    if let Some(Armed::Saved(bytes)) = armed_take(at) {
+                        saved += 1;
+                        assert!(
+                            *bytes == copy[at - p..at - p + BLOCK],
+                            "block {} saved other bytes than taken",
+                            (at - p) / BLOCK
+                        );
+                    }
+                }
+            }
+        });
+        assert!(saved > 0, "no block saved of {armed_blocks} armed: nothing was checked");
     }
 }
