@@ -2345,6 +2345,11 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes, whether through marked views):
+    /// with `VICTORY_DECLARE_ONCE=1` declaring one again changes nothing
+    /// and is not recorded again ([`declare_once`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize, bool)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// The last card-written source copied into each aliased host texture
@@ -2390,6 +2395,21 @@ impl Deferred {
         self.uploads.push(buffer);
     }
 
+    /// The steps recorded last write title memory: what was brought up to
+    /// date before them is not any more, and what was declared written
+    /// before them is to be declared again.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+    }
+
+    /// Whether the declaration of `key` (host copy, address, bytes, marked)
+    /// is to be recorded: always, unless `once` and it was declared since
+    /// the list last wrote title memory ([`Deferred::title_written`]).
+    fn declare(&mut self, key: (usize, usize, usize, bool), once: bool) -> bool {
+        !once || self.gpu_written.insert(key)
+    }
+
     /// Clears all recorded entries while retaining container capacities so
     /// list resets do not free and reallocate `Vec`/`HashSet` storage every
     /// frame.
@@ -2408,6 +2428,7 @@ impl Deferred {
             upload_bytes,
             kept,
             refreshed,
+            gpu_written,
             textures,
             texture_aliases,
             texture_uploads,
@@ -2425,6 +2446,7 @@ impl Deferred {
         uploads.clear();
         kept.clear();
         refreshed.clear();
+        gpu_written.clear();
         textures.clear();
         texture_aliases.clear();
         texture_uploads.clear();
@@ -4783,6 +4805,23 @@ fn join_copies() -> bool {
 /// Since the last frame-rate line: title buffer copies recorded, and those
 /// that continue the one before ([`join_copies`]).
 static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether a range shaders write is declared once until the list next
+/// writes title memory (`VICTORY_DECLARE_ONCE=1`; off by default: every
+/// dispatch's declaration is a step of its own). After avatarmanz/VIctory-7900XTX
+/// b32fb997 (from Belobug dd799aad, romainhedouin); there the switch is on by
+/// default and `=0` turns it off. The ranges, and their order, stay what they
+/// were: a declaration that follows a write of title memory is recorded again.
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_some_and(|v| v == "1"))
+}
+
+/// With `VICTORY_DECLARE_ONCE=1`, since the last frame-rate line: ranges
+/// declared written and recorded, and those left out for being declared
+/// already ([`HostList::defer_gpu_write`]).
+#[cfg(feature = "diagnostics")]
+static DECLARED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the last frame-rate line: the microseconds the submitting thread
 /// spent deciding and recording the lists' preludes (`HostList::prelude`),
@@ -8166,7 +8205,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
         deferred.filled_root_cbvs.clear();
     }
 
@@ -8290,6 +8329,10 @@ impl HostList {
 
     /// Shaders of the list write `[address, address + len)` of a buffer's
     /// host copy: copied back into title memory once the list has run.
+    /// With `VICTORY_DECLARE_ONCE=1` a range is declared once until the list
+    /// next writes title memory: the dispatches of a frame declared the same
+    /// few ranges thousands of times, each a step of its own (a flush of its
+    /// copy's pending refreshes and two locks on the thread that submits).
     pub(crate) fn defer_gpu_write(
         &self,
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
@@ -8297,9 +8340,14 @@ impl HostList {
         len: usize,
         marked: bool,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len, marked);
+        let new = deferred.declare(key, declare_once());
+        #[cfg(feature = "diagnostics")]
+        DECLARED[usize::from(!new)].fetch_add(1, Ordering::Relaxed);
+        if new {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len, marked));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -8612,7 +8660,7 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
+        deferred.title_written();
         deferred.filled_root_cbvs.clear();
     }
 
@@ -9947,6 +9995,15 @@ impl Meter {
                 );
             }
         }
+        #[cfg(feature = "diagnostics")]
+        {
+            let [recorded, left_out] = [0, 1].map(|i| DECLARED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if recorded + left_out > 0.0 {
+                tracing::info!(
+                    "ranges shaders write, declared per frame (VICTORY_DECLARE_ONCE=1): {recorded:.0} recorded,                      {left_out:.0} left out for being declared already in the list"
+                );
+            }
+        }
         {
             let buried = BURIED_ASIDE.swap(0, Ordering::Relaxed) as f64 / frames;
             if buried > 0.0 {
@@ -10946,6 +11003,11 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 /// file is at the size limit).
 #[cfg(test)]
 mod queue2_tests;
+
+/// Declarations of shader writes recorded once per list
+/// ([`Deferred::declare`]); the tests are in a file of their own.
+#[cfg(test)]
+mod declare_tests;
 
 #[cfg(test)]
 mod root_cbv_fill_tests {
