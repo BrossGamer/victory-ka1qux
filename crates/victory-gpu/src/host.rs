@@ -10022,6 +10022,10 @@ impl Meter {
             }
         }
         #[cfg(feature = "diagnostics")]
+        if let Some(line) = crate::descriptor::host::list_views_line(frames) {
+            tracing::info!("{line}");
+        }
+        #[cfg(feature = "diagnostics")]
         {
             let [set, kept] = [0, 1].map(|i| crate::draw::TARGETS_SET[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if set + kept > 0.0 {

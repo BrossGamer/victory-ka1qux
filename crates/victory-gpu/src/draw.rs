@@ -405,6 +405,10 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// This recording of the list, for
+    /// [`crate::descriptor::host::HostHeap::make_listed`] (0: it has none
+    /// yet).
+    recording: u64,
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -451,6 +455,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.root_generations.clear();
@@ -3872,12 +3877,30 @@ impl State {
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
+            // With `VICTORY_LIST_VIEWS=1` a view this list made before has
+            // its descriptor copied.
+            let list_views = crate::descriptor::host::list_views();
+            if list_views && self.recording == 0 {
+                static NEXT: AtomicU64 = AtomicU64::new(1);
+                self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
+            }
+            let recording = self.recording;
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let handle = table + u64::from(k) * 32;
+                // Not a view of the half-float kind (those are shown another
+                // way: below) and not a constant buffer's: made as the title's
+                // record names it, once in the list.
+                let listed = if list_views && halved(self, slot, k * 8).is_none() {
+                    crate::descriptor::record_at(handle).and_then(|words| host.make_listed(recording, words, index))
+                } else {
+                    None
+                };
+                let made_already = listed.is_some();
+                match listed.or_else(|| crate::descriptor::view(handle)) {
                     Some(View::Constant(address, size)) => {
                         let size = crate::descriptor::constant_staging_bytes(size);
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -3888,9 +3911,11 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
+                        if !made_already {
+                            match halved(self, slot, k * 8) {
+                                Some(shown) => host.make_at(index, &shown),
+                                None => host.make_at(index, &view),
+                            }
                         }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
