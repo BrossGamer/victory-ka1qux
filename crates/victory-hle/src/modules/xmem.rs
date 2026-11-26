@@ -235,6 +235,109 @@ fn layout(size: usize, attributes: u64) -> Option<Layout> {
     Layout::from_size_align(size.checked_add(align)?, align).ok()
 }
 
+/// The allocator id (bits 16-23 of the attributes) of graphics memory: what
+/// committed resources ask for (`victory_gpu::resource`).
+const D3D_ALLOCATOR: u64 = 128;
+/// Graphics blocks from this size up are the ones [`graphics_block`] gives
+/// reservations of their own.
+const WATCHED_FROM: usize = 64 << 10;
+
+/// Whether [`XMemAllocDefault`] gives graphics blocks of [`WATCHED_FROM`] and
+/// up write-watched reservations of their own (`VICTORY_GRAPHICS_WATCHED=1`;
+/// off by default: they come from the host heap, as before).
+///
+/// A title without allocation hooks has every block, graphics memory
+/// included, served from the host heap, which the GPU side cannot
+/// write-watch: the host copies of committed resources there are refreshed
+/// whole at every submission that uses them. From a reservation made as
+/// the runtime's memory is (`XMemVirtualAlloc`: write-watched), only the
+/// pages written since the last copy are copied (decision 0007). A title
+/// with hooks (`hooks`) reaches this path only through what its hook hands
+/// on: the lines [`note_graphics`] logs say whether any block did.
+/// (After Marvisak/VIctory pull request 3053, by 0xkn0wh3r3.)
+fn graphics_watched() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GRAPHICS_WATCHED").is_some_and(|v| v == "1"))
+}
+
+/// The blocks [`graphics_block`] reserved, for [`XMemFreeDefault`].
+static WATCHED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+/// How many blocks [`WATCHED`] holds: the free of every other block does not
+/// take its lock.
+static WATCHED_LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Since the start: graphics blocks of [`WATCHED_FROM`] and up that
+/// [`XMemAllocDefault`] gave reservations (count, bytes) and those it took
+/// from the host heap (count, bytes).
+static GRAPHICS_BLOCKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Counts a graphics block of [`WATCHED_FROM`] and up that
+/// [`XMemAllocDefault`] served (`watched`: from a reservation), and says so
+/// in the log at the first and then at every sixteenfold count: with the
+/// switch off, whether it would matter; with it on, whether any block
+/// reaches it at all (a title whose hook serves graphics memory itself
+/// never calls [`XMemAllocDefault`] for it).
+fn note_graphics(size: usize, watched: bool) {
+    let which = if watched { 0 } else { 2 };
+    let n = GRAPHICS_BLOCKS[which].fetch_add(1, Ordering::Relaxed) + 1;
+    GRAPHICS_BLOCKS[which + 1].fetch_add(size as u64, Ordering::Relaxed);
+    if n.is_power_of_two() && n.trailing_zeros().is_multiple_of(4) {
+        let [reserved, reserved_bytes, heap, heap_bytes] = GRAPHICS_BLOCKS.each_ref().map(|c| c.load(Ordering::Relaxed));
+        tracing::info!(
+            reserved,
+            reserved_mb = reserved_bytes >> 20,
+            heap,
+            heap_mb = heap_bytes >> 20,
+            "xmem: graphics blocks of {} KiB and up that XMemAllocDefault served since the start: from write-watched reservations of their own \
+             (VICTORY_GRAPHICS_WATCHED=1) and from the host heap",
+            WATCHED_FROM >> 10
+        );
+    }
+}
+
+/// Whether a block is graphics memory (the allocator of committed
+/// resources) of [`WATCHED_FROM`] or more.
+fn large_graphics(size: usize, attributes: u64) -> bool {
+    (attributes >> 16 & 0xff) == D3D_ALLOCATOR && size >= WATCHED_FROM
+}
+
+/// Graphics memory of [`WATCHED_FROM`] or more (committed resources): a
+/// reservation of its own from [`XMemVirtualAlloc`], write-watched as the
+/// runtime's memory is, so that the GPU side copies only the pages the
+/// title wrote since its last copy. `None` for other blocks, an alignment
+/// past what a reservation gives, or a refusal: they come from the host
+/// heap. The reservation is title memory like the runtime's, in the kind
+/// the windows in place of `VICTORY_UNIFIED=1` already open (private
+/// memory in a committed run), and goes back through the same
+/// [`XMemFreeDefault`] path as 32-bit blocks do, which lets the windows
+/// over it go first.
+fn graphics_block(size: usize, attributes: u64) -> Option<*mut c_void> {
+    let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
+    if !large_graphics(size, attributes) || align > WATCHED_FROM {
+        return None;
+    }
+    let at = XMemVirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE | MEM_COMMIT, GRAPHICS, PAGE_READWRITE);
+    if at.is_null() {
+        return None;
+    }
+    WATCHED.lock().unwrap_or_else(|e| e.into_inner()).insert(at as usize);
+    WATCHED_LIVE.fetch_add(1, Ordering::Relaxed);
+    Some(at)
+}
+
+/// Whether `address` is a block [`graphics_block`] reserved (it is then
+/// forgotten: the caller frees it).
+fn watched_block(address: *mut c_void) -> bool {
+    if WATCHED_LIVE.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let found = WATCHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&(address as usize));
+    if found {
+        WATCHED_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+    found
+}
+
 type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
@@ -304,6 +407,11 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
             PAGE_READWRITE,
         );
     }
+    let graphics = large_graphics(size, attributes);
+    if graphics && graphics_watched() && let Some(block) = graphics_block(size, attributes) {
+        note_graphics(size, true);
+        return block;
+    }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
@@ -315,6 +423,9 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let block = unsafe { alloc(layout) };
     if block.is_null() {
         return block.cast();
+    }
+    if graphics {
+        note_graphics(size, false);
     }
     victory_gpu::title_pages_changed(block as usize, layout.size());
     // SAFETY: the block holds the alignment (at least the header) and then
@@ -336,7 +447,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
-        if attributes & ALLOC_32BIT != 0 {
+        // A reservation of the graphics blocks ([`graphics_block`]) goes back
+        // as a 32-bit block does: whole.
+        if attributes & ALLOC_32BIT != 0 || watched_block(address) {
             // Copy-back pages the GPU side left pending there go unwritten,
             // and windows held in place over it (`VICTORY_UNIFIED=1`) go.
             victory_gpu::title_memory_release(address as usize, 0);
@@ -1578,6 +1691,47 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    /// Graphics blocks of a page or more get a write-watched reservation of
+    /// their own (the GPU side copies only the pages written into their host
+    /// copy) and go back to the system when freed; smaller ones, other
+    /// allocators' blocks and larger alignments than a reservation gives
+    /// come from the host heap (upstream #3053).
+    #[test]
+    fn large_graphics_blocks_are_write_watched() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE, VirtualQuery};
+        let watched = |at: *mut c_void, len: usize| {
+            let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+            // SAFETY: room for one answer; no reset.
+            unsafe { GetWriteWatch(0, at, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+        };
+        let graphics = D3D_ALLOCATOR << 16 | 0x10 << ALIGNMENT_SHIFT;
+        let len = 3 * WATCHED_FROM + 100;
+        let p = graphics_block(len, graphics).expect("a reservation of its own");
+        assert_eq!(p as usize % WATCHED_FROM, 0, "64 KiB aligned");
+        assert!(watched(p, len), "write-watched");
+        // SAFETY: the bytes just allocated.
+        unsafe { p.cast::<u8>().add(len - 1).write_volatile(7) };
+        // Freed as the title frees it: by address and attributes.
+        XMemFreeDefault(p, graphics);
+        assert!(!WATCHED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(p as usize)), "forgotten");
+        // SAFETY: plain query of an address.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(p, &mut info, size_of_val(&info)) };
+        assert_eq!(info.State, MEM_FREE, "released");
+        // Smaller blocks, other allocators' and larger alignments: the heap.
+        for (size, attributes) in [
+            (1000, graphics),
+            (len, 0x10 << ALIGNMENT_SHIFT),
+            (len, D3D_ALLOCATOR << 16 | 0x11 << ALIGNMENT_SHIFT),
+        ] {
+            assert!(graphics_block(size, attributes).is_none(), "{size} bytes, {attributes:#x}");
+            let q = XMemAllocDefault(size, attributes);
+            assert!(!q.is_null());
+            XMemFreeDefault(q, attributes);
+        }
     }
 
     #[test]
