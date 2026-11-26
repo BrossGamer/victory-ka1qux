@@ -5685,20 +5685,47 @@ struct Exact {
     /// for the next copies of that size ([`exact_pool`]); and their bytes.
     pool: BTreeMap<u64, Vec<(ID3D12Resource, usize)>>,
     pooled: u64,
+    /// With [`exact_fast`]: every copy of the map once, by the asking it was
+    /// made or last looked at, oldest first ([`queued_idle`]).
+    queue: std::collections::VecDeque<((u64, u64), u64)>,
 }
 
-static EXACT: Mutex<Exact> = Mutex::new(Exact {
-    tick: 0,
-    map: BTreeMap::new(),
-    cursor: (0, 0),
-    pool: BTreeMap::new(),
-    pooled: 0,
-});
+impl Exact {
+    const fn new() -> Exact {
+        Exact {
+            tick: 0,
+            map: BTreeMap::new(),
+            cursor: (0, 0),
+            pool: BTreeMap::new(),
+            pooled: 0,
+            queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Takes the copy at `key` out of the map, and with [`exact_pool`] keeps
+    /// its buffer for the next copies of its size while the pool has room.
+    fn let_go(&mut self, key: (u64, u64)) {
+        let Some((shadow, _)) = self.map.remove(&key) else {
+            return;
+        };
+        EXACT_STATS[5].fetch_add(1, Ordering::Relaxed);
+        let size = exact_size(shadow.len, true);
+        if size <= EXACT_POOLED_MOST && self.pooled + size <= EXACT_POOL_BYTES {
+            let kept = (shadow.buffer.clone(), shadow.data as usize);
+            drop(shadow);
+            self.pool.entry(size).or_default().push(kept);
+            self.pooled += size;
+        }
+    }
+}
+
+static EXACT: Mutex<Exact> = Mutex::new(Exact::new());
 
 /// Since the last frame line: askings for such copies, copies made, of
 /// them made on a buffer a copy let go of, the microseconds spent making
-/// copies and those spent looking for idle ones, and the copies let go.
-static EXACT_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// copies and those spent looking for idle ones, the copies let go, and the
+/// copies looked at to find them.
+static EXACT_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// Whether the copies of single views' bytes are let go a few at a time and
 /// their buffers kept for the next copies (`VICTORY_EXACT_POOL=0`: no, as
@@ -5714,6 +5741,79 @@ static EXACT_STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 fn exact_pool() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Whether the idle copies are looked for in a queue instead of in address
+/// order (`VICTORY_EXACT_FAST=1`; off by default; with the pool only).
+///
+/// The scan looks at 64 copies a copy made, round the map by address, each
+/// with a reference count asked of its buffer: about 800 copies made a
+/// frame look at some 50,000, over 12,000 or more kept of which nearly all
+/// are held by a slot or asked for every frame, so 10 ms a frame went in
+/// asking counts of buffers that could not be let go, under the lock every
+/// recording thread takes. With the queue, each copy is looked at once per
+/// round of the queue, at most [`EXACT_LOOK_FAST`] of them per copy made, and
+/// the count is only asked of the copies not asked for lately and not held by
+/// a list. A copy is let go on the same terms as before (held by the map
+/// alone, its buffer by the copy alone, not asked for lately); only which
+/// idle copies go first, and when, differs. With fewer looked at per copy
+/// made, the idle copies kept settle at about one in `EXACT_LOOK_FAST` of
+/// those the queue reaches (the scan: one in 64), so a few hundred more
+/// buffers stay with copies nobody asks for.
+fn exact_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_FAST").is_some_and(|v| v == "1"))
+}
+
+/// The askings an idle copy stays for, and the copies looked at per copy
+/// made by the scan and by the queue.
+const EXACT_LATELY: u64 = 512;
+const EXACT_LOOK_FAST: usize = 16;
+const EXACT_LOOK: usize = 64;
+
+/// What looking at a queued copy found ([`queued_idle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Look {
+    /// No longer in the map.
+    Gone,
+    /// Still wanted: looked at again after the rest of the queue.
+    Keep,
+    /// Idle: to be let go.
+    Idle,
+}
+
+/// The idle copies among the oldest of the `queue` (copies by key, with the
+/// asking each was queued at, oldest first), and how many were looked at.
+///
+/// At most `budget` are taken from the front, each only once
+/// `EXACT_LATELY` askings after it was queued (the rest are all younger).
+/// Each is judged by `look`: one it finds [`Look::Keep`] goes to the back,
+/// queued at `now`; one it finds idle is returned and not queued again; one
+/// no longer there is dropped.
+fn queued_idle(
+    queue: &mut std::collections::VecDeque<((u64, u64), u64)>,
+    now: u64,
+    budget: usize,
+    mut look: impl FnMut((u64, u64), u64) -> Look,
+) -> (Vec<(u64, u64)>, usize) {
+    let mut idle = Vec::new();
+    let mut looked = 0;
+    while looked < budget {
+        let Some(&(key, queued)) = queue.front() else {
+            break;
+        };
+        if queued + EXACT_LATELY > now {
+            break;
+        }
+        queue.pop_front();
+        looked += 1;
+        match look(key, queued) {
+            Look::Gone => {}
+            Look::Keep => queue.push_back((key, now)),
+            Look::Idle => idle.push(key),
+        }
+    }
+    (idle, looked)
 }
 
 /// The largest buffer the pool keeps, and the bytes it keeps in all.
@@ -5749,21 +5849,23 @@ fn exact_size(len: u64, pool: bool) -> u64 {
 /// (start, bytes) for as long as a list or a slot holds it; of the others,
 /// those not asked for lately go once there are many (ring positions
 /// change every frame): with [`exact_pool`], a few looked at per copy
-/// made, and their buffers kept for the next copies.
+/// made (in address order, or with [`exact_fast`] the oldest of a queue),
+/// and their buffers kept for the next copies.
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, the askings an
-    /// idle one stays for, and (with the pool) the copies looked at per
-    /// copy made.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
-    const LOOK: usize = 64;
     if len == 0 {
         return None;
     }
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let pool = exact_pool();
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    let exact = &mut *guard;
+    exact_in(&mut guard, address, len, pool, pool && exact_fast())
+}
+
+/// [`exact`] on the copies of `exact`, with the pool (`pool`) and the queue
+/// (`fast`, which needs the pool) as given.
+fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool) -> Option<Arc<Shadow>> {
+    /// Copies kept before the idle ones are looked for.
+    const MANY: usize = 256;
     exact.tick += 1;
     let now = exact.tick;
     if let Some((shadow, used)) = exact.map.get_mut(&(address, len)) {
@@ -5771,46 +5873,62 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    // Held by the map alone (no list), its buffer by the copy alone (no
-    // slot shows it), and not asked for lately.
-    let idle = |shadow: &Arc<Shadow>, used: u64| {
-        Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) == 1 && used + LATELY <= now
-    };
+    let size = exact_size(len, pool);
     if exact.map.len() >= MANY {
         let looking = std::time::Instant::now();
-        if pool {
-            // A few, from where the last look ended, round the map.
-            let mut keys: Vec<(u64, u64)> = exact.map.range(exact.cursor..).take(LOOK).map(|(&k, _)| k).collect();
-            if keys.len() < LOOK {
-                let more: Vec<(u64, u64)> = exact.map.keys().take(LOOK - keys.len()).copied().collect();
-                keys.extend(more);
-            }
-            exact.cursor = keys.last().map_or((0, 0), |&(a, l)| (a, l.saturating_add(1)));
-            for key in keys {
-                if !exact.map.get(&key).is_some_and(|(shadow, used)| idle(shadow, *used)) {
-                    continue;
+        if fast {
+            // A few of the oldest in the queue.
+            let map = &exact.map;
+            let (idle, looked) = queued_idle(&mut exact.queue, now, EXACT_LOOK_FAST, |key, _| match map.get(&key) {
+                None => Look::Gone,
+                // The cheap tests first: asked for lately, then held by a
+                // list; the buffer's count (a call on its object, a cache
+                // miss) only for what is left.
+                Some((shadow, used)) => {
+                    if used + EXACT_LATELY <= now
+                        && Arc::strong_count(shadow) == 1
+                        && crate::host::references(&shadow.buffer) == 1
+                    {
+                        Look::Idle
+                    } else {
+                        Look::Keep
+                    }
                 }
-                let Some((shadow, _)) = exact.map.remove(&key) else {
-                    continue;
-                };
-                EXACT_STATS[5].fetch_add(1, Ordering::Relaxed);
-                let size = exact_size(shadow.len, true);
-                if size <= EXACT_POOLED_MOST && exact.pooled + size <= EXACT_POOL_BYTES {
-                    let kept = (shadow.buffer.clone(), shadow.data as usize);
-                    drop(shadow);
-                    exact.pool.entry(size).or_default().push(kept);
-                    exact.pooled += size;
-                }
+            });
+            EXACT_STATS[6].fetch_add(looked as u64, Ordering::Relaxed);
+            for key in idle {
+                exact.let_go(key);
             }
         } else {
-            let before = exact.map.len();
-            exact.map.retain(|_, (shadow, used)| !idle(shadow, *used));
-            EXACT_STATS[5].fetch_add((before - exact.map.len()) as u64, Ordering::Relaxed);
+            // Held by the map alone (no list), its buffer by the copy alone
+            // (no slot shows it), and not asked for lately.
+            let idle = |shadow: &Arc<Shadow>, used: u64| {
+                Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) == 1 && used + EXACT_LATELY <= now
+            };
+            if pool {
+                // A few, from where the last look ended, round the map.
+                let mut keys: Vec<(u64, u64)> = exact.map.range(exact.cursor..).take(EXACT_LOOK).map(|(&k, _)| k).collect();
+                if keys.len() < EXACT_LOOK {
+                    let more: Vec<(u64, u64)> = exact.map.keys().take(EXACT_LOOK - keys.len()).copied().collect();
+                    keys.extend(more);
+                }
+                exact.cursor = keys.last().map_or((0, 0), |&(a, l)| (a, l.saturating_add(1)));
+                EXACT_STATS[6].fetch_add(keys.len() as u64, Ordering::Relaxed);
+                for key in keys {
+                    if exact.map.get(&key).is_some_and(|(shadow, used)| idle(shadow, *used)) {
+                        exact.let_go(key);
+                    }
+                }
+            } else {
+                let before = exact.map.len();
+                exact.map.retain(|_, (shadow, used)| !idle(shadow, *used));
+                EXACT_STATS[5].fetch_add((before - exact.map.len()) as u64, Ordering::Relaxed);
+                EXACT_STATS[6].fetch_add(before as u64, Ordering::Relaxed);
+            }
         }
         EXACT_STATS[4].fetch_add(looking.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
     let making = std::time::Instant::now();
-    let size = exact_size(len, pool);
     let (buffer, data) = match exact.pool.get_mut(&size).and_then(Vec::pop) {
         Some((buffer, data)) => {
             exact.pooled -= size;
@@ -5826,6 +5944,9 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // buffer's old bytes are all replaced at its first refresh.
     let shadow = Shadow::new(buffer, data, gpu, address, len).registered();
     exact.map.insert((address, len), (shadow.clone(), now));
+    if fast {
+        exact.queue.push_back(((address, len), now));
+    }
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     EXACT_STATS[3].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(shadow)
@@ -5835,26 +5956,40 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// bytes ([`exact`]), per frame over `frames`, and the copies kept now.
 /// Nothing while there are none.
 pub(crate) fn exact_line(frames: f64) {
-    let [asked, made, reused, making_us, looking_us, let_go] =
-        [0, 1, 2, 3, 4, 5].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+    let [asked, made, reused, making_us, looking_us, let_go, looked] =
+        [0, 1, 2, 3, 4, 5, 6].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
     if asked == 0 {
         return;
     }
-    let (kept, waiting) = {
+    let pool = exact_pool();
+    // The copies alive, and the bytes of the buffers they and the pool hold
+    // (the size class each was made on).
+    let (kept, kept_bytes, waiting, waiting_bytes) = {
         let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-        (exact.map.len(), exact.pool.values().map(Vec::len).sum::<usize>())
+        (
+            exact.map.len(),
+            exact.map.values().map(|(shadow, _)| exact_size(shadow.len, pool)).sum::<u64>(),
+            exact.pool.values().map(Vec::len).sum::<usize>(),
+            exact.pooled,
+        )
     };
+    let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on a buffer a copy let go of; \
-         VICTORY_EXACT_POOL=0: none), {:.1} ms making them, {:.1} ms looking for idle ones, {:.1} let go; {kept} kept, \
-         {waiting} buffers waiting",
+         VICTORY_EXACT_POOL=0: none), {:.1} ms making them, {:.1} ms looking for idle ones ({:.1} copies looked at per frame, {}; \
+         VICTORY_EXACT_FAST=1: the oldest of a queue), {:.1} let go; {kept} kept ({:.1} MiB of buffers), \
+         {waiting} buffers waiting ({:.1} MiB)",
         asked as f64 / frames,
         made as f64 / frames,
         reused as f64 / frames,
         making_us as f64 / 1e3 / frames,
         looking_us as f64 / 1e3 / frames,
-        let_go as f64 / frames
+        looked as f64 / frames,
+        if pool && exact_fast() { "queue" } else { "scan" },
+        let_go as f64 / frames,
+        mib(kept_bytes),
+        mib(waiting_bytes)
     );
 }
 
@@ -6105,6 +6240,153 @@ mod exact_tests {
         assert_eq!(exact_size((64 << 10) + 1, true), 128 << 10);
         assert_eq!(exact_size(EXACT_POOLED_MOST, true), EXACT_POOLED_MOST);
         assert_eq!(exact_size(EXACT_POOLED_MOST + 1, true), EXACT_POOLED_MOST + 256);
+    }
+
+    /// The queue of copies to look at gives idle ones only: not one asked
+    /// for lately, not one held (by a list or a slot), and none before its
+    /// time; each is looked at once a round, the held ones go to the back,
+    /// and the gone ones are dropped.
+    #[test]
+    fn the_queue_gives_the_idle_copies_and_only_those() {
+        use super::{EXACT_LATELY, Look, queued_idle};
+        use std::collections::{HashMap, HashSet, VecDeque};
+        struct Entry {
+            used: u64,
+            held: bool,
+        }
+        type Entries = HashMap<(u64, u64), Entry>;
+        fn look(entries: &Entries, key: (u64, u64), now: u64) -> Look {
+            match entries.get(&key) {
+                None => Look::Gone,
+                Some(entry) if entry.held || entry.used + EXACT_LATELY > now => Look::Keep,
+                Some(_) => Look::Idle,
+            }
+        }
+        // Keys 0..10 queued at askings 0, 100, ... 900. Copies 1, 4, 6 and 8
+        // are idle; 0, 3, 7 and 9 held; 2 asked for later; 5 is gone.
+        let key = |i: u64| (i * 100, 36u64);
+        let mut entries = Entries::new();
+        for (i, used, held) in [
+            (0, 0, true),
+            (1, 100, false),
+            (2, 700, false),
+            (3, 300, true),
+            (4, 400, false),
+            (6, 600, false),
+            (7, 1000, true),
+            (8, 800, false),
+            (9, 900, true),
+        ] {
+            entries.insert(key(i), Entry { used, held });
+        }
+        let mut queue: VecDeque<((u64, u64), u64)> = (0..10).map(|i| (key(i), i * 100)).collect();
+        // Where the first six have waited: only they are looked at, though
+        // the budget is for more.
+        let now = 1012;
+        let (idle, looked) = queued_idle(&mut queue, now, 100, |k, _| look(&entries, k, now));
+        assert_eq!((idle, looked), (vec![key(1), key(4)], 6), "0, 3 held, 2 asked for, 5 gone");
+        assert_eq!(queue.front(), Some(&(key(6), 600)), "the younger ones wait");
+        assert_eq!(queue.back(), Some(&(key(3), now)), "the held ones queue again, now");
+        assert_eq!(queue.len(), 7);
+        // Later, a budget of 3 looks at 3 only: 6 and 8 idle, 7 held.
+        let now = 1400;
+        let (idle, looked) = queued_idle(&mut queue, now, 3, |k, _| look(&entries, k, now));
+        assert_eq!((idle, looked), (vec![key(6), key(8)], 3));
+        // Copy 9 has not waited yet; the ones queued again at 1012 neither.
+        let (idle, looked) = queued_idle(&mut queue, now, 100, |k, _| look(&entries, k, now));
+        assert_eq!((idle, looked), (vec![], 0));
+        // Round after round: a held copy is never given, and a copy only once.
+        let mut seen = HashSet::new();
+        for round in 1..=20u64 {
+            let now = 1500 + round * 600;
+            let (idle, looked) = queued_idle(&mut queue, now, 100, |k, _| look(&entries, k, now));
+            assert!(looked > 0);
+            for k in idle {
+                assert!(seen.insert(k), "given twice");
+                assert!(!entries[&k].held, "a held copy was given");
+            }
+        }
+        assert_eq!(seen, HashSet::from([key(2)]), "what is left is held, but copy 2, asked for once");
+        // Let go of what held them, they are given at their turn.
+        for i in [0, 3, 7, 9] {
+            entries.get_mut(&key(i)).unwrap().held = false;
+        }
+        let now = 1500 + 21 * 600;
+        let (mut idle, _) = queued_idle(&mut queue, now, 100, |k, _| look(&entries, k, now));
+        idle.sort_unstable();
+        assert_eq!(idle, vec![key(0), key(3), key(7), key(9)]);
+        assert!(queue.is_empty());
+    }
+
+    /// One asking for a copy of `i` on `exact`, its buffer noted in `buffers`.
+    fn ask(exact: &mut super::Exact, buffers: &mut std::collections::HashSet<usize>, fast: bool, base: u64, i: u64) -> std::sync::Arc<super::Shadow> {
+        use windows::core::Interface;
+        let copy = super::exact_in(exact, base + i, 12, true, fast).unwrap();
+        buffers.insert(copy.buffer.as_raw() as usize);
+        copy
+    }
+
+    /// Copies kept by a list (an `Arc`), by a slot (a reference on the
+    /// buffer) or asked for lately are never let go; the idle ones are, and
+    /// their buffers made use of again; and once nothing holds the others
+    /// they go too (`fast`: the queue; else the scan).
+    fn idle_copies_go_and_held_ones_stay(fast: bool) {
+        use windows::core::Interface;
+        if crate::host::host().is_none() {
+            return; // no host device to make buffers on
+        }
+        let title = vec![0u8; 4096];
+        let base = title.as_ptr() as u64;
+        let key = |i: u64| (base + i, 12u64);
+        let mut exact = super::Exact::new();
+        let mut buffers = std::collections::HashSet::new();
+        // More than the many that are kept before any is looked for.
+        let mut held = None;
+        let mut slot = None;
+        for i in 0..300 {
+            let copy = ask(&mut exact, &mut buffers, fast, base, i);
+            match i {
+                0 => held = Some(copy),
+                1 => slot = Some(copy.buffer.clone()),
+                _ => {}
+            }
+        }
+        let slot_buffer = slot.as_ref().unwrap().as_raw() as usize;
+        // Many more askings than a copy stays for, copy 2 among them asked
+        // for again now and then.
+        for i in 300..1500 {
+            if i % 50 == 0 {
+                ask(&mut exact, &mut buffers, fast, base, 2);
+            }
+            ask(&mut exact, &mut buffers, fast, base, i);
+        }
+        let on_slot = |s: &std::sync::Arc<super::Shadow>| s.buffer.as_raw() as usize == slot_buffer;
+        assert!(std::sync::Arc::ptr_eq(&exact.map[&key(0)].0, held.as_ref().unwrap()), "held by a list");
+        assert!(exact.map.get(&key(1)).is_some_and(|(s, _)| on_slot(s)), "held by a slot");
+        assert!(exact.map.contains_key(&key(2)), "asked for lately");
+        let users = exact.map.values().filter(|(s, _)| on_slot(s)).count()
+            + exact.pool.values().flatten().filter(|(b, _)| b.as_raw() as usize == slot_buffer).count();
+        assert_eq!(users, 1, "the buffer a slot holds is not in use for another copy");
+        assert!((3..300).all(|i| !exact.map.contains_key(&key(i))), "the idle ones were let go");
+        assert!(buffers.len() < 800, "{} buffers for 1,500 copies: not made use of again", buffers.len());
+        // Nothing holds them now, and copy 2 is not asked for again.
+        drop(held);
+        drop(slot);
+        for i in 1500..3000 {
+            ask(&mut exact, &mut buffers, fast, base, i);
+        }
+        assert!((0..3).all(|i| !exact.map.contains_key(&key(i))), "gone once nothing holds them");
+        drop(title);
+    }
+
+    #[test]
+    fn with_the_queue_idle_copies_go_and_held_ones_stay() {
+        idle_copies_go_and_held_ones_stay(true);
+    }
+
+    #[test]
+    fn with_the_scan_idle_copies_go_and_held_ones_stay() {
+        idle_copies_go_and_held_ones_stay(false);
     }
 }
 
