@@ -95,7 +95,8 @@ const GROUP_BASE: u32 = 65_535;
 
 /// A compute program that reads its group's number in x alone adds the number of
 /// the first group: a dispatch of more groups than the host runs comes in
-/// parts.
+/// parts. One that reads y as well does with `VICTORY_GROUP_BASE_XYZ=1` (each
+/// part runs all of y; upstream VIctory #3086).
 #[test]
 fn a_group_number_in_x_counts_from_the_host_s_first_group() {
     let program = |y: bool| -> Vec<u32> {
@@ -126,6 +127,18 @@ fn a_group_number_in_x_counts_from_the_host_s_first_group() {
         assert_eq!(asks, expected != 0);
         run_cases(&shader, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, expected, "{label}"));
     }
+    // With `VICTORY_GROUP_BASE_XYZ=1` a program that reads y as well asks too
+    // (each part runs all of y: what it stores, its number in y, is the host's).
+    let also_y = {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the only test that sets this switch, and it holds ONE_AT_A_TIME.
+        unsafe { std::env::set_var("VICTORY_GROUP_BASE_XYZ", "1") };
+        let also_y = lower_words(program(true), 1, 0, X | Y);
+        unsafe { std::env::remove_var("VICTORY_GROUP_BASE_XYZ") };
+        also_y
+    };
+    assert!(also_y.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE)));
+    run_cases(&also_y, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, 0, "{label}"));
 }
 
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives

@@ -2748,7 +2748,7 @@ impl<'a> Lower<'a> {
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
             Input::GroupId(c) => {
                 let id = self.compute_id("groupId.i32", 94, c);
-                if c != 0 || !self.one_dimensional() {
+                if c != 0 || !self.takes_group_base() {
                     return id;
                 }
                 // The number of the first group of this part of the dispatch
@@ -2826,9 +2826,19 @@ impl<'a> Lower<'a> {
     /// user data (the host's root signature holds 64 dwords, views
     /// included): the programs a dispatch of more groups than the host runs
     /// in one dimension can be run in parts for.
-    fn one_dimensional(&self) -> bool {
+    ///
+    /// `VICTORY_GROUP_BASE_XYZ=1` (off by default): also a program that reads
+    /// its group's number in y or z. Each part runs all of y and z, so the
+    /// number in x plus the part's first group is right for it too (upstream
+    /// VIctory #3086 does so for every such program), but 616 of the 1,122
+    /// saved compute programs then take the dword and are made again, for
+    /// dispatches nobody has seen: none of the saved runs' logs has a
+    /// dispatch of more than 65,535 groups in x by a program that reads y or
+    /// z ("cannot be run in parts" is not in any).
+    fn takes_group_base(&self) -> bool {
         const MOST: u32 = 20;
         let reads = |c| self.x.io.inputs.iter().any(|i| i.1 == Input::GroupId(c));
+        let beyond = !(reads(1) || reads(2)) || std::env::var_os("VICTORY_GROUP_BASE_XYZ").is_some_and(|v| v == "1");
         let words = self
             .x
             .native
@@ -2839,8 +2849,7 @@ impl<'a> Lower<'a> {
             .unwrap_or(0);
         matches!(self.x.native.io, StageIo::Cs(_))
             && reads(0)
-            && !reads(1)
-            && !reads(2)
+            && beyond
             && words <= MOST
             && !crate::spill::is_spilled(self.x.native)
     }

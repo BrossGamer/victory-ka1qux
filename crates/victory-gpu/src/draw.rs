@@ -3317,6 +3317,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {gx}x{gy}x{gz}"), true));
         let (x, y, z) = (gx, gy, gz);
+        if y > crate::indirect::PART || z > crate::indirect::PART {
+            // (Only x is run in parts; the host takes y and z as they are.)
+            once!(x, y, z, "a dispatch of more groups in y or z than the host runs in one dimension");
+        }
         match (x > crate::indirect::PART).then(|| group_base(p)).flatten() {
             Some((param, dword)) => {
                 // More groups in x than the host runs in one dimension: in
