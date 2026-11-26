@@ -148,6 +148,8 @@ mod intersect_tests;
 pub mod host;
 mod lower;
 #[cfg(all(test, windows))]
+mod cbv_subdword_tests;
+#[cfg(all(test, windows))]
 mod marks_tests;
 #[cfg(all(test, windows))]
 mod native16_tests;

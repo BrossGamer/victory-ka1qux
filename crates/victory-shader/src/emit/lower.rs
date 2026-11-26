@@ -6915,6 +6915,20 @@ impl<'a> Lower<'a> {
         x
     }
 
+    /// The 8- or 16-bit value at byte address `byte` out of `dword`, the
+    /// 32-bit word that holds it: shifted down, then zero- or sign-extended
+    /// to 32 bits (as the byte and short loads do).
+    fn extract_sub(&mut self, dword: V, byte: V, bits: u32, signed: bool) -> V {
+        let c = self.cur;
+        let three = self.s.m.i32(3);
+        let within = self.s.m.bin(c, Bin::And, byte, three);
+        let shift = self.s.m.bin(c, Bin::Shl, within, three);
+        let x = self.s.m.bin(c, Bin::LShr, dword, shift);
+        let up = self.s.m.i32(32 - bits);
+        let x = self.s.m.bin(c, Bin::Shl, x, up);
+        self.s.m.bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, up)
+    }
+
     /// `channels` channels of the element at byte `off` of raw buffer `h`,
     /// converted from the GFX10 buffer format `format` as the hardware's
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
@@ -11865,10 +11879,15 @@ impl<'a> Lower<'a> {
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
-        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+        if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed && !store && atomic.is_none() {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
+            // A byte or 16-bit load takes the value out of the dword that
+            // holds it, shifted down and extended as the instruction says
+            // (it gave the whole dword, and a value at any byte but the
+            // first of its dword read the bytes before it as well; after
+            // Marvisak/VIctory pull request 3008 by RVZO6).
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let byte = match index {
                 Some(i) => {
@@ -11884,7 +11903,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let mut x = self.cbuffer_dword(h, a);
+                if let Some((bits, signed)) = narrow {
+                    x = self.extract_sub(x, a, bits, signed);
+                }
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
