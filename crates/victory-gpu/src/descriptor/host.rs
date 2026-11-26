@@ -1661,6 +1661,33 @@ impl Drop for HostHeap {
             named.retain(|&(heap, _), _| heap != key);
         }
     }
+/// With `VICTORY_DYNAMIC_BIG=1` and a host view heap that is not capped
+/// (`null`, the last slot of the heap, is [`UNCAPPED_VIEWS`] - 1 and the
+/// title's `count` slots and these fit before it): 2^19 dynamic slots, where
+/// [`DYNAMIC`] ran out in one open-world session for about 0.5 % of the
+/// tables ("no free dynamic descriptor slots": run `tudo`, a frame asks for
+/// up to 16,000 tables while the frame before still holds its own). The
+/// title's own heap in that session was 1,507,328 slots, so 2,031,616 of
+/// the 2,097,152 are used. On a capped heap these slots are the title's
+/// (see [`DYNAMIC`]), so the base stays.
+fn dynamic_slots(count: u32, null: u32) -> u32 {
+    const BIG: u32 = 1 << 19;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DYNAMIC_BIG").is_some_and(|v| v == "1")) {
+        return DYNAMIC;
+    }
+    if null == UNCAPPED_VIEWS - 1 && u64::from(count) + u64::from(BIG) <= u64::from(null) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| tracing::info!(slots = BIG, "dynamic descriptor slots of the host view heap (VICTORY_DYNAMIC_BIG=1)"));
+        return BIG;
+    }
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::warn!(count, null, "VICTORY_DYNAMIC_BIG=1: the host view heap is capped or too full for 2^19 dynamic slots; the usual {DYNAMIC} stay")
+    });
+    DYNAMIC
+}
+
 }
 
 impl HostHeap {
@@ -1683,7 +1710,6 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
@@ -1707,6 +1733,7 @@ impl HostHeap {
             let size = null + 1;
             let fitted = if count + extra <= null {
                 count
+        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
@@ -1793,8 +1820,8 @@ impl HostHeap {
             kept: (0..(count + extra).div_ceil(KEPT_PIECE))
                 .map(|_| Mutex::new(vec![None; KEPT_PIECE as usize]))
                 .collect(),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             addresses,
@@ -1914,7 +1941,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1944,7 +1971,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
