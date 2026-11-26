@@ -771,6 +771,34 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
             }
         }
     }
+    // A mask the region copies from one it saved is as empty, and so is a join of masks that
+    // are (an inner branch's join of two paths, each holding the empty EXEC it saved).
+    let mut grown = cascade_exact();
+    while grown {
+        grown = false;
+        for &b in region {
+            for phi in &p.blocks[b].phis {
+                if matches!(phi.reg, Reg::S(_))
+                    && !saved.contains(&phi.value)
+                    && phi.args.iter().all(|a| saved.contains(a))
+                {
+                    grown |= saved.insert(phi.value);
+                }
+            }
+            for inst in &p.blocks[b].insts {
+                if matches!(inst.name(), "s_mov_b32" | "s_mov_b64")
+                    && inst.reads.len() == inst.writes.len()
+                    && inst.reads.iter().chain(&inst.writes).all(|r| matches!(r.0, Reg::S(c) if c != 126 && c != 127))
+                {
+                    for (w, r) in inst.writes.iter().zip(&inst.reads) {
+                        if saved.contains(&r.1) {
+                            grown |= saved.insert(w.1);
+                        }
+                    }
+                }
+            }
+        }
+    }
     for &b in region {
         for inst in &p.blocks[b].insts {
             let name = inst.name();
@@ -810,34 +838,104 @@ fn walks_with_empty_exec(p: &Program, region: &[usize]) -> bool {
 /// scalar restore there cannot activate vector operations for those lanes. The
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses.
+/// A program too long for the branch to reach its end has the other form of the same
+/// early-out ([`EarlyOut`]), which is left out as well.
 /// `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
     let mut blocks = p.blocks.clone();
+    let mut far = Vec::new();
     let mut any = false;
     for (b, block) in blocks.iter_mut().enumerate() {
-        let Exit::Branch { taken, not_taken } = block.exit else {
-            continue;
-        };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
-            && skipped_region(p, b, not_taken, taken).is_some_and(|(region, _)| walks_with_empty_exec(p, &region)) {
+        let Some(out) = early_out(p, b) else { continue };
+        if skipped_region(p, b, out.next, out.end).is_some_and(|(region, _)| walks_with_empty_exec(p, &region)) {
             block.insts.pop();
-            block.exit = Exit::Jump(not_taken);
+            block.exit = Exit::Jump(out.next);
+            far.extend(out.far);
             any = true;
         }
     }
     if !any {
         return None;
     }
-    for block in &mut blocks {
+    finish_without(&mut blocks, &far)?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The blocks of a program changed by leaving branches out, linked again and made reducible:
+/// the far jumps of early-outs left out (`far`) that nothing else reaches are emptied, for
+/// code that no path runs must not stay behind with the values of the program before.
+/// `None` if the flow cannot be made reducible.
+fn finish_without(blocks: &mut Vec<Block>, far: &[usize]) -> Option<()> {
+    for block in blocks.iter_mut() {
         block.phis.clear();
     }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    link(blocks);
+    let dead: Vec<usize> = far.iter().copied().filter(|&f| blocks[f].preds.is_empty()).collect();
+    if !dead.is_empty() {
+        for f in dead {
+            blocks[f].insts.clear();
+            blocks[f].exit = Exit::End;
+        }
+        link(blocks);
+    }
+    split_irreducible(blocks).ok()
+}
+
+/// Whether block `b` only ends the program.
+fn ends_program(p: &Program, b: usize) -> bool {
+    p.blocks[b].exit == Exit::End
+        && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
+}
+
+/// The end block that block `b`, the far jump of a console branch whose target is too far for
+/// the branch's 16-bit offset (`s_getpc_b64`, an address added to it, `s_setpc_b64`), jumps
+/// to, if that block only ends the program. Code that does any work on the way stays what it
+/// is.
+fn far_jump_to_end(p: &Program, b: usize) -> Option<usize> {
+    let block = &p.blocks[b];
+    let Exit::Jump(target) = block.exit else { return None };
+    (ends_program(p, target)
+        && block
+            .insts
+            .iter()
+            .all(|i| matches!(i.name(), "s_getpc_b64" | "s_add_u32" | "s_addc_u32" | "s_setpc_b64")))
+    .then_some(target)
+}
+
+/// An early-out at the end of block `b`: where the lanes that stay go, the block that ends the
+/// program, and the far jump to it if the branch is the far form.
+struct EarlyOut {
+    next: usize,
+    end: usize,
+    far: Option<usize>,
+}
+
+/// The early-out `b` ends in, if it does: `s_cbranch_execz` to a block that only ends the
+/// program, or `s_cbranch_execnz` whose other way is a far jump to such a block (a program too
+/// long for the branch to reach its end). The branch is then left out and the code goes on
+/// at `next`.
+fn early_out(p: &Program, b: usize) -> Option<EarlyOut> {
+    let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
+        return None;
+    };
+    match p.blocks[b].insts.last()?.name() {
+        "s_cbranch_execz" if ends_program(p, taken) => Some(EarlyOut { next: not_taken, end: taken, far: None }),
+        "s_cbranch_execnz" if cascade_exact() => {
+            let end = far_jump_to_end(p, not_taken)?;
+            Some(EarlyOut { next: taken, end, far: Some(not_taken) })
+        }
+        _ => None,
+    }
+}
+
+/// Whether the far form of an early-out ([`EarlyOut`]) is left out too, a join that passes
+/// one scalar through is a copy of it ([`copy_through_phis`]), and a mask a region copies or
+/// joins from masks it saved empty is as empty ([`walks_with_empty_exec`]): the ways the tiled
+/// cascade shadow programs reach an exact translation on a host of 32-lane waves
+/// (`VICTORY_CASCADE_EXACT=0` goes back to the near form, the plain copies and the masks
+/// saved in the region alone).
+fn cascade_exact() -> bool {
+    std::env::var_os("VICTORY_CASCADE_EXACT").is_none_or(|v| v != "0")
 }
 
 /// As [`without_early_outs`], and also without the branches that only skip a
@@ -854,17 +952,15 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
 ///
 /// `deep` looks closer at what the code after the branch can see. A scalar the region moves
 /// away and back (the compiler parks scalars in VGPR lanes around a branch and takes them
-/// back before the join, `unspill`) is the value it copies; a join nothing reads shows no
-/// one the difference (a restore of EXEC that the next one overwrites reads nothing); and
-/// the join may have other ways in (an inner branch that ends together with an outer one).
+/// back before the join, `unspill`) is the value it copies, and so is a scalar phi whose
+/// arguments all come to one value (a join of branches that left it alone); a join nothing
+/// reads shows no one the difference (a restore of EXEC that the next one overwrites reads
+/// nothing); and the join may have other ways in (an inner branch that ends together with an
+/// outer one).
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
     let n = p.blocks.len();
-    let ends = |b: usize| {
-        p.blocks[b].exit == Exit::End
-            && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
-    };
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
     let mut copy: std::collections::HashMap<Value, Value> = Default::default();
@@ -913,12 +1009,10 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
             }
         }
     }
-    let root = |mut v: Value| {
-        while deep && let Some(&c) = copy.get(&v) {
-            v = c;
-        }
-        v
-    };
+    if deep {
+        copy_through_phis(p, &mut copy);
+    }
+    let root = |v: Value| if deep { follow(&copy, v) } else { v };
     let scalars_unchanged = |b: usize, target: usize, inside: &[bool]| {
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
@@ -945,31 +1039,76 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         deep || join.preds.iter().all(|&q| q == b || inside[q])
     };
     let mut blocks = p.blocks.clone();
+    let mut far = Vec::new();
     let mut any = false;
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
         };
-        if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        let out = early_out(p, b);
+        let skip = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
+        if out.is_none() && !skip {
             continue;
         }
-        let Some((region, inside)) = skipped_region(p, b, not_taken, taken) else { continue };
+        // an early-out leaves the program where the branch goes (`end`); a skip, at the join
+        let (go, to) = out.as_ref().map_or((not_taken, taken), |o| (o.next, o.end));
+        let Some((region, inside)) = skipped_region(p, b, go, to) else { continue };
         let pure = region.iter().all(|&x| !matches!(p.blocks[x].exit, Exit::End | Exit::Indirect));
-        if (ends(taken) || pure && scalars_unchanged(b, taken, &inside)) && walks_with_empty_exec(p, &region) {
+        if (out.is_some() || pure && scalars_unchanged(b, taken, &inside)) && walks_with_empty_exec(p, &region) {
             blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(not_taken);
+            blocks[b].exit = Exit::Jump(go);
+            far.extend(out.and_then(|o| o.far));
             any = true;
         }
     }
     if !any {
         return None;
     }
-    for block in &mut blocks {
-        block.phis.clear();
-    }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
+    finish_without(&mut blocks, &far)?;
     Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The value `v` is a copy of, followed to the end of `copy`'s chains.
+fn follow(copy: &std::collections::HashMap<Value, Value>, mut v: Value) -> Value {
+    while let Some(&c) = copy.get(&v) {
+        v = c;
+    }
+    v
+}
+
+/// The one value every argument of the scalar `phi` comes to (the phi's own value left
+/// aside, as a loop's back edge brings it), if there is one.
+fn single_source(copy: &std::collections::HashMap<Value, Value>, phi: &Phi) -> Option<Value> {
+    let mut one = None;
+    for x in phi.args.iter().map(|&a| follow(copy, a)).filter(|&x| x != phi.value) {
+        if *one.get_or_insert(x) != x {
+            return None;
+        }
+    }
+    one
+}
+
+/// Adds to `copy` the scalar phis that pass one value through (a join of branches none of
+/// which changed it, one after the other, as the console's compiler leaves them): such a phi
+/// is a copy of that value. A phi that merges a real change is not. Repeats until no phi is
+/// added, for a phi may pass through the ones before it.
+fn copy_through_phis(p: &Program, copy: &mut std::collections::HashMap<Value, Value>) {
+    if !cascade_exact() {
+        return;
+    }
+    let mut added = true;
+    while added {
+        added = false;
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if copy.contains_key(&phi.value) || !matches!(phi.reg, Reg::S(_) | Reg::Scc) {
+                continue;
+            }
+            if let Some(one) = single_source(copy, phi) {
+                copy.insert(phi.value, one);
+                added = true;
+            }
+        }
+    }
 }
 
 /// Placeholder before renaming.
