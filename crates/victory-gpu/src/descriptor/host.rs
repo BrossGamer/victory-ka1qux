@@ -16,6 +16,7 @@ use crate::host::host;
 pub(crate) mod batched;
 mod debug_null;
 mod listed;
+mod raw_range;
 pub(crate) mod spanned;
 #[cfg(feature = "diagnostics")]
 pub(crate) use listed::line as list_views_line;
@@ -1284,6 +1285,41 @@ impl TextureQueue {
         order
     }
 
+    /// Of the slots `indices`, the ones that wait for their upload, due or
+    /// not and held or not, each with its write number as
+    /// [`TextureQueue::due`] hands it out: for a pass that has to bring
+    /// those very slots up to date now (a bake draw's own sources,
+    /// `crate::draw`). Not the ones uploaded whole that wait for another
+    /// look.
+    fn queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        let mut out: Vec<(u32, u64)> = Vec::new();
+        for &index in indices {
+            if out.iter().any(|&(i, _)| i == index) {
+                continue;
+            }
+            if let Some(w) = self.slots.get(&index).filter(|w| w.relook.is_none()) {
+                out.push((index, w.write));
+            }
+        }
+        out
+    }
+
+    /// Puts the slots `indices` into the queue as written in `frame` and due
+    /// at once, unless they wait in it for their upload already: for texture
+    /// views a shader is about to pick by index whose host slot shows
+    /// nothing and which nothing would bring up to date (a view the spans
+    /// took for stale when the title wrote a newer one of memory it clashes
+    /// with, and which the title reads all the same). One uploaded whole
+    /// that waits for another look is put back too: that look would find its
+    /// memory unchanged and leave it.
+    fn requeue(&mut self, indices: &[u32], frame: u64) {
+        for &index in indices {
+            if self.slots.get(&index).is_none_or(|w| w.relook.is_some()) {
+                self.written(index, frame, frame, false);
+            }
+        }
+    }
+
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
@@ -1487,7 +1523,7 @@ pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// What became of buffer views that did not fit the host copy of their
 /// memory as they were, since the start (see [`view_fates`] for the order).
-static VIEW_FATES: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+static VIEW_FATES: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 const FATE_NO_ELEMENTS: usize = 0;
 const FATE_RAW_OFF_16: usize = 1;
 const FATE_OWN_TYPED: usize = 2;
@@ -1498,6 +1534,7 @@ const FATE_UNORDERED_STRUCTURED: usize = 6;
 const FATE_OFF_ELEMENT: usize = 7;
 const FATE_CONSTANT_OFF_256: usize = 8;
 const FATE_CONSTANT_OWN: usize = 9;
+const FATE_OWN_RAW_UNORDERED: usize = 10;
 
 fn fate(which: usize) {
     VIEW_FATES[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1509,7 +1546,7 @@ pub(crate) fn view_fates() -> String {
     format!(
         "{} (of no elements {}, raw ones not on 16 bytes {}); buffer views left null off their copy's \
          elements: {} read, {} unordered; unordered structured views not on 16 bytes, left structured: {}; \
-         buffer views on a copy of their own range: {} typed, {} raw, {} structured; constant buffer          views left null as not on 256 bytes of the host's copy: {}, made on a copy of their own range: {}{}",
+         buffer views on a copy of their own range: {} typed, {} raw, {} structured, {} raw unordered; constant buffer          views left null as not on 256 bytes of the host's copy: {}, made on a copy of their own range: {}{}",
         REFUSED_VIEWS.load(std::sync::atomic::Ordering::Relaxed),
         f(FATE_NO_ELEMENTS),
         f(FATE_RAW_OFF_16),
@@ -1519,6 +1556,7 @@ pub(crate) fn view_fates() -> String {
         f(FATE_OWN_TYPED),
         f(FATE_OWN_RAW),
         f(FATE_OWN_STRUCTURED),
+        f(FATE_OWN_RAW_UNORDERED),
         f(FATE_CONSTANT_OFF_256),
         f(FATE_CONSTANT_OWN),
         crate::shadow::stale_report(),
@@ -2071,6 +2109,18 @@ impl HostHeap {
             }
         }
         out
+    }
+
+    /// See [`TextureQueue::queued`].
+    pub(crate) fn texture_slots_queued(&self, indices: &[u32]) -> Vec<(u32, u64)> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).queued(indices)
+    }
+
+    /// See [`TextureQueue::requeue`].
+    pub(crate) fn texture_slots_requeue(&self, indices: &[u32], frame: u64) {
+        if !indices.is_empty() {
+            self.textures.lock().unwrap_or_else(|e| e.into_inner()).requeue(indices, frame);
+        }
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -3308,15 +3358,21 @@ impl HostHeap {
     /// the host placed after the buffer.
     pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // A view's range has to lie inside the buffer: a description that runs
+        // past it is refused with no word, and what a refused creation leaves
+        // in the slot is undefined (`raw_range`).
+        let Some(range) = raw_range::of("SRV", buffer, offset, len) else {
+            self.null_raw_at(index);
+            return;
+        };
         let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
                 },
@@ -3343,14 +3399,18 @@ impl HostHeap {
     /// reaching whatever the host placed after the buffer.
     pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
         let Some(host) = host() else { return };
-        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        // As `raw_at`: the range inside the buffer, or nothing at all.
+        let Some(range) = raw_range::of("UAV", buffer, offset, len) else {
+            self.null_raw_uav_at(index);
+            return;
+        };
         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
-                    FirstElement: offset / 4,
-                    NumElements: elements,
+                    FirstElement: range.first,
+                    NumElements: range.elements,
                     StructureByteStride: 0,
                     CounterOffsetInBytes: 0,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
@@ -4204,7 +4264,8 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     }
     // A view off its buffer's elements is made on a copy of its own bytes:
     // the same question `buffer_srv` (`off_element`: off its elements, or
-    // untyped and off 16 bytes) and `buffer_uav` (`own_bytes`) ask, of the
+    // untyped and off 16 bytes) and `buffer_uav` (`own_bytes`: off its
+    // elements, or raw and off 16 bytes) ask, of the
     // copy they find, so that the copy brought up to date is the one the
     // slot shows.
     if let Some(words) = shader_buffer_words(view) {
@@ -4216,9 +4277,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
             return crate::shadow::exact(address, len).map(|own| (own, address, len));
         }
     } else if let Some((base, width)) = buffer_extent(view)
-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
+        && let Some((first, count, element, stride, unknown, raw)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
@@ -4387,8 +4448,45 @@ fn own_copy_on() -> bool {
 /// a view has no host view there; it is made on a copy of its own bytes
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+///
+/// A raw view (`raw`, 4-byte elements) is also made on a copy of its own bytes
+/// where it begins on a dword of its buffer's copy but not on 16 bytes of it
+/// ([`own_raw_bytes_if`]).
+#[allow(clippy::too_many_arguments)]
+fn own_bytes(
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+    raw: bool,
+) -> Option<(u64, u64)> {
+    let on = own_copy_on();
+    own_bytes_if(on, offset, base, first, count, element, stride, unknown)
+        .or_else(|| own_raw_bytes_if(on, offset, base, first, count, raw))
+}
+
+/// The title memory (start, bytes) of a raw unordered view that begins on a
+/// dword of the host copy of its buffer (`offset` bytes in, for the buffer at
+/// `base`) but not on 16 bytes of it, where the host's raw views begin
+/// ([`buffer_view_ok`]): `first` dwords from `base`, `count` of them. The
+/// console's raw views begin on any dword; such a view was refused and left
+/// null, so a shader's writes through it, and a clear of it, went nowhere.
+/// (Upstream VIctory PR #3075 picks a host copy that starts on 16 bytes
+/// instead, where this one makes a copy of the view's own bytes, as the
+/// shader views off 16 bytes already get: [`off_raw`].) `None`: the view is
+/// made on its buffer's copy.
+fn own_raw_bytes_if(on: bool, offset: u64, base: u64, first: u64, count: u32, raw: bool) -> Option<(u64, u64)> {
+    if !on || !raw || count == 0 {
+        return None;
+    }
+    let from = first.checked_mul(4)?;
+    if offset.checked_add(from)?.is_multiple_of(16) {
+        return None;
+    }
+    Some((base.checked_add(from)?, u64::from(count) * 4))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4413,9 +4511,10 @@ fn own_bytes_if(
 }
 
 /// Of a buffer view: its first element, its elements, the bytes of one (a
-/// raw view's: 4), its structure's stride, and whether it has no format.
-/// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+/// raw view's: 4), its structure's stride, whether it has no format, and
+/// whether it is a raw view. As [`buffer_srv`] and [`buffer_uav`] read them
+/// from the same words.
+fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool)> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
@@ -4434,12 +4533,18 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
         } else {
             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        let raw = b.StructureByteStride == 0
+            && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+            && d.Format == DXGI_FORMAT_R32_TYPELESS;
+        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     } else {
         let d = srv_desc(words);
         // SAFETY: a buffer view's union member.
         let b = unsafe { d.Anonymous.Buffer };
-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
+        let raw = b.StructureByteStride == 0
+            && b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+            && d.Format == DXGI_FORMAT_R32_TYPELESS;
+        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw))
     }
 }
 
@@ -4616,10 +4721,18 @@ fn buffer_uav(
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
+        // (A raw view the host would refuse anyway, `buffer_view_ok`, gets no copy.)
+        let raw = b.StructureByteStride == 0
+            && b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+            && desc.Format == DXGI_FORMAT_R32_TYPELESS;
+        let offset = shadow.offset(address);
+        match own_bytes(offset, address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
+                if raw && offset.is_multiple_of(4) {
+                    fate(FATE_OWN_RAW_UNORDERED);
+                }
                 desc.Anonymous.Buffer.FirstElement = 0;
                 (own, true)
             }
@@ -6206,6 +6319,65 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         crate::shadow::unregister(RESOURCE, start);
     }
 
+    /// A raw unordered view that begins on a dword of its copy but not on 16
+    /// bytes of it is made on a copy of its own bytes, which the slot shows and
+    /// `buffer_copy` names (upstream VIctory #771: such a view was refused and
+    /// left null, and a clear or a write through it went nowhere). A raw view
+    /// on 16 bytes still uses the buffer's copy.
+    #[test]
+    fn a_raw_unordered_view_off_16_bytes_gets_its_own_copy() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        const RESOURCE: usize = 0x62_0071;
+        let title = vec![0u8; 8192];
+        let start = (title.as_ptr() as u64).next_multiple_of(16);
+        crate::shadow::register(RESOURCE, start, 4096);
+        let raw = |first: u64, count: u32| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: count,
+                    StructureByteStride: 0,
+                    CounterOffsetInBytes: 0,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                },
+            },
+        };
+        let placed = |desc: &D3D12_UNORDERED_ACCESS_VIEW_DESC| {
+            // SAFETY: 40 bytes in the host's layout, as `uav_desc` reads them.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(desc).cast::<[u32; 10]>().read_unaligned() };
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 4096; // its width
+            let mut view = [0u32; 16];
+            view[..10].copy_from_slice(&words);
+            view[10] = start as u32;
+            view[11] = (start >> 32) as u32;
+            View::Placed(true, resource, view)
+        };
+        // Four dwords from the second: 4 bytes into the memory, which the host's
+        // raw views cannot begin on.
+        let desc = raw(1, 4);
+        let kept = buffer_uav(start, 4096, desc, heap.cpu(0)).expect("a view, not left null");
+        let (copy, address, len) = buffer_copy(&placed(&desc)).unwrap();
+        assert_eq!((address, len), (start + 4, 16));
+        assert_eq!(copy.span(), (start + 4, 16), "a copy of the view's range alone");
+        assert_eq!(kept.as_ref(), Some(&copy.buffer), "the slot shows the copy the pass updates");
+        // On 16 bytes: the buffer's copy, as before.
+        let desc = raw(4, 4);
+        let kept = buffer_uav(start, 4096, desc, heap.cpu(1)).expect("a view");
+        let (copy, ..) = buffer_copy(&placed(&desc)).unwrap();
+        assert_eq!(copy.span(), (start, 4096), "the buffer's own copy");
+        assert_eq!(kept.as_ref(), Some(&copy.buffer));
+        crate::shadow::unregister(RESOURCE, start);
+    }
+
     /// A record that names the buffer view its slot already shows leaves the
     /// slot as it is; one whose slot was made null, or another view, is
     /// made. The pass over buffer views does not mark the slots it makes
@@ -6793,6 +6965,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(q.room(5), 1);
         assert!(q.due(5, 100).iter().any(|d| d.0 == 20));
         assert_eq!(q.room(6), 0);
+    }
+
+    /// The slots a draw names are handed out whatever their turn: not due
+    /// yet, or held back for lack of room. One uploaded whole that waits
+    /// for another look is not waiting for its upload; put back, it is due
+    /// at once as a slot written now, and so is one the queue did not hold.
+    /// A slot that waits for its upload already keeps its place (fork PR
+    /// #1264).
+    #[test]
+    fn slots_a_draw_names_are_handed_out_whatever_their_turn() {
+        let mut q = TextureQueue::default();
+        q.written(5, 1, 0, false);
+        q.written(6, 1, 50, false);
+        q.written(7, 1, 0, false);
+        let due = q.due(1, 100);
+        let write = |index: u32| due.iter().find(|d| d.0 == index).map(|d| d.1).unwrap();
+        assert!(!due.iter().any(|d| d.0 == 6), "slot 6 is not due before frame 50");
+        q.hold(7, write(7), 101);
+        let named = |q: &TextureQueue| -> Vec<u32> { q.queued(&[5, 6, 7, 8]).into_iter().map(|d| d.0).collect() };
+        assert_eq!(named(&q), [5, 6, 7]);
+        assert_eq!(q.queued(&[7]), [(7, write(7))], "with the write the pass hands back");
+        assert_eq!(q.queued(&[6, 6, 5]).len(), 2, "each once");
+        // Uploaded whole: it waits for a look at its memory, not for an upload.
+        assert!(!q.uploaded_whole(5, write(5), 9, (0x1000, 0x100), 1234));
+        assert_eq!(named(&q), [6, 7]);
+        let six = q.queued(&[6]);
+        q.requeue(&[5, 6, 8], 3);
+        assert_eq!(named(&q), [5, 6, 7, 8]);
+        assert!(q.slots[&5].relook.is_none());
+        assert_eq!(q.queued(&[6]), six, "slot 6 waited already: as it was");
+        let now: Vec<u32> = q.due(3, 100).into_iter().map(|d| d.0).collect();
+        assert!(now.contains(&5) && now.contains(&8) && !now.contains(&6) && !now.contains(&7));
     }
 
     /// Textures of which only the smallest levels are held, packed into
@@ -7854,7 +8058,28 @@ mod record_print_tests {
 
 #[cfg(test)]
 mod own_copy_tests {
-    use super::own_bytes_if;
+    use super::{own_bytes_if, own_raw_bytes_if};
+
+    /// A raw unordered view gets a copy of its own bytes when it begins on a
+    /// dword of its copy but not on 16 bytes of it (upstream VIctory #771, the
+    /// view the title clears four dwords through from its second), and on
+    /// nothing else: not on 16 bytes, not raw, no elements, switch off.
+    #[test]
+    fn a_raw_view_off_16_bytes_gets_its_own_bytes() {
+        let base = 0xd_9000_0000u64;
+        assert_eq!(own_raw_bytes_if(true, 0, base, 1, 4, true), Some((base + 4, 16)));
+        assert_eq!(own_raw_bytes_if(true, 0, base, 3, 8, true), Some((base + 12, 32)));
+        assert_eq!(own_raw_bytes_if(true, 0, base, 4, 4, true), None, "16 bytes in");
+        assert_eq!(own_raw_bytes_if(true, 0, base, 0, 4, true), None);
+        // The buffer itself 8 bytes into its copy: the sum counts.
+        assert_eq!(own_raw_bytes_if(true, 8, base, 2, 4, true), None, "8 + 8");
+        assert_eq!(own_raw_bytes_if(true, 8, base, 1, 4, true), Some((base + 4, 16)));
+        assert_eq!(own_raw_bytes_if(true, 12, base, 0, 4, true), Some((base, 16)));
+        assert_eq!(own_raw_bytes_if(true, 0, base, 1, 4, false), None, "not raw");
+        assert_eq!(own_raw_bytes_if(true, 0, base, 1, 0, true), None, "no elements");
+        assert_eq!(own_raw_bytes_if(false, 0, base, 1, 4, true), None, "VICTORY_VIEW_OWN_COPY=0");
+        assert_eq!(own_raw_bytes_if(true, 0, base, u64::MAX, 4, true), None, "no wrap");
+    }
 
     /// A buffer view gets a copy of its own bytes only when it has no host
     /// view on its buffer's copy: off that copy's elements, and not a
