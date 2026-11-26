@@ -154,7 +154,7 @@ pub(crate) struct HostHeap {
     /// In pieces of [`KEPT_PIECE`] slots, each behind a lock of its own:
     /// the recording threads make their tables' slots at the same time
     /// (after victory-fork's pull request #1146).
-    kept: Vec<Mutex<Vec<Option<ID3D12Resource>>>>,
+    kept: Vec<Mutex<Vec<Option<crate::shadow::Held>>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -3255,7 +3255,7 @@ impl HostHeap {
 
     /// The piece of [`HostHeap::kept`] slot `index` is in, locked, and
     /// where in it the slot is; `None` past the heap.
-    fn kept_piece(&self, index: u32) -> Option<(std::sync::MutexGuard<'_, Vec<Option<ID3D12Resource>>>, usize)> {
+    fn kept_piece(&self, index: u32) -> Option<(std::sync::MutexGuard<'_, Vec<Option<crate::shadow::Held>>>, usize)> {
         if index >= self.count + self.dynamic {
             return None;
         }
@@ -3266,13 +3266,14 @@ impl HostHeap {
     /// The host resource slot `index` shows (tests).
     #[cfg(test)]
     fn kept_at(&self, index: u32) -> Option<ID3D12Resource> {
-        self.kept_piece(index).and_then(|(kept, at)| kept[at].clone())
+        self.kept_piece(index).and_then(|(kept, at)| kept[at].as_ref().map(|held| held.resource().clone()))
     }
 
-    /// Slot `index` now views `resource` (or nothing of the host's). Every
+    /// Slot `index` now views `resource` (or nothing of the host's); a view
+    /// of a range of a slab holds the range ([`crate::shadow::Held`]). Every
     /// slot write comes here: its mark table entry follows.
-    fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        self.set_mark(index, resource.as_ref());
+    fn keep(&self, index: u32, resource: Option<crate::shadow::Held>) {
+        self.set_mark(index, resource.as_ref().map(crate::shadow::Held::resource));
         // Whatever the slot showed, it is not known to be that view now
         // (the caller notes it again if it is: [`HostHeap::note_shown`]).
         if let Some(sig) = self.shown.lock().unwrap_or_else(|e| e.into_inner()).get_mut(index as usize) {
@@ -3283,11 +3284,9 @@ impl HostHeap {
             // A bake named it lately: counted if what it shows changes
             // ([`bake_slot_changed`]).
             let changed = bake_watch_on()
-                && slot.as_ref().is_some_and(|old| {
-                    resource.as_ref().is_none_or(|new| {
-                        windows::core::Interface::as_raw(new) != windows::core::Interface::as_raw(old)
-                    })
-                });
+                && slot
+                    .as_ref()
+                    .is_some_and(|old| resource.as_ref().is_none_or(|new| new.raw() != old.raw()));
             let nulled = resource.is_none();
             let old = std::mem::replace(slot, resource);
             drop(kept);
@@ -3328,7 +3327,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer.clone().into()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view that reads
@@ -3367,7 +3366,7 @@ impl HostHeap {
                 self.cpu(index),
             )
         };
-        self.keep(index, Some(buffer.clone()));
+        self.keep(index, Some(buffer.clone().into()));
     }
 
     /// Makes slot `index` (a dynamic one) a raw unordered access view of
@@ -3854,11 +3853,9 @@ impl HostHeap {
         let Some((copy, _, _)) = buffer_copy(view) else {
             return false;
         };
-        self.kept_piece(index).is_some_and(|(kept, at)| {
-            kept[at]
-                .as_ref()
-                .is_some_and(|shown| windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(&copy.buffer))
-        })
+        // (A copy that is a range of a slab: the slot must show that range,
+        // not another of the same buffer.)
+        self.kept_piece(index).is_some_and(|(kept, at)| kept[at].as_ref().is_some_and(|shown| shown.is_of(&copy)))
     }
 
     /// Title slot `index`'s host descriptor was just made from a view with
@@ -3890,7 +3887,16 @@ impl HostHeap {
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
         let (kept, at) = self.kept_piece(index)?;
         let shown = kept[at].as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        Some(windows::core::Interface::as_raw(shown.resource()) == windows::core::Interface::as_raw(buffer))
+    }
+
+    /// Whether host slot `index` shows the memory of `copy`: its range, if
+    /// the copy is a range of a slab (`shows` of its buffer would say yes of
+    /// every range of the slab); `None` if it shows no resource.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn shows_copy(&self, index: u32, copy: &crate::shadow::Shadow) -> Option<bool> {
+        let (kept, at) = self.kept_piece(index)?;
+        Some(kept[at].as_ref()?.is_of(copy))
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -3937,7 +3943,7 @@ impl HostHeap {
     pub(crate) fn probe_slot(&self, index: u32) -> SlotProbe {
         let host = self
             .kept_piece(index)
-            .and_then(|(kept, at)| kept[at].as_ref().map(|r| windows::core::Interface::as_raw(r) as usize))
+            .and_then(|(kept, at)| kept[at].as_ref().map(crate::shadow::Held::raw))
             .unwrap_or(0);
         let shown = host != 0;
         let queue = self.textures.lock().unwrap_or_else(|e| e.into_inner());
@@ -4323,7 +4329,7 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 }
 
 /// The host resource a slot made by [`make`] views, if any.
-type Kept = Option<ID3D12Resource>;
+type Kept = Option<crate::shadow::Held>;
 
 /// Whether the pass over records copied in as bytes also mirrors slots
 /// that draws read through tables lately (`VICTORY_HEAP_SYNC_TABLES=1`;
@@ -4516,7 +4522,9 @@ fn buffer_srv(
         let start = buffer.FirstElement.checked_mul(element)?.checked_add(address)?;
         shadow = crate::shadow::exact(start, u64::from(buffer.NumElements) * element)?;
         buffer.FirstElement = 0;
-        offset = 0;
+        // (Where the copy begins in its buffer: 0, or with
+        // `VICTORY_EXACT_SUB=1` the offset of its range of a slab.)
+        offset = shadow.offset(start);
     }
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -4550,8 +4558,8 @@ fn buffer_srv(
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    // (A range of a slab ends where the range does.)
+    let width = shadow.buffer_end();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count == 0 {
@@ -4580,7 +4588,7 @@ fn buffer_srv(
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
     };
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(shadow.held()))
 }
 
 /// An unordered access view of title buffer memory at `address` (`len`
@@ -4633,7 +4641,8 @@ fn buffer_uav(
     } else {
         crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
-    let offset = if own { 0 } else { shadow.offset(address) };
+    // (An own copy's first byte: 0, or its range's offset in a slab.)
+    let offset = if own { shadow.offset(shadow.span().0) } else { shadow.offset(address) };
     // A structured view as a raw view of the same bytes (see `raw_window`).
     let window = (desc.Format == DXGI_FORMAT_UNKNOWN)
         .then(|| raw_window(offset, buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride))
@@ -4662,8 +4671,7 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
-    // SAFETY: a live buffer.
-    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let width = shadow.buffer_end();
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if count == 0 {
@@ -4691,12 +4699,13 @@ fn buffer_uav(
     // The view's first byte in title memory, and a typed view's element
     // size: its writes' marks (`crate::marks`), for the slot this goes to.
     let bytes = if raw { 4 } else if stride > 0 { u64::from(stride) } else { element };
-    let first_byte = shadow.span().0 + first * bytes;
+    // (From the copy's first byte: not from its range's, in a slab.)
+    let first_byte = shadow.span().0 + first * bytes - shadow.sub().map_or(0, |sub| sub.base());
     let typed = if raw || stride > 0 { 0 } else { element };
     if let Some(entry) = shadow.mark_entry(first_byte, typed) {
         MARK.with(|m| m.set(Some((windows::core::Interface::as_raw(&shadow.buffer) as usize, entry))));
     }
-    Some(Some(shadow.buffer.clone()))
+    Some(Some(shadow.held()))
 }
 
 thread_local! {
@@ -5108,7 +5117,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
-            Some(Some(shadow.buffer.clone()))
+            Some(Some(shadow.held()))
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
@@ -5191,7 +5200,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if let (Some(shown), Some((memory, _))) = (tiled, crate::resource::texture_memory(resource)) {
                     TILED_MADE.set(Some((memory as u64, shown)));
                 }
-                Some(Some(texture.clone()))
+                Some(Some(texture.clone().into()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
@@ -5253,7 +5262,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     at,
                 )
             };
-            Some(Some(texture.clone()))
+            Some(Some(texture.clone().into()))
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
@@ -6065,12 +6074,135 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let (copy, address, len) = buffer_copy(&placed(base, &desc)).unwrap();
         assert_eq!((address, len), (base + 12, 22 * 12));
         assert_eq!(copy.span(), (base + 12, 22 * 12), "a copy of the view's range alone");
-        assert_eq!(kept.as_ref(), Some(&copy.buffer), "the slot shows the copy the pass updates");
+        assert!(kept.as_ref().is_some_and(|held| held.is_of(&copy)), "the slot shows the copy the pass updates");
 
         let kept = buffer_srv(start + 24, 1024, desc, heap.cpu(1)).expect("a view");
         let (copy, ..) = buffer_copy(&placed(start + 24, &desc)).unwrap();
         assert_eq!(copy.span(), (start, title.len() as u64), "the buffer's own copy");
-        assert_eq!(kept.as_ref(), Some(&copy.buffer));
+        assert!(kept.as_ref().is_some_and(|held| held.is_of(&copy)));
+        crate::shadow::unregister(RESOURCE, start);
+    }
+
+    /// With the small copies on slabs (`VICTORY_EXACT_SUB=1`), the views off
+    /// their copy's elements (a typed view of 12-byte elements, a structured
+    /// view of 20-byte ones, a constant buffer view off 256 bytes) are made
+    /// on a range of a slab, away from the slab's start, and a shader that
+    /// reads them through the heap gets the bytes of their memory, and no
+    /// others.
+    #[test]
+    fn views_on_ranges_of_a_slab_read_the_bytes_of_their_ranges() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = "#define RS \"DescriptorTable(SRV(t0), CBV(b0), SRV(t1)), UAV(u0)\"\n\
+            Buffer<float3> typed : register(t0);\n\
+            cbuffer c : register(b0) { uint4 v[16]; };\n\
+            ByteAddressBuffer structured : register(t1);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            [RootSignature(RS)]\n\
+            [numthreads(32, 1, 1)]\n\
+            void main(uint3 id : SV_DispatchThreadID) {\n\
+                if (id.x < 22) dst.Store3(id.x * 12, asuint(typed[id.x]));\n\
+                if (id.x < 16) dst.Store4(264 + id.x * 16, v[id.x]);\n\
+                if (id.x < 25) dst.Store(520 + id.x * 4, structured.Load(id.x * 4));\n\
+            }\n";
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let Ok(mut rig) = crate::inplace::Rig::new(&host.device) else {
+            return;
+        };
+        let Some((out, out_data)) = host.shared_buffer(4096) else {
+            return;
+        };
+        crate::shadow::force_exact_sub(Some(true));
+        const RESOURCE: usize = 0x62_0072;
+        let title: Vec<u8> = (0..16384usize).map(|i| (i * 13 + 5) as u8).collect();
+        let start = title.as_ptr() as u64;
+        crate::shadow::register(RESOURCE, start, title.len() as u64);
+        // Copies of other views come first: the ranges the views below take
+        // are not the slab's first.
+        let others: Vec<_> = (0..3u64).map(|i| crate::shadow::exact(start + 8192 + 4 * i, 12 + 4 * i).unwrap()).collect();
+        let placed = |base: u64, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC| {
+            // SAFETY: 40 bytes in the host's layout, as `srv_desc` reads them.
+            let words: [u32; 10] = unsafe { std::ptr::from_ref(desc).cast::<[u32; 10]>().read_unaligned() };
+            let mut resource = [0u32; 14];
+            resource[0] = 1; // a buffer
+            resource[4] = 1024; // its width
+            let mut view = [0u32; 16];
+            view[..10].copy_from_slice(&words);
+            view[10] = base as u32;
+            view[11] = (base >> 32) as u32;
+            View::Placed(false, resource, view)
+        };
+        // 22 typed elements of 12 bytes from element 1 of the memory 4 bytes in.
+        let typed = typed_view(DXGI_FORMAT_R32G32B32_FLOAT, 1, 22);
+        let kept_typed = buffer_srv(start + 4, 1024, typed, heap.cpu(0)).expect("a view").expect("a host resource");
+        let (typed_copy, typed_at, typed_len) = buffer_copy(&placed(start + 4, &typed)).unwrap();
+        // 5 structured elements of 20 bytes, 8 bytes in: not on 16, a raw view of its own copy.
+        let mut structured = typed_view(DXGI_FORMAT_UNKNOWN, 0, 5);
+        structured.Anonymous.Buffer.StructureByteStride = 20;
+        let kept_structured = buffer_srv(start + 8, 1024, structured, heap.cpu(2)).expect("a view").expect("a host resource");
+        let (structured_copy, structured_at, structured_len) = buffer_copy(&placed(start + 8, &structured)).unwrap();
+        // A constant buffer view of 64 bytes 16 bytes into the memory: the host's begin on 256.
+        let view = View::Constant(start + 16, 64);
+        let (cbv_copy, constant_at, constant_len, own) = constant_copy(start + 16, 64).unwrap();
+        assert!(own);
+        let kept_constant = make(&view, heap.cpu(1)).unwrap().expect("a view");
+        for (copy, kept) in [(&typed_copy, &kept_typed), (&structured_copy, &kept_structured), (&cbv_copy, &kept_constant)] {
+            let sub = copy.sub().expect("a range of a slab");
+            assert!(sub.base() >= 3 * 768 && sub.base() % 768 == 0, "away from the slab's start: {}", sub.base());
+            assert!(kept.is_of(copy), "the slot shows the copy the pass updates");
+        }
+        assert_eq!((typed_at, typed_len, structured_len, constant_len), (start + 16, 264, 100, 256));
+        assert_eq!(cbv_copy.gpu(constant_at) % 256, 0);
+        for (copy, at, len) in [(&typed_copy, typed_at, typed_len), (&structured_copy, structured_at, structured_len), (&cbv_copy, constant_at, constant_len)] {
+            assert!(copy.update(at as usize, len as usize) > 0);
+        }
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; then the blob's
+        // own bytes, which hold the root signature too.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("sub"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None).unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        // SAFETY: a live buffer; an open list of the rig's; the slots view live buffers.
+        unsafe {
+            std::ptr::write_bytes(out_data, 0xEE, 4096);
+            let gpu = out.GetGPUVirtualAddress();
+            rig.run(|list| {
+                list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootDescriptorTable(0, heap.gpu_handle(0));
+                list.SetComputeRootUnorderedAccessView(1, gpu);
+                list.Dispatch(1, 1, 1);
+            })
+            .unwrap();
+        }
+        // SAFETY: the buffer's mapping; the card is done.
+        let read = unsafe { std::slice::from_raw_parts(out_data, 1024) };
+        let from = |at: u64, len: u64| &title[(at - start) as usize..(at - start + len) as usize];
+        assert_eq!(&read[..264], from(typed_at, 264), "the typed view");
+        assert_eq!(&read[264..520], from(constant_at, 256), "the constant buffer view");
+        assert_eq!(&read[520..620], from(structured_at, 100), "the structured view, as a raw view of its range");
+        assert!(read[620..].iter().all(|&b| b == 0xEE), "nothing else was written");
+        drop((others, typed_copy, structured_copy, cbv_copy));
+        crate::shadow::force_exact_sub(None);
         crate::shadow::unregister(RESOURCE, start);
     }
 

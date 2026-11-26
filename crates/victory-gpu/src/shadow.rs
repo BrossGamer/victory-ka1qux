@@ -24,7 +24,11 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod sub;
 mod under;
+pub(crate) use sub::Held;
+#[cfg(test)]
+pub(crate) use sub::force as force_exact_sub;
 pub(crate) use under::{on as under_fused, stats as under_stats};
 
 thread_local! {
@@ -126,6 +130,12 @@ pub(crate) struct Shadow {
     /// 1: over private memory, bit 2: it reaches the end of its title
     /// memory, so a root view with no length may be given it).
     unified: u8,
+    /// With `VICTORY_EXACT_SUB=1`, a small copy of a view's own bytes
+    /// ([`exact`]): `buffer` is a slab shared with other copies, and the
+    /// copy is the range of it this holds ([`sub`]); `base` is the range's
+    /// offset in the buffer (0 for every other copy).
+    sub: Option<Arc<sub::Sub>>,
+    base: u64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2962,7 +2972,42 @@ impl Shadow {
 
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
-        address - self.start + self.place.as_ref().map_or(0, |place| place.1)
+        address - self.start + self.base + self.place.as_ref().map_or(0, |place| place.1)
+    }
+
+    /// The range of a slab the copy is, if it is ([`sub`]).
+    pub(crate) fn sub(&self) -> Option<&Arc<sub::Sub>> {
+        self.sub.as_ref()
+    }
+
+    /// The bytes of the buffer from its start to the end of what the copy
+    /// may be viewed through: the buffer's width, but for a range of a
+    /// slab, where it ends with the range.
+    pub(crate) fn buffer_end(&self) -> u64 {
+        match &self.sub {
+            Some(sub) => sub.base() + sub.cap(),
+            // SAFETY: a live buffer.
+            None => unsafe { self.buffer.GetDesc() }.Width,
+        }
+    }
+
+    /// What a descriptor slot that views the copy holds: the buffer, and the
+    /// range of its slab if it is one ([`sub`]), which no other copy may be
+    /// given while the slot shows it.
+    pub(crate) fn held(&self) -> Held {
+        Held::new(self.buffer.clone(), self.sub.clone())
+    }
+
+    /// Whether anything besides the copy holds the memory it is in: a
+    /// descriptor slot that views it, or a submission that still reads it
+    /// through one (the buffer's references: a copy's own buffer is held by
+    /// the copy alone otherwise; a range's, those of the range, since the
+    /// slab's buffer is every range's).
+    fn held_apart(&self) -> bool {
+        match &self.sub {
+            Some(sub) => Arc::strong_count(sub) > 1,
+            None => crate::host::references(&self.buffer) > 1,
+        }
     }
 
     /// Title memory `[start, start + len)` in place: `placed` is a buffer
@@ -3026,6 +3071,8 @@ impl Shadow {
             fallback: Mutex::default(),
             own_view: None,
             unified: 0,
+            sub: None,
+            base: 0,
         }
     }
 
@@ -5688,6 +5735,8 @@ struct Exact {
     /// With [`exact_fast`]: every copy of the map once, by the asking it was
     /// made or last looked at, oldest first ([`queued_idle`]).
     queue: std::collections::VecDeque<((u64, u64), u64)>,
+    /// With [`exact_sub`]: the slabs the small copies are ranges of.
+    subs: sub::Pool,
 }
 
 impl Exact {
@@ -5699,16 +5748,22 @@ impl Exact {
             pool: BTreeMap::new(),
             pooled: 0,
             queue: std::collections::VecDeque::new(),
+            subs: sub::Pool::new(),
         }
     }
 
     /// Takes the copy at `key` out of the map, and with [`exact_pool`] keeps
     /// its buffer for the next copies of its size while the pool has room.
+    /// (A range of a slab goes back to its slab when nothing holds it, with
+    /// the copy: nothing does, or the copy would not be let go.)
     fn let_go(&mut self, key: (u64, u64)) {
         let Some((shadow, _)) = self.map.remove(&key) else {
             return;
         };
         EXACT_STATS[5].fetch_add(1, Ordering::Relaxed);
+        if shadow.sub.is_some() {
+            return;
+        }
         let size = exact_size(shadow.len, true);
         if size <= EXACT_POOLED_MOST && self.pooled + size <= EXACT_POOL_BYTES {
             let kept = (shadow.buffer.clone(), shadow.data as usize);
@@ -5763,6 +5818,22 @@ fn exact_pool() -> bool {
 fn exact_fast() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Whether the small copies (16 KiB or less) are ranges of shared slabs
+/// (`VICTORY_EXACT_SUB=1`; off by default; with the pool only: see
+/// [`sub`]).
+///
+/// With the pool each copy made a buffer of 64 KiB at the least (what a
+/// small buffer takes on the card anyway), and the 20,000 and more copies
+/// kept held 1.4 GiB of buffers although most of them need 256 bytes to 4
+/// KiB. A copy of a range takes the range's class (768 bytes to 18 KiB) of a
+/// buffer of 4 MiB, and its views count their elements from the range's
+/// offset in it. A copy is let go on the same terms as before (held by the
+/// map alone, no slot showing it, not asked for lately), told from the
+/// range's own reference count, not the slab buffer's.
+fn exact_sub() -> bool {
+    sub::on()
 }
 
 /// The askings an idle copy stays for, and the copies looked at per copy
@@ -5858,12 +5929,13 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     EXACT_STATS[0].fetch_add(1, Ordering::Relaxed);
     let pool = exact_pool();
     let mut guard = EXACT.lock().unwrap_or_else(|e| e.into_inner());
-    exact_in(&mut guard, address, len, pool, pool && exact_fast())
+    exact_in(&mut guard, address, len, pool, pool && exact_fast(), pool && exact_sub())
 }
 
-/// [`exact`] on the copies of `exact`, with the pool (`pool`) and the queue
-/// (`fast`, which needs the pool) as given.
-fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool) -> Option<Arc<Shadow>> {
+/// [`exact`] on the copies of `exact`, with the pool (`pool`), the queue
+/// (`fast`, which needs the pool) and the slabs for small copies (`slabbed`,
+/// which needs it too) as given.
+fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool, slabbed: bool) -> Option<Arc<Shadow>> {
     /// Copies kept before the idle ones are looked for.
     const MANY: usize = 256;
     exact.tick += 1;
@@ -5885,10 +5957,7 @@ fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool) -
                 // list; the buffer's count (a call on its object, a cache
                 // miss) only for what is left.
                 Some((shadow, used)) => {
-                    if used + EXACT_LATELY <= now
-                        && Arc::strong_count(shadow) == 1
-                        && crate::host::references(&shadow.buffer) == 1
-                    {
+                    if used + EXACT_LATELY <= now && Arc::strong_count(shadow) == 1 && !shadow.held_apart() {
                         Look::Idle
                     } else {
                         Look::Keep
@@ -5903,7 +5972,7 @@ fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool) -
             // Held by the map alone (no list), its buffer by the copy alone
             // (no slot shows it), and not asked for lately.
             let idle = |shadow: &Arc<Shadow>, used: u64| {
-                Arc::strong_count(shadow) == 1 && crate::host::references(&shadow.buffer) == 1 && used + EXACT_LATELY <= now
+                Arc::strong_count(shadow) == 1 && !shadow.held_apart() && used + EXACT_LATELY <= now
             };
             if pool {
                 // A few, from where the last look ended, round the map.
@@ -5929,20 +5998,39 @@ fn exact_in(exact: &mut Exact, address: u64, len: u64, pool: bool, fast: bool) -
         EXACT_STATS[4].fetch_add(looking.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
     let making = std::time::Instant::now();
-    let (buffer, data) = match exact.pool.get_mut(&size).and_then(Vec::pop) {
-        Some((buffer, data)) => {
-            exact.pooled -= size;
-            EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
-            (buffer, data as *mut u8)
+    // A small copy is a range of a slab ([`sub`]), a new slab if none has
+    // room; the slabs no copy holds are looked for now and then.
+    let lease = if slabbed {
+        if now.is_multiple_of(sub::TRIM_EVERY) {
+            exact.subs.trim(now);
         }
-        None => host()?.shared_buffer(size)?,
+        exact.subs.take(len.next_multiple_of(256))
+    } else {
+        None
     };
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-    // A new copy: none of it counts as copied (`Shadow::new`), so a reused
-    // buffer's old bytes are all replaced at its first refresh.
-    let shadow = Shadow::new(buffer, data, gpu, address, len).registered();
+    let shadow = if let Some(lease) = lease {
+        // A new copy as below: none of it counts as copied, so the old
+        // bytes of a range taken again are all replaced at its first refresh.
+        let mut shadow = Shadow::new(lease.buffer().clone(), lease.data(), lease.gpu(), address, len);
+        shadow.base = lease.base();
+        shadow.sub = Some(lease);
+        shadow.registered()
+    } else {
+        let (buffer, data) = match exact.pool.get_mut(&size).and_then(Vec::pop) {
+            Some((buffer, data)) => {
+                exact.pooled -= size;
+                EXACT_STATS[2].fetch_add(1, Ordering::Relaxed);
+                (buffer, data as *mut u8)
+            }
+            None => host()?.shared_buffer(size)?,
+        };
+        crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        // A new copy: none of it counts as copied (`Shadow::new`), so a reused
+        // buffer's old bytes are all replaced at its first refresh.
+        Shadow::new(buffer, data, gpu, address, len).registered()
+    };
     exact.map.insert((address, len), (shadow.clone(), now));
     if fast {
         exact.queue.push_back(((address, len), now));
@@ -5963,23 +6051,45 @@ pub(crate) fn exact_line(frames: f64) {
     }
     let pool = exact_pool();
     // The copies alive, and the bytes of the buffers they and the pool hold
-    // (the size class each was made on).
-    let (kept, kept_bytes, waiting, waiting_bytes) = {
+    // (the size class each was made on; the range of a slab each takes, with
+    // `VICTORY_EXACT_SUB=1`), and the slabs.
+    let (kept, kept_bytes, waiting, waiting_bytes, slabs) = {
         let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
         (
             exact.map.len(),
-            exact.map.values().map(|(shadow, _)| exact_size(shadow.len, pool)).sum::<u64>(),
+            exact
+                .map
+                .values()
+                .map(|(shadow, _)| shadow.sub.as_ref().map_or_else(|| exact_size(shadow.len, pool), |sub| sub.cap()))
+                .sum::<u64>(),
             exact.pool.values().map(Vec::len).sum::<usize>(),
             exact.pooled,
+            exact.subs.census(),
         )
     };
     let mib = |bytes: u64| bytes as f64 / (1 << 20) as f64;
+    // With the slabs: the copies that are ranges of them (alive, and the
+    // bytes of their ranges) and the bytes the slabs hold in all.
+    let on_slabs = if exact_sub() {
+        let [made, released, cut, again] = sub::stats();
+        format!(
+            "; VICTORY_EXACT_SUB=1: {} copies on slabs ({:.1} MiB of ranges, {} given back and waiting) in {} slabs \
+             ({:.1} MiB in all; {made} made and {released} released, {cut} ranges cut and {again} taken again since the start)",
+            slabs.ranges,
+            mib(slabs.range_bytes),
+            slabs.free,
+            slabs.slabs,
+            mib(slabs.slab_bytes)
+        )
+    } else {
+        String::new()
+    };
     tracing::info!(
         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
          {:.1} asked for per frame, {:.1} copies of their own bytes made per frame ({:.1} on a buffer a copy let go of; \
          VICTORY_EXACT_POOL=0: none), {:.1} ms making them, {:.1} ms looking for idle ones ({:.1} copies looked at per frame, {}; \
          VICTORY_EXACT_FAST=1: the oldest of a queue), {:.1} let go; {kept} kept ({:.1} MiB of buffers), \
-         {waiting} buffers waiting ({:.1} MiB)",
+         {waiting} buffers waiting ({:.1} MiB){on_slabs}",
         asked as f64 / frames,
         made as f64 / frames,
         reused as f64 / frames,
@@ -6321,7 +6431,7 @@ mod exact_tests {
     /// One asking for a copy of `i` on `exact`, its buffer noted in `buffers`.
     fn ask(exact: &mut super::Exact, buffers: &mut std::collections::HashSet<usize>, fast: bool, base: u64, i: u64) -> std::sync::Arc<super::Shadow> {
         use windows::core::Interface;
-        let copy = super::exact_in(exact, base + i, 12, true, fast).unwrap();
+        let copy = super::exact_in(exact, base + i, 12, true, fast, false).unwrap();
         buffers.insert(copy.buffer.as_raw() as usize);
         copy
     }

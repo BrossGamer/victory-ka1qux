@@ -2170,7 +2170,7 @@ impl State {
                 continue;
             };
             #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
+            if host.shows_copy(index, &shadow) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             ranges.insert(index, (shadow, address, address + len));
