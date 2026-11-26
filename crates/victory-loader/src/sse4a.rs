@@ -60,7 +60,7 @@ pub(crate) fn decode(code: &[u8]) -> Option<Field> {
 }
 
 /// `jmp rel32` at `at` to `to`, if it reaches.
-fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
+pub(crate) fn jump(at: usize, to: usize) -> Option<[u8; 5]> {
     let rel = i32::try_from(to as i64 - (at as i64 + 5)).ok()?;
     let [a, b, c, d] = rel.to_le_bytes();
     Some([0xe9, a, b, c, d])
@@ -121,7 +121,7 @@ pub(crate) fn stub(f: Field, at: usize, place: usize) -> Option<Vec<u8>> {
     Some(code)
 }
 
-const STUBS_LEN: usize = 64 << 10;
+pub(crate) const STUBS_LEN: usize = 64 << 10;
 
 /// The memory new stubs go in, near the title's code, and the bytes used. Its lock is held
 /// while a stub is made and the code changed: one thread at a time.
@@ -132,7 +132,7 @@ pub(crate) static REPLACED: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
 /// Memory for code within reach of a `jmp rel32` at `at`.
-fn near(at: usize) -> Option<usize> {
+pub(crate) fn near(at: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc,
     };

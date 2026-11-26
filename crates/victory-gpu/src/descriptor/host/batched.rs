@@ -191,12 +191,31 @@ impl HostHeap {
     pub(crate) fn mirror_copied_batch(
         &self,
         pages: &[(usize, usize)],
-        (start, step): (u64, u64),
+        at: (u64, u64),
         mirrored_count: u32,
         in_place: bool,
     ) -> (u64, u64, u64) {
+        let (read, looked, made, _) = self.mirror_copied_batch_noting(pages, at, mirrored_count, in_place, usize::MAX);
+        (read, looked, made)
+    }
+
+    /// [`HostHeap::mirror_copied_batch`] that also says which records of the
+    /// ranges from `noting` on (`VICTORY_PORT_DESCRIPTORS=1`: the first ranges
+    /// are runs of slots that were marked, the rest pages the fallback looks
+    /// at whole) were not the ones last seen: the slot's index, and whether a
+    /// draw read it through a table lately (left to the draw, as for any
+    /// range). A record that changed on a range the marks did not tell of is a
+    /// writer the patches miss.
+    pub(crate) fn mirror_copied_batch_noting(
+        &self,
+        pages: &[(usize, usize)],
+        (start, step): (u64, u64),
+        mirrored_count: u32,
+        in_place: bool,
+        noting: usize,
+    ) -> (u64, u64, u64, Vec<(u32, bool)>) {
         if pages.is_empty() {
-            return (0, 0, 0);
+            return (0, 0, 0, Vec::new());
         }
         let began = Instant::now();
         let scans = scan_pages(pages, (start, step), mirrored_count, in_place);
@@ -204,12 +223,17 @@ impl HostHeap {
         let (frame, tables, zero) = (crate::frame::current(), sync_tables(), zero_record_print());
         let (mut read, mut looked) = (0u64, 0u64);
         let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut found: Vec<(u32, bool)> = Vec::new();
+        // The scans are those of the ranges, in their order (a job that did not
+        // come back is not told apart: then none is noted).
+        let noting = if scans.len() == pages.len() { noting } else { usize::MAX };
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
                 copied.resize(self.count as usize, 0);
             }
-            for scan in scans.iter().flatten() {
+            for (n, scan) in scans.iter().enumerate() {
+                let Some(scan) = scan else { continue };
                 read += 1;
                 for (i, &print) in scan.prints.iter().enumerate() {
                     if print == 0 {
@@ -228,7 +252,11 @@ impl HostHeap {
                     }
                     // A table's slot lately: left to its draws, and looked
                     // at again next time.
-                    if !tables && self.tabled_lately(index as u32, frame) {
+                    let tabled = (n >= noting || !tables) && self.tabled_lately(index as u32, frame);
+                    if n >= noting {
+                        found.push((index as u32, tabled));
+                    }
+                    if !tables && tabled {
                         COPIED_TABLED.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
@@ -254,7 +282,7 @@ impl HostHeap {
         ]) {
             count.fetch_add(n, Ordering::Relaxed);
         }
-        (read, looked, due.len() as u64)
+        (read, looked, due.len() as u64, found)
     }
 }
 
@@ -434,6 +462,52 @@ mod tests {
         assert!(both(&memory).2 > 0, "some moved, some cleared");
         assert_eq!(both(&memory).2, 0);
         crate::shadow::unregister(RESOURCE, buffer.0);
+    }
+
+    /// The ranges from `noting` on say which records changed on them: those of
+    /// the marked runs before them are mirrored all the same and not told, and
+    /// a record that did not change is told of by none.
+    #[test]
+    fn records_changed_on_the_noted_ranges_are_told() {
+        for in_place in [false, true] {
+            let Some(heap) = HostHeap::new(false, COUNT) else {
+                eprintln!("no host GPU: skipped");
+                return;
+            };
+            let buffer = vec![0u8; 256 << 10];
+            let buffer = (buffer.as_ptr() as u64, buffer.len() as u64);
+            crate::shadow::register(RESOURCE, buffer.0, buffer.1);
+            let mut memory = vec![[0u32; 8]; COUNT as usize];
+            let start = memory.as_mut_ptr() as u64;
+            let at = |slot: u64| start + slot * STEP;
+            for i in (0..COUNT).filter(|i| i % 3 == 0) {
+                write_record(at(u64::from(i)), i, buffer, 0);
+            }
+            let pages = pages(&memory);
+            // Everything seen once; nothing is told.
+            let (_, _, _, found) = heap.mirror_copied_batch_noting(&pages, (start, STEP), COUNT, in_place, 0);
+            assert!(!found.is_empty(), "the first look finds the records new");
+            let (_, _, made, found) = heap.mirror_copied_batch_noting(&pages, (start, STEP), COUNT, in_place, 0);
+            assert_eq!((made, found.len()), (0, 0), "nothing changed, nothing told");
+            // A record of the run (slot 3) and one of the page after (slot 201), changed.
+            write_record(at(3), 3, buffer, 7);
+            write_record(at(201), 201, buffer, 7);
+            let run = (at(3) as usize, at(4) as usize);
+            let page = pages[1];
+            assert!((page.0 as u64..page.1 as u64).contains(&at(201)));
+            // Noted from the page: the run's record is mirrored, not told.
+            let (read, looked, made, found) = heap.mirror_copied_batch_noting(&[run, page], (start, STEP), COUNT, in_place, 1);
+            assert_eq!((read, made), (2, 2), "both records mirrored");
+            assert!(looked > 128, "the run's record and the page's: {looked}");
+            assert_eq!(found, [(201, false)], "in place: {in_place}");
+            // Seen now: not told again, whichever ranges are noted.
+            let (_, _, made, found) = heap.mirror_copied_batch_noting(&[run, page], (start, STEP), COUNT, in_place, 0);
+            assert_eq!((made, found.len()), (0, 0));
+            // Without noting, as `mirror_copied_batch`.
+            write_record(at(204), 204, buffer, 9);
+            assert_eq!(heap.mirror_copied_batch(&[page], (start, STEP), COUNT, in_place).2, 1);
+            crate::shadow::unregister(RESOURCE, buffer.0);
+        }
     }
 
     /// Pages read on jobs come back as the same pages read here, in order,

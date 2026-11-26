@@ -165,6 +165,9 @@ fn mirror(handle: u64) {
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    // Its record is looked at again with the title's own
+    // (`VICTORY_PORT_DESCRIPTORS`).
+    crate::port_descriptors::mark(handle);
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -214,6 +217,15 @@ pub(crate) fn sync_heaps() {
         let mirrored_count = heap.desc.count.min(host.count());
         // Records of 32 bytes (view heaps), fingerprinted where they are.
         let in_place = step == 32 && page_at_once() && crate::heapprint::on();
+        // The heap whose slots the title's stores and our calls mark
+        // (`VICTORY_PORT_DESCRIPTORS=1`): the marked slots, not the changed pages.
+        if crate::port_descriptors::adopted(start) {
+            let (checked, seen, made) = sync_marked(host, written, (start, end), step, mirrored_count, in_place);
+            pages += checked;
+            looked += seen;
+            mirrored += made;
+            continue;
+        }
         // All the changed pages of the heap together (`VICTORY_HEAP_SYNC_BATCH=1`).
         if host::batched::on() && page_at_once() {
             let ranges = written.take(start as usize, end as usize);
@@ -298,6 +310,52 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// [`sync_heaps`] for the heap whose slots are marked
+/// (`crate::port_descriptors`): the marked slots' runs, and the pages the
+/// fallback looks at whole, go through the batch of changed pages
+/// ([`host::batched`]), which reads and compares each record with the one
+/// last seen and mirrors the ones that changed. A record that changed on
+/// one of the fallback's pages and was not marked is a miss. Returns the pages
+/// of the fallback looked at, the records looked at and those mirrored.
+#[cfg(windows)]
+fn sync_marked(
+    host: &host::HostHeap,
+    written: &crate::watch::Tracked,
+    (start, end): (u64, u64),
+    step: u64,
+    mirrored_count: u32,
+    in_place: bool,
+) -> (u64, u64, u64) {
+    let frame = crate::frame::current();
+    let mut ranges: Vec<(usize, usize)> = crate::port_descriptors::take(start)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(first, n)| {
+            let from = start as usize + first as usize * step as usize;
+            (from, from + n as usize * step as usize)
+        })
+        .collect();
+    let marked = ranges.len();
+    if crate::port_descriptors::ask_due(frame) {
+        crate::port_descriptors::asked(&written.take(start as usize, end as usize));
+    }
+    let checks = crate::port_descriptors::to_check(frame);
+    for &page in &checks {
+        let (from, to) = (page.max(start as usize), (page + crate::watch::PAGE).min(end as usize));
+        if from < to {
+            ranges.push((from, to));
+        }
+    }
+    let (_, looked, made, found) = host.mirror_copied_batch_noting(&ranges, (start, step), mirrored_count, in_place, marked);
+    for (index, tabled) in found {
+        let handle = start + u64::from(index) * step;
+        let mut tag = [0u8; 4];
+        let view = crate::host::read_into(handle as *const u8, &mut tag) && u32::from_le_bytes(tag) == VIEW_TAG;
+        crate::port_descriptors::missed(index, handle, view, tabled);
+    }
+    (checks.len() as u64, looked, made)
+}
+
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
 /// not the one last seen (mirrored), and the microseconds it took.
@@ -308,6 +366,7 @@ pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::port_descriptors::line(frames);
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let [left_alone, locked] = host::spanned::COUNT.each_ref().map(|n| n.swap(0, std::sync::atomic::Ordering::Relaxed));
     if host::spanned::quick() && left_alone + locked > 0 {
@@ -319,7 +378,7 @@ pub(crate) fn sync_line(frames: f64) {
     }
     crate::heapprint::line(frames);
     host::batched::line(frames);
-    if pages == 0 {
+    if pages == 0 && looked == 0 {
         return;
     }
     tracing::info!(
@@ -379,6 +438,7 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
+        crate::port_descriptors::let_go(self.start);
     }
 }
 
@@ -583,7 +643,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -1218,6 +1278,11 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // The title's own stores tell this heap's slots (`VICTORY_PORT_DESCRIPTORS`).
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        crate::port_descriptors::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;

@@ -28,6 +28,10 @@ pub struct Config {
     /// A title profile: code patterns for `VICTORY_FSR` on Series X (a file
     /// the user keeps; nothing about a title is built in).
     pub fsr_profile: Option<PathBuf>,
+    /// A profile of where the title stores its descriptor records, for
+    /// `VICTORY_PORT_DESCRIPTORS=1` (a file the user keeps; nothing about a
+    /// title is built in).
+    pub descriptors_profile: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -49,6 +53,7 @@ struct FilePaths {
     test_titles: Vec<PathBuf>,
     fidelityfx_dir: Option<PathBuf>,
     fsr_profile: Option<PathBuf>,
+    descriptors_profile: Option<PathBuf>,
 }
 
 impl Config {
@@ -106,6 +111,7 @@ impl Config {
             test_titles,
             fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             fsr_profile: env_path("VICTORY_FSR_PROFILE").or(file.fsr_profile),
+            descriptors_profile: env_path("VICTORY_DESCRIPTORS_PROFILE").or(file.descriptors_profile),
             source,
         })
     }
@@ -169,14 +175,19 @@ mod tests {
         let file = FilePaths {
             fidelityfx_dir: Some("sdk-from-file".into()),
             fsr_profile: Some("profile-from-file".into()),
+            descriptors_profile: Some("descriptors-from-file".into()),
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_FIDELITYFX_DIR").then(|| OsString::from("sdk-from-env"));
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.fidelityfx_dir.unwrap(), PathBuf::from("sdk-from-env"));
         assert_eq!(cfg.fsr_profile.unwrap(), PathBuf::from("profile-from-file"));
+        assert_eq!(cfg.descriptors_profile.unwrap(), PathBuf::from("descriptors-from-file"));
+        let env = |k: &str| (k == "VICTORY_DESCRIPTORS_PROFILE").then(|| OsString::from("descriptors-from-env"));
+        let cfg = Config::resolve(FilePaths { descriptors_profile: Some("descriptors-from-file".into()), ..Default::default() }, None, env).unwrap();
+        assert_eq!(cfg.descriptors_profile.unwrap(), PathBuf::from("descriptors-from-env"));
         let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
-        assert!(cfg.fidelityfx_dir.is_none() && cfg.fsr_profile.is_none());
+        assert!(cfg.fidelityfx_dir.is_none() && cfg.fsr_profile.is_none() && cfg.descriptors_profile.is_none());
     }
 
     #[test]

@@ -78,7 +78,14 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        // The copies into the title's descriptor heap are marked with
+        // `VICTORY_PORT_DESCRIPTORS=1` (the address as it is without).
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol {
+            return Some(victory_gpu::port_descriptors::import(name, address));
+        }
+        Some(address)
     }
 }
 
