@@ -112,6 +112,13 @@ pub(crate) struct Shadow {
     /// kept a snapshot all the same (not all guarded and clean).
     marked: Mutex<Vec<(usize, usize)>>,
     fallback: Mutex<Vec<(usize, usize)>>,
+    /// The title released the buffer ([`unregister`]) while this copy may
+    /// still have a submission's copy-back pending: the addresses may be
+    /// another use's by then, and what shaders wrote for the submission
+    /// that is over must not land in it, so nothing goes back from here on
+    /// (after upstream VIctory #3036; the copy stays for the lists that
+    /// still hold it). `VICTORY_COPY_BACK_GONE=0`: not noted.
+    gone: std::sync::atomic::AtomicBool,
     /// In place through a view of ours (`crate::inplace`'s stretches): the
     /// view, unmapped after `place`'s heap goes (fields drop in order).
     own_view: Option<crate::inplace::OwnView>,
@@ -3015,6 +3022,7 @@ impl Shadow {
             marks: None,
             marked_now: std::sync::atomic::AtomicBool::new(false),
             marked: Mutex::default(),
+            gone: std::sync::atomic::AtomicBool::new(false),
             fallback: Mutex::default(),
             own_view: None,
             unified: 0,
@@ -3089,6 +3097,9 @@ impl Shadow {
     /// from the first to the last with `VICTORY_MARKED_RUNS=0`). Returns the
     /// bytes written.
     pub(crate) fn copy_back_marked(&self, page: usize, before: &[u8]) -> usize {
+        if self.gone.load(Ordering::Relaxed) {
+            return 0;
+        }
         let mut marked = self.marked.lock().unwrap_or_else(|e| e.into_inner()).clone();
         // Each byte once (after upstream VIctory #3031, whose fix is of the
         // same kind): armed ranges overlap (the world arms several views of
@@ -3430,6 +3441,10 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
+        // The title took the buffer back while this copy-back was pending.
+        if self.gone.load(Ordering::Relaxed) {
+            return 0;
+        }
         if self.place.is_some() {
             // The shaders wrote the title's pages themselves: through a
             // view of ours no guard saw it, so the guards are told now,
@@ -3543,7 +3558,7 @@ impl Shadow {
     /// memory. Returns the bytes written to title memory.
     pub(crate) fn relay_merge(&self, at: usize, n: usize, now: &mut Vec<u8>, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
-        if self.card.is_some() || n == 0 || at + n > self.len as usize {
+        if self.card.is_some() || n == 0 || at + n > self.len as usize || self.gone.load(Ordering::Relaxed) {
             return 0;
         }
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4860,9 +4875,23 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let old = buffers().remove(&(start, resource));
     if let Some(old) = old {
+        // A copy-back still pending must not write through addresses the
+        // title has taken back (see [`Shadow::gone`]).
+        if let Some(shadow) = &old.shadow
+            && copy_back_gone()
+        {
+            shadow.gone.store(true, Ordering::Relaxed);
+        }
         crate::memory::ownership_changed(start, old.end - start);
         BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     }
+}
+
+/// Whether a buffer the title released stops its copy's copy-backs
+/// ([`Shadow::gone`]); on by default, `VICTORY_COPY_BACK_GONE=0`: as before.
+fn copy_back_gone() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_BACK_GONE").is_none_or(|v| v != "0"))
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -6571,6 +6600,69 @@ mod lookup_tests {
         assert!(same(&lookup_reading(at, 1, false, false).unwrap(), &plain), "the plain window is the table's now");
         assert!(same(&find_root(at, RootKind::Uav).unwrap(), &plain));
         LOOSE.write().unwrap().remove(&(start, len));
+    }
+
+    /// A copy-back still pending when the title gives the buffer back (and
+    /// takes the addresses again for something of its own) writes nothing:
+    /// the byte a shader wrote for a submission that is over does not land in
+    /// the new use of the memory. After upstream VIctory #3036 (FIND-14).
+    /// A copy that is not gone is the control: the same byte goes back.
+    #[test]
+    fn a_pending_copy_back_writes_nothing_into_a_buffer_the_title_gave_back() {
+        let _one = crate::address_space();
+        if crate::host::host().is_none() || !super::copy_back_gone() {
+            return; // no host GPU, or turned off for this run
+        }
+        let memory = vec![0u8; 5 * crate::watch::PAGE];
+        let first = (memory.as_ptr() as usize).next_multiple_of(crate::watch::PAGE);
+        // A shader writes byte 24 of a copy for a submission: what the
+        // submission's copy-back leaves at that address, where the memory is
+        // as it was when the submission began (zeros: what a fresh
+        // allocation of the title's holds; a byte the title changed is its
+        // own and stays anyway, `back_piece`).
+        let run = |page: usize, gone: bool| -> u8 {
+            let copy = super::exact(page as u64, crate::watch::PAGE as u64).unwrap();
+            assert!(copy.update(page, crate::watch::PAGE) > 0);
+            copy.writing(page, 64);
+            super::take_snapshots();
+            // SAFETY: the copy's mapping, one page; the test's memory.
+            unsafe {
+                copy.data.add(24).write(0x99);
+            }
+            copy.gone.store(gone, std::sync::atomic::Ordering::Relaxed);
+            copy.copy_back(page, 64);
+            copy.copy_back_done(&[(page, page + 64)]);
+            drop(copy);
+            super::EXACT.lock().unwrap().map.remove(&(page as u64, crate::watch::PAGE as u64));
+            // SAFETY: the test's memory.
+            unsafe { (page as *const u8).add(24).read_volatile() }
+        };
+        assert_eq!(run(first, false), 0x99, "a copy that is not gone puts the shader's byte back");
+        assert_eq!(run(first + 2 * crate::watch::PAGE, true), 0, "one that is gone leaves what the title put there");
+    }
+
+    /// A buffer the title releases says so to its copy ([`Shadow::gone`]),
+    /// and nothing goes back from a copy that is gone.
+    #[test]
+    fn a_released_buffers_copy_is_gone_and_a_live_ones_is_not() {
+        let _one = crate::address_space();
+        if crate::host::host().is_none() || !super::copy_back_gone() {
+            return; // no host GPU, or turned off for this run
+        }
+        const LEN: usize = 1 << 16;
+        let memory = vec![0u8; 2 * LEN];
+        let at = (memory.as_ptr() as usize).next_multiple_of(LEN) as u64;
+        let (a, b) = (0x73_0001usize, 0x73_0002usize);
+        register(a, at, 0x1000);
+        register(b, at + 0x1000, 0x1000);
+        let one = lookup_as(at + 0x10, 0x10, false, false, false).expect("a host copy");
+        let two = lookup_as(at + 0x1010, 0x10, false, false, false).expect("a host copy");
+        assert!(!one.gone.load(std::sync::atomic::Ordering::Relaxed) && !two.gone.load(std::sync::atomic::Ordering::Relaxed));
+        unregister(a, at);
+        assert!(one.gone.load(std::sync::atomic::Ordering::Relaxed), "the released buffer's copy is gone");
+        assert!(!two.gone.load(std::sync::atomic::Ordering::Relaxed), "the other is not");
+        assert_eq!(one.copy_back(at as usize, 16), 0);
+        unregister(b, at + 0x1000);
     }
 
     /// The answers a thread remembers (`VICTORY_SHADOW_CACHE=1`) are the
