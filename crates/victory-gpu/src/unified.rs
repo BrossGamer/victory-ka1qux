@@ -426,7 +426,7 @@ fn known_not_here(cell: u64, reach: bool) -> Option<Reason> {
 
 /// Whether the host's shared GPU memory has room for a heap of `bytes`
 /// more beside what the copies and uploads need.
-fn room(bytes: u64) -> bool {
+pub(crate) fn room(bytes: u64) -> bool {
     match crate::host::host().and_then(|h| h.video_memory_groups()) {
         // A budget of nothing is no information (the software adapter).
         Some([_, shared]) => shared[0] == 0 || shared[1] + bytes + RESERVE <= shared[0],

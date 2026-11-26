@@ -157,14 +157,31 @@ impl Drop for OwnView {
     fn drop(&mut self) {
         let mut left = LEFT_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
         left.push(self.0);
-        left.retain(|&at| {
-            // SAFETY: a view of ours that nothing reads any more.
-            let unmapped = unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) } != 0;
-            if unmapped {
-                STRETCHES[1].fetch_sub(1, Ordering::Relaxed);
-            }
-            !unmapped
-        });
+        unmap_left(&mut left);
+    }
+}
+
+/// Unmaps the views of ours in `left` that nothing holds any more; the
+/// others (a heap on them still stands) stay for the next try.
+fn unmap_left(left: &mut Vec<usize>) {
+    left.retain(|&at| {
+        // SAFETY: a view of ours that nothing reads any more.
+        let unmapped = unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) } != 0;
+        if unmapped {
+            STRETCHES[1].fetch_sub(1, Ordering::Relaxed);
+        }
+        !unmapped
+    });
+}
+
+/// Tries again the views of ours that could not be unmapped yet. A view is
+/// tried at every drop of one; `crate::port`, whose regions may be let go
+/// while a heap on their view stands a moment longer, calls this now and
+/// then.
+pub(crate) fn retry_views() {
+    let mut left = LEFT_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    if !left.is_empty() {
+        unmap_left(&mut left);
     }
 }
 
@@ -189,6 +206,43 @@ pub(crate) fn place_stretch(device: &ID3D12Device, start: u64, len: u64, section
     place_run(device, start, len, section, offset)
 }
 
+/// Why [`open_stretch`] gave no heap.
+pub(crate) enum StretchError {
+    /// The stretch could not be mapped again: the host's answer.
+    NotMapped(std::io::Error),
+    /// A page of it is not committed.
+    NotCommitted,
+    /// The host refused the heap.
+    Refused(windows::core::Error),
+}
+
+/// A view of ours on `bytes` of `section` from byte `from` (a multiple of
+/// 64 KiB, inside the section): the same physical pages the title's views
+/// show, committed through them, and a heap opened on it
+/// (`OpenExistingHeapFromAddress1`). The heap goes before the view (which
+/// stays mapped while it stands, [`OwnView`]). Any number of buffers may be
+/// placed in the heap ([`place`]): [`place_run`] makes a heap for each
+/// window, `crate::port` keeps one for a whole stretch.
+pub(crate) fn open_stretch(device: &ID3D12Device, section: usize, from: u64, bytes: u64) -> Result<(ID3D12Heap, OwnView), StretchError> {
+    // SAFETY: a section the runtime told us of, alive while the title has
+    // views of it (it has one over this stretch now); inside it.
+    let view = unsafe {
+        mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize)
+    };
+    if view.Value.is_null() {
+        return Err(StretchError::NotMapped(std::io::Error::last_os_error()));
+    }
+    STRETCHES[1].fetch_add(1, Ordering::Relaxed);
+    let own = OwnView(view.Value as usize);
+    // Every page committed (the section is made reserved: a page is
+    // committed when the title first maps or writes it), or the host refuses.
+    if !committed_whole(own.0, bytes as usize) {
+        return Err(StretchError::NotCommitted);
+    }
+    let heap = open(device, From::Part(own.0, bytes as usize)).map_err(StretchError::Refused)?;
+    Ok((heap, own))
+}
+
 /// [`place_stretch`] for a stretch of any length (`crate::unified` has its
 /// own least length).
 pub(crate) fn place_run(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
@@ -199,29 +253,23 @@ pub(crate) fn place_run(device: &ID3D12Device, start: u64, len: u64, section: us
         STRETCHES[4].fetch_add(1, Ordering::Relaxed);
         return Err(None);
     };
-    // SAFETY: a section the runtime told us of, alive while the title has
-    // views of it (it has one over this stretch now); inside it.
-    let view = unsafe {
-        mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize)
-    };
-    if view.Value.is_null() {
-        if STRETCHES[4].fetch_add(1, Ordering::Relaxed) < 8 {
-            tracing::warn!(error = %std::io::Error::last_os_error(), start = format_args!("{start:#x}"), bytes, "a stretch of title memory could not be mapped again");
+    let (heap, own) = match open_stretch(device, section, from, bytes) {
+        Ok(opened) => opened,
+        Err(StretchError::NotMapped(error)) => {
+            if STRETCHES[4].fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(%error, start = format_args!("{start:#x}"), bytes, "a stretch of title memory could not be mapped again");
+            }
+            return Err(None);
         }
-        return Err(None);
-    }
-    STRETCHES[1].fetch_add(1, Ordering::Relaxed);
-    let own = OwnView(view.Value as usize);
-    // Every page committed (the section is made reserved: a page is
-    // committed when the title first maps or writes it), or the host refuses.
-    if !committed_whole(own.0, bytes as usize) {
-        STRETCHES[3].fetch_add(1, Ordering::Relaxed);
-        return Err(None);
-    }
-    let heap = open(device, From::Part(own.0, bytes as usize)).map_err(|e| {
-        STRETCHES[5].fetch_add(1, Ordering::Relaxed);
-        Some(e)
-    })?;
+        Err(StretchError::NotCommitted) => {
+            STRETCHES[3].fetch_add(1, Ordering::Relaxed);
+            return Err(None);
+        }
+        Err(StretchError::Refused(e)) => {
+            STRETCHES[5].fetch_add(1, Ordering::Relaxed);
+            return Err(Some(e));
+        }
+    };
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
@@ -328,6 +376,15 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again and
+/// [`title_memory_freeing`] looks for it.
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -342,6 +399,9 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // The regions of renderer port 1 there are no longer what the title
+    // shows (what is placed in them goes below, with the rest).
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -888,6 +948,15 @@ pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
 }
 
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike ([`run_around`] with no
+/// limit), if all of the range is in it: what one view of ours on the
+/// section could show, and one heap opened on it.
+pub(crate) fn stretch(at: usize, len: usize) -> Option<Run> {
+    let run = run_around(at, 0, usize::MAX)?;
+    (run.start <= at && at.saturating_add(len.max(1)) <= run.end).then_some(run)
+}
+
 /// Whether `[at, at + len)` is private memory, all committed and
 /// read-write: what [`From::Part`] takes. One question to Windows (it
 /// walks the page tables to the end of the pages that share the first
@@ -914,7 +983,7 @@ fn hr<T>(result: &windows::core::Result<T>) -> String {
 
 /// A queue, a list and a fence of the probe's own on `device`: nothing of
 /// the host's submissions is touched.
-struct Rig {
+pub(crate) struct Rig {
     device: ID3D12Device,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -934,7 +1003,7 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
+    pub(crate) fn new(device: &ID3D12Device) -> windows::core::Result<Rig> {
         // SAFETY: plain creation of objects of our own.
         unsafe {
             let queue: ID3D12CommandQueue =
@@ -979,7 +1048,7 @@ impl Rig {
     }
 
     /// What the GPU reads of `size` bytes of `resource` from `offset`.
-    fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
+    pub(crate) fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
         self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
@@ -994,7 +1063,7 @@ impl Rig {
     }
 
     /// The GPU writes `bytes` at `offset` of `resource` (a copy).
-    fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
+    pub(crate) fn store(&mut self, resource: &ID3D12Resource, offset: u64, bytes: &[u8]) -> windows::core::Result<()> {
         let up = self.committed(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64, D3D12_RESOURCE_STATE_GENERIC_READ)?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds the buffer's bytes until unmapped.
@@ -1569,7 +1638,7 @@ pub(crate) fn tick() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over
