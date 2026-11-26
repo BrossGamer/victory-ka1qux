@@ -801,6 +801,8 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        // GPU upload heaps (`VICTORY_WINDOW_UPLOAD=1`, `crate::window_upload`)
+        crate::window_upload::note_device(&device);
         // native 16-bit operations: translated shaders then do the console's f16 arithmetic in
         // `half` (`VICTORY_F16_IN_F32=1` keeps it in f32; after upstream VIctory's pull
         // request 2825)

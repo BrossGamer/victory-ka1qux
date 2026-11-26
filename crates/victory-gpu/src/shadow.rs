@@ -89,6 +89,10 @@ pub(crate) struct Shadow {
     card: Option<Card>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
+    /// A window whose one buffer is in a GPU upload heap
+    /// (`crate::window_upload`): its bytes, counted with the windows on the
+    /// card; 0 for any other copy.
+    uploaded: u64,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
     /// heap opened on the title memory itself, so shaders read and write
     /// the title's own bytes and nothing is copied either way. The heap,
@@ -252,10 +256,17 @@ static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
 pub(crate) fn card_room_kept() -> u64 {
-    if !card_room_kept_on() || !cards() {
+    if !card_room_kept_on() {
         return 0;
     }
-    card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    // (Plus the part of the budget of windows in GPU upload heaps not used
+    // yet: `VICTORY_WINDOW_UPLOAD=1`.)
+    let buffers = if cards() {
+        card_limits().1.saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
+    } else {
+        0
+    };
+    buffers + window_room_kept()
 }
 
 /// The copies in the card's memory, by the copy's address (no other copy
@@ -461,6 +472,90 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+thread_local! {
+    /// Whether the ask this thread is making is of a kind that only reads the
+    /// window it gets: a window made for it may then go to a GPU upload heap
+    /// ([`window_upload_for`]). Set by [`find_root`] for root constant buffer
+    /// and shader resource views and by [`find_any_reading`].
+    static READS_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// [`lookup`] for an ask that only reads what it gets ([`READS_ONLY`]).
+fn lookup_reading(address: u64, len: u64, any: bool, cbv: bool) -> Option<Arc<Shadow>> {
+    READS_ONLY.set(true);
+    let found = lookup(address, len, any, cbv);
+    READS_ONLY.set(false);
+    found
+}
+
+/// A window of `size` bytes as one buffer in a GPU upload heap, and where it
+/// is mapped, if `VICTORY_WINDOW_UPLOAD=1` and the device has such heaps
+/// (`crate::window_upload`), the window is for an ask that only reads it, it
+/// fits the budget of windows on the card ([`window_card_most`]) and the card
+/// has room for it. Its bytes are counted with the windows' from here.
+fn window_upload_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let most = window_card_most();
+    if most == 0 || !crate::window_upload::enabled() || !READS_ONLY.get() {
+        return None;
+    }
+    let host = host()?;
+    // A buffer kept from a window let go is counted already.
+    if let Some(kept) = crate::window_upload::take(size) {
+        return Some(kept);
+    }
+    // As the texture queue keeps this room free ([`card_room_kept`]), the
+    // window may go up to the line it keeps ([`card_for`]).
+    let hundredths = if card_room_kept_on() { 97 } else { 80 };
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 100 * hundredths
+    {
+        window_upload_said(1, size);
+        return None;
+    }
+    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > most {
+        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        window_upload_said(2, size);
+        return None;
+    }
+    let made = host.gpu_upload_buffer(size);
+    if made.is_none() {
+        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+    } else {
+        window_upload_said(0, size);
+    }
+    made
+}
+
+/// Said at the first window that went to a GPU upload heap, and each of those
+/// turned down for the card's room or the most asked, and then now and again.
+fn window_upload_said(which: usize, size: u64) {
+    static COUNTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+    let n = COUNTS[which].fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(64) {
+        let what = ["went to a GPU upload heap", "turned down: no room on the card for", "turned down: the most is reached at"][which];
+        tracing::info!(
+            "windows outside buffers in GPU upload heaps (VICTORY_WINDOW_UPLOAD=1, VICTORY_CARD_WINDOWS_MB={}): {what} one of {} KiB; \
+             so far {} made, {} turned down for the card's room, {} for the most asked; {} MB of windows on the card",
+            window_card_most() >> 20,
+            size >> 10,
+            COUNTS[0].load(Ordering::Relaxed),
+            COUNTS[1].load(Ordering::Relaxed),
+            COUNTS[2].load(Ordering::Relaxed),
+            WINDOW_CARD_BYTES.load(Ordering::Relaxed) >> 20
+        );
+    }
+}
+
+/// The part of the budget of windows on the card that is not used, which the
+/// texture queue keeps free while windows go to GPU upload heaps
+/// ([`card_room_kept`]).
+fn window_room_kept() -> u64 {
+    if !crate::window_upload::enabled() {
+        return 0;
+    }
+    window_card_most().saturating_sub(WINDOW_CARD_BYTES.load(Ordering::Relaxed))
 }
 
 /// The copies in the card's memory whose CPU side changed since they were
@@ -2402,6 +2497,10 @@ impl Drop for Shadow {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
         let window = self.window;
+        if self.uploaded != 0 && !crate::window_upload::give(&self.buffer, self.data, self.uploaded) {
+            // Not kept for a window to come: no longer counted.
+            WINDOW_CARD_BYTES.fetch_sub(self.uploaded, Ordering::Relaxed);
+        }
         if let Some(card) = &mut self.card {
             if window {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
@@ -2855,6 +2954,7 @@ impl Shadow {
             },
             card: None,
             window: false,
+            uploaded: 0,
             place: None,
             marks: None,
             marked_now: std::sync::atomic::AtomicBool::new(false),
@@ -3094,6 +3194,9 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
+        if self.uploaded != 0 {
+            crate::window_upload::write_declared();
+        }
         if self.place.is_some() {
             // Through a view of ours on the title's section: declared all
             // the same, so that when the submission is done the guards are
@@ -4757,9 +4860,20 @@ impl RootKind {
 /// buffer object gets a window of its own size ([`cbv_windows`]) and not
 /// the 4 MiB cell its address is in.
 pub(crate) fn find_root(address: u64, kind: RootKind) -> Option<Arc<Shadow>> {
-    let shadow = lookup(address, 1, false, kind == RootKind::Cbv && cbv_windows())?;
+    let cbv = kind == RootKind::Cbv && cbv_windows();
+    // A constant buffer or shader resource view only reads.
+    let shadow = if kind == RootKind::Uav { lookup(address, 1, false, cbv)? } else { lookup_reading(address, 1, false, cbv)? };
     shadow.ask_kinds.fetch_or(kind.bit(), Ordering::Relaxed);
     Some(shadow)
+}
+
+/// [`find_any`] for a vertex or index stream, which shaders only read: its
+/// window may be in a GPU upload heap (`crate::window_upload`).
+pub(crate) fn find_any_reading(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !fine() {
+        return lookup_reading(address, len, false, false);
+    }
+    lookup_reading(address, len, true, false)
 }
 
 /// The most a constant buffer view reads (Direct3D 12's limit, 4,096
@@ -5260,11 +5374,16 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
     // which a window in place must reach too.
     let unified = crate::unified::on();
     let (need_end, need_reach) = if cbv { (address.saturating_add(CBV_MOST), false) } else { (end, unsized_ask) };
+    // Whether the ask only reads the window it gets: one in a GPU upload heap
+    // is for such asks only (`crate::window_upload`).
+    let reads = READS_ONLY.get();
     // A window that is there (nearly every ask): under the shared lock.
     {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         let held = if unified { in_place_holder(&map, address, need_end, need_reach) } else { None };
-        if let Some(shadow) = held.or_else(|| map.get(&pick(&map))) {
+        if let Some(shadow) = held.or_else(|| map.get(&pick(&map)))
+            && (shadow.uploaded == 0 || reads)
+        {
             note(shadow);
             return Some(shadow.clone());
         }
@@ -5272,13 +5391,24 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
     // In place, made before the lock is taken (the host calls take a
     // while); dropped if another thread made a window meanwhile.
     let made = if unified { crate::unified::make(address, need_end, need_reach) } else { None };
+    // A window in a GPU upload heap that an ask that may write takes out of
+    // the table: dropped after the lock (what holds it keeps it).
+    let mut swapped: Option<Arc<Shadow>> = None;
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
     // Chosen again: another thread may have made one meanwhile.
     let (start, len) = pick(&map);
     let held = if unified { in_place_holder(&map, address, need_end, need_reach) } else { None };
     if let Some(shadow) = held.or_else(|| map.get(&(start, len))) {
-        note(shadow);
-        return Some(shadow.clone());
+        if shadow.uploaded == 0 || reads {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        // Read by the CPU where it compares and copies back what shaders
+        // write, and that is slow from the card's memory: a plain window
+        // takes its place, made below, and the one in the GPU upload heap
+        // stays for the lists and slots that have it (they only read it).
+        crate::window_upload::swapped_for_a_plain_window();
+        swapped = map.remove(&(start, len));
     }
     if let Some(made) = made {
         use std::collections::btree_map::Entry;
@@ -5312,6 +5442,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    // In a GPU upload heap, for an ask that only reads: one buffer in the
+    // card's memory, which the CPU fills and shaders read (no marks: nothing
+    // writes it).
+    if reads && let Some((buffer, data)) = window_upload_for(len) {
+        crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} in a GPU upload heap"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+        shadow.window = true;
+        shadow.uploaded = len;
+        let shadow = Arc::new(shadow);
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        drop(map);
+        drop(swapped);
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -6166,6 +6313,46 @@ mod lookup_tests {
             }
         }
         panic!("a count moved five times while a registration waited for the table's lock");
+    }
+
+    /// A window in a GPU upload heap (`VICTORY_WINDOW_UPLOAD=1`) is for asks
+    /// that only read it: those get it, and an ask that may write (a root
+    /// unordered access view) takes it out of the table and gets a plain
+    /// window, which the asks after it get too. The upload window is stood
+    /// in for here by a plain one marked as such (a device with GPU upload
+    /// heaps is not needed).
+    #[test]
+    fn a_window_in_a_gpu_upload_heap_is_for_asks_that_only_read() {
+        use super::{LOOSE, RootKind, Shadow, WINDOW, WINDOW_CARD_BYTES, find_root, lookup_reading, window_of};
+        use std::sync::atomic::Ordering;
+        let Some(host) = crate::host::host() else {
+            eprintln!("no host GPU: skipped");
+            return;
+        };
+        // An address no title memory is at, so no buffer of another test holds it.
+        let at = 0x6a00_0000_0000u64 + 0x123;
+        let (start, len) = window_of(at, at + 1, WINDOW);
+        let (buffer, data) = host.shared_buffer(len).expect("a buffer");
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let mut upload = Shadow::new(buffer, data, gpu, start, len);
+        upload.window = true;
+        upload.uploaded = len;
+        let upload = Arc::new(upload);
+        // (Counted as a window made in such a heap is.)
+        WINDOW_CARD_BYTES.fetch_add(len, Ordering::Relaxed);
+        LOOSE.write().unwrap().insert((start, len), upload.clone());
+        let same = |a: &Arc<Shadow>, b: &Arc<Shadow>| Arc::ptr_eq(a, b);
+        assert!(same(&lookup_reading(at, 1, false, false).unwrap(), &upload), "a read ask gets it");
+        assert!(same(&find_root(at, RootKind::Srv).unwrap(), &upload), "a root shader resource view reads");
+        assert!(same(&find_root(at, RootKind::Cbv).unwrap(), &upload), "a root constant buffer view reads");
+        // An ask that may write: a plain window, in the table from now.
+        let plain = find_root(at, RootKind::Uav).unwrap();
+        assert!(!same(&plain, &upload), "a root unordered access view must not get it");
+        assert_eq!(plain.uploaded, 0);
+        assert!(same(&lookup_reading(at, 1, false, false).unwrap(), &plain), "the plain window is the table's now");
+        assert!(same(&find_root(at, RootKind::Uav).unwrap(), &plain));
+        LOOSE.write().unwrap().remove(&(start, len));
     }
 
     /// The answers a thread remembers (`VICTORY_SHADOW_CACHE=1`) are the
