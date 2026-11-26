@@ -4804,14 +4804,147 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true, false)
 }
 
+/// Whether [`lookup`] remembers, per recording thread, the copies it
+/// answered asks with, and answers a repeat from there while the title's
+/// buffers have not changed (`VICTORY_SHADOW_CACHE=1`; off by default: every
+/// ask looks in the table under its shared lock, as before).
+///
+/// Every view of every draw asks, on every recording thread: the table's
+/// lock is shared, but taking it is a write to one cache line all the
+/// threads own in turn, and the search of the table is a walk of a tree.
+/// (From fxceless/victory-fork pull request #1224, Steenax6/VIctory-NVID
+/// 2e21055, where the table's lock cost the recording threads 32 ms a frame.)
+fn lookup_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SHADOW_CACHE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "each recording thread remembers the host copy an address range was answered with, while the title's                  buffers stand as they were (VICTORY_SHADOW_CACHE=1)"
+            );
+        }
+        on
+    })
+}
+
+/// An answer [`lookup`] gave from a buffer's copy: the ask, the
+/// [`buffer_generation`] it was given at, and the copy (weak: a remembered
+/// answer holds nothing, so a copy goes when it went before).
+struct Answer {
+    address: u64,
+    end: u64,
+    generation: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+/// Answers remembered per thread, by ask.
+const ANSWERS: usize = 512;
+
+thread_local! {
+    static ANSWERED: std::cell::RefCell<Vec<Option<Answer>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Asks this thread answered from its memory, and asks it took to the
+    /// table, since it last added them to [`ANSWER_STATS`] (counted here, not
+    /// on a counter all threads share, which is what the memory is there to
+    /// spare them).
+    static COUNTED: [std::cell::Cell<u64>; 2] = const { [std::cell::Cell::new(0), std::cell::Cell::new(0)] };
+}
+
+/// Asks answered from a thread's memory, and asks that went to the table
+/// (each added in steps of [`HIT_STEP`] per thread), since the last frame
+/// line.
+static ANSWER_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+const HIT_STEP: u64 = 4096;
+
+/// Counts an ask ([`ANSWER_STATS`]): `which` 0 answered from the memory, 1
+/// taken to the table.
+fn count_ask(which: usize) {
+    COUNTED.with(|c| {
+        let n = c[which].get() + 1;
+        if n >= HIT_STEP {
+            ANSWER_STATS[which].fetch_add(n, Ordering::Relaxed);
+            c[which].set(0);
+        } else {
+            c[which].set(n);
+        }
+    });
+}
+
+/// Where an ask is remembered.
+fn answer_slot(address: u64, end: u64) -> usize {
+    let h = (address ^ end.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (h >> 40) as usize % ANSWERS
+}
+
+/// The copy [`lookup`] answered `[address, end)` with on this thread, if the
+/// title's buffers are as they were at `generation` and the copy is still
+/// there. It is then the answer the table gives: what the table answers
+/// depends on the buffers in it and on which have a copy, and only what bumps
+/// [`BUFFER_GENERATION`] takes a copy away or changes which buffer an ask
+/// takes.
+fn answered(address: u64, end: u64, generation: u64) -> Option<Arc<Shadow>> {
+    let shadow = ANSWERED.with(|a| {
+        let a = a.borrow();
+        let hit = a.get(answer_slot(address, end))?.as_ref()?;
+        (hit.generation == generation && hit.address == address && hit.end == end).then(|| hit.shadow.upgrade()).flatten()
+    })?;
+    count_ask(0);
+    Some(shadow)
+}
+
+/// Remembers that `shadow` answered `[address, end)` at `generation`, read
+/// before the table was looked in: a change since makes the answer old at
+/// once, never new.
+fn remember(address: u64, end: u64, generation: u64, shadow: &Arc<Shadow>) {
+    ANSWERED.with(|a| {
+        let mut a = a.borrow_mut();
+        if a.is_empty() {
+            a.resize_with(ANSWERS, || None);
+        }
+        a[answer_slot(address, end)] = Some(Answer { address, end, generation, shadow: Arc::downgrade(shadow) });
+    });
+}
+
+/// For the frame line: how the memory of answers did (`VICTORY_SHADOW_CACHE=1`).
+pub(crate) fn lookup_line(frames: f64) {
+    if !lookup_cache() {
+        return;
+    }
+    let [hits, misses] = [0, 1].map(|i| ANSWER_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "asks for a title buffer's host copy per frame (VICTORY_SHADOW_CACHE=1): {hits:.0} answered from a recording          thread's memory (counted in steps of {HIT_STEP} per thread), {misses:.0} went to the table"
+    );
+}
+
 fn lookup(address: u64, len: u64, any: bool, cbv: bool) -> Option<Arc<Shadow>> {
+    // A root constant buffer view's ask may be answered with a small window
+    // of its own (`cbv`); such asks neither use nor fill the memory of
+    // answers, so another kind of ask is never handed a window cut for one.
+    lookup_as(address, len, any, cbv, !cbv && lookup_cache())
+}
+
+/// [`lookup`], with the memory of answers ([`lookup_cache`]) or without.
+fn lookup_as(address: u64, len: u64, any: bool, cbv: bool, cache: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    // Read before the table is: a change that comes between makes what is
+    // remembered below old at once.
+    let generation = buffer_generation();
+    if cache {
+        if let Some(shadow) = answered(address, end, generation) {
+            return Some(shadow);
+        }
+        count_ask(1);
+    }
     // The copy is there for nearly every ask: found under the shared lock.
     {
         let map = buffers_shared();
         let found = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end);
         match found {
-            Some((_, Entry { shadow: Some(shadow), .. })) => return Some(shadow.clone()),
+            Some((_, Entry { shadow: Some(shadow), .. })) => {
+                if cache {
+                    remember(address, end, generation, shadow);
+                }
+                return Some(shadow.clone());
+            }
             // To be made: below, alone.
             Some(_) => {}
             None => {
@@ -5885,4 +6018,46 @@ pub(crate) fn stale_report() -> String {
         STALE[1].load(Ordering::Relaxed),
         STALE[2].load(Ordering::Relaxed),
     )
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{lookup_as, register, unregister};
+    use std::sync::Arc;
+
+    /// The answers a thread remembers (`VICTORY_SHADOW_CACHE=1`) are the
+    /// table's: the same copy while the table stands, the inner buffer once
+    /// one is added, the outer one again when it goes, and not the copy of a
+    /// buffer taken out. (After fxceless/victory-fork pull request #1224.)
+    #[test]
+    fn remembered_answers_follow_the_table() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        if crate::host::host().is_none() {
+            return; // no host GPU
+        }
+        let find = |address: u64, len: u64| lookup_as(address, len, false, false, true);
+        const LEN: usize = 1 << 16;
+        // SAFETY: a plain allocation of our own.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let at = memory as u64;
+        let (outer, inner) = (0x71_0001usize, 0x71_0002usize);
+        register(outer, at, LEN as u64);
+        let one = find(at + 0x100, 0x40).expect("a host copy");
+        for _ in 0..3 {
+            assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &one));
+        }
+        register(inner, at + 0x100, 0x100);
+        let two = find(at + 0x100, 0x40).expect("the inner buffer's copy");
+        assert!(!Arc::ptr_eq(&two, &one), "the inner buffer, added since");
+        assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &two));
+        unregister(inner, at + 0x100);
+        assert!(Arc::ptr_eq(&find(at + 0x100, 0x40).unwrap(), &one), "the outer again");
+        unregister(outer, at);
+        assert!(find(at + 0x100, 0x40).is_none_or(|s| !Arc::ptr_eq(&s, &one)), "not the copy of a buffer gone");
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
 }

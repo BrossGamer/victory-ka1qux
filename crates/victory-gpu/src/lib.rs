@@ -31,6 +31,8 @@ pub mod device;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
+mod awake;
+#[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
