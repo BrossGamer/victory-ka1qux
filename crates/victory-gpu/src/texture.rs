@@ -871,7 +871,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
     let on_demand = if staging.on_demand { crate::resource::host_tiled(resource) } else { None };
     if let Some(on_demand) = on_demand {
         let staging = staging.clone();
-        list.defer_host(move || {
+        list.defer_tiles(move || {
             // A staging buffer no detiling has filled holds no level: told
             // to the host copy as "none are held", that took the tiles'
             // levels out of what its views show, and its slots read zeros
@@ -1001,7 +1001,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
         fresh: fresh & !unzeroed,
         ran: std::sync::atomic::AtomicBool::new(false),
     };
-    list.defer_host(move || {
+    list.defer_tiles(move || {
         step.ran.store(true, std::sync::atomic::Ordering::Relaxed);
         step.on_demand.card_wrote(levels, memory);
     });
