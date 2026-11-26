@@ -5362,9 +5362,16 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool, cbv: bool) -> Opt
     };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
-        shadow.used.store(crate::host::moment(), Ordering::Relaxed);
-        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        crate::host::touch(&shadow.used);
+        // (With `VICTORY_COARSE_CLOCK=1`, read first: the lines are shared by
+        // all the recording threads.)
+        let read_first = crate::host::coarse_clock();
+        if !read_first || shadow.asked[0].load(Ordering::Relaxed) > address {
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+        }
+        if !read_first || shadow.asked[1].load(Ordering::Relaxed) < end {
+            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+        }
         if unsized_ask {
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }

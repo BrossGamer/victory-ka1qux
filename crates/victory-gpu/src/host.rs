@@ -98,7 +98,80 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    let ms = if coarse_clock() { coarse_ms() } else { now_ms() };
+    (crate::frame::current() << 32) | ((ms / 100) & 0xffff_ffff)
+}
+
+/// Whether what is noted tens of thousands of times a frame by the recording
+/// threads is cheaper (`VICTORY_COARSE_CLOCK=1`; off by default): the time of
+/// a note comes from the system's tick (16 ms; [`coarse_ms`]) where the
+/// performance counter's is about 25 ns a read, and a note that would write
+/// what is there already ([`touch`]) writes nothing, so that the line it is
+/// in is not taken from the other threads that read it. After
+/// avatarmanz/VIctory-7900XTX a1bdba4 (`coarse_ms`, "read first"), where
+/// they are on without a switch.
+pub(crate) fn coarse_clock() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COARSE_CLOCK").is_some_and(|v| v == "1"))
+}
+
+/// [`now_ms`] to the system's tick (16 ms): a few nanoseconds where the
+/// performance counter's are 25. For what is noted and read in tenths of a
+/// second ([`moment`]).
+pub(crate) fn coarse_ms() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    // The same beginning as `now_ms`.
+    static BEGAN: OnceLock<u64> = OnceLock::new();
+    // SAFETY: a plain query.
+    let now = unsafe { GetTickCount64() };
+    now.saturating_sub(*BEGAN.get_or_init(|| now.saturating_sub(now_ms())))
+}
+
+/// Notes in `used` that it was used this [`moment`]: with
+/// `VICTORY_COARSE_CLOCK=1` only if it says another (the same moment is most
+/// asks of a frame, from five threads).
+pub(crate) fn touch(used: &std::sync::atomic::AtomicU64) {
+    touch_at(used, moment(), coarse_clock());
+}
+
+/// [`touch`] at `now`, reading first if `read_first`; whether it stored.
+fn touch_at(used: &std::sync::atomic::AtomicU64, now: u64, read_first: bool) -> bool {
+    if read_first && used.load(Ordering::Relaxed) == now {
+        return false;
+    }
+    used.store(now, Ordering::Relaxed);
+    true
+}
+
+#[cfg(test)]
+mod coarse_tests {
+    use super::{coarse_ms, now_ms, touch_at};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The system's tick reads as `now_ms` does, to within its resolution.
+    #[test]
+    fn the_coarse_clock_reads_as_the_fine_one_to_the_tick() {
+        for _ in 0..3 {
+            let (coarse, fine) = (coarse_ms(), now_ms());
+            assert!(coarse.abs_diff(fine) <= 100, "coarse {coarse} ms, fine {fine} ms");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let before = coarse_ms();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(coarse_ms() >= before, "the coarse clock goes on");
+    }
+
+    /// A note of use stores when it says another moment, and, reading first,
+    /// leaves the line alone when it says the same.
+    #[test]
+    fn a_note_of_the_same_moment_stores_nothing_when_reading_first() {
+        let used = AtomicU64::new(7);
+        assert!(!touch_at(&used, 7, true), "the same moment: nothing stored");
+        assert!(touch_at(&used, 8, true) && used.load(Ordering::Relaxed) == 8);
+        // Not reading first: stored every time, as before.
+        assert!(touch_at(&used, 8, false) && used.load(Ordering::Relaxed) == 8);
+        assert!(touch_at(&used, 9, false) && used.load(Ordering::Relaxed) == 9);
+    }
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
