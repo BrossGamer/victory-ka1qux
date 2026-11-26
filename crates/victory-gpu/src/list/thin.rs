@@ -683,14 +683,14 @@ extern "system" fn copy_texture_region_x(
 /// Makes the calls of a stream on `list`: how many, and whether the last one
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
-    let (mut i, mut calls, mut closed) = (0, 0, false);
+    let (mut i, mut calls, mut closed) = (0, 0u64, false);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
         let w = &stream[i + 1..i + 1 + len];
         i += 1 + len;
         calls += 1;
-        if calls % 64 == 0 {
+        if calls.is_multiple_of(64) {
             skip = left();
         }
         if skip && op != CLOSE && op != RESET {
@@ -955,7 +955,7 @@ mod tests {
         front(list).begin(0, null);
         topology(list, 4);
         let place = allocate_upload(list, 256, 64);
-        assert!(!place.is_null() && place as usize % 64 == 0, "memory is handed out at the call");
+        assert!(!place.is_null() && (place as usize).is_multiple_of(64), "memory is handed out at the call");
         // SAFETY: 256 bytes handed out just now.
         unsafe { place.write_bytes(7, 256) };
         assert_eq!(list_close(list), S_OK);

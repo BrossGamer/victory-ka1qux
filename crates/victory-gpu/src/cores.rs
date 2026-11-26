@@ -160,7 +160,7 @@ static ASKED: Mutex<Vec<Asked>> = Mutex::new(Vec::new());
 
 /// The ids a thread of `kind` is given, the `n`th of the busy ones if it is
 /// one.
-fn ids_for<'a>(plan: &'a Plan, kind: Kind, busy_before: usize) -> (&'a [u32], &'static str) {
+fn ids_for(plan: &Plan, kind: Kind, busy_before: usize) -> (&[u32], &'static str) {
     match kind {
         Kind::Lane if !plan.lane.is_empty() => (&plan.lane, "a core of its own"),
         Kind::Busy if busy_before < plan.busy.len() => (&plan.busy[busy_before], "a core of its own"),
