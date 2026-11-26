@@ -127,3 +127,15 @@ pub use watch::{
     title_memory_remapped, title_memory_remapping, title_memory_remapping_range, title_memory_written,
     title_pages_changed, title_pages_told, writing_async as kernel_will_write_async, writing_held as kernel_will_write,
 };
+
+/// Tests that map, commit and free memory of their own, and look at tables
+/// the layer keeps by address (write watching, windows of title memory, the
+/// runs found in private memory), take this for their whole run: memory one
+/// of them frees is memory another is given at the same address, with what
+/// the first left in those tables still there, and the two tests found each
+/// other's guards and windows when the whole suite ran at once.
+#[cfg(all(test, windows))]
+pub(crate) fn address_space() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

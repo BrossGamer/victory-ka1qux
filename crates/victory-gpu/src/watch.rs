@@ -2358,6 +2358,7 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        let _one = crate::address_space();
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(
@@ -2396,6 +2397,7 @@ mod tests {
     /// lands and the block counts as written.
     #[test]
     fn kernel_reads_into_guarded_blocks_after_opening() {
+        let _one = crate::address_space();
         use std::io::{Read, Seek, Write};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
@@ -2453,6 +2455,7 @@ mod tests {
     /// nothing guarded to open.
     #[test]
     fn a_view_guarded_before_it_is_told_of_is_writable_after() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
             MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
@@ -2503,6 +2506,7 @@ mod tests {
     /// told when it is done. A range not all clean is not armed.
     #[test]
     fn armed_blocks_keep_their_bytes_from_before_the_first_write() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
         };
@@ -2561,6 +2565,7 @@ mod tests {
     /// again, so a kernel write into them still succeeds.
     #[test]
     fn blocks_of_an_asynchronous_write_stay_open() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
@@ -2596,6 +2601,7 @@ mod tests {
     /// knows, is opened by a write to it instead of the write faulting on.
     #[test]
     fn a_read_only_view_block_no_guard_knows_opens_on_a_write() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY,
             UnmapViewOfFile, VirtualProtect,
@@ -2630,6 +2636,7 @@ mod tests {
 
     #[test]
     fn writes_in_partly_committed_view_blocks_are_reported() {
+        let _one = crate::address_space();
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -2691,6 +2698,7 @@ mod tests {
     /// or mapped since.
     #[test]
     fn a_range_that_begins_in_an_unmapped_block_is_guarded() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
@@ -2784,6 +2792,7 @@ mod tests {
     /// counts as written.
     #[test]
     fn neighbouring_guarded_blocks_are_opened_in_views_and_across_them() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
@@ -2879,6 +2888,7 @@ mod tests {
     /// again (they cannot be guarded) until the runtime maps them.
     #[test]
     fn unmapped_blocks_are_reported_once_until_mapped() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
             MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,

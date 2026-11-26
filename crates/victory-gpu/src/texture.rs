@@ -1884,6 +1884,7 @@ mod short_tests {
     /// side, and its staging buffer begins at the title's first mip it has.
     #[test]
     fn a_texture_made_short_of_room_is_staged_from_the_mips_it_has() {
+        let _one = crate::address_space();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         use windows_sys::Win32::System::Memory::*;
         const BYTES: usize = 2 << 20;
@@ -1932,6 +1933,7 @@ mod remap_tests {
     /// unrelated memory, or of an empty range, must leave it alone.
     #[test]
     fn a_remap_under_a_staged_texture_makes_it_upload_again() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::*;
         const PAGE_RUN: usize = 0x1_0000;
         // Two 64 KiB runs: the texture lives in the first, the second is
@@ -1981,6 +1983,7 @@ mod title_memory_tests {
     /// (fork pull request #765).
     #[test]
     fn a_staging_buffer_no_detiling_filled_judges_no_level() {
+        let _one = crate::address_space();
         use std::sync::atomic::Ordering::Relaxed;
         use windows_sys::Win32::System::Memory::*;
         if !crate::tiles::wanted() {
@@ -2035,6 +2038,7 @@ mod title_memory_tests {
     /// for one), as those it holds are when their memory is.
     #[test]
     fn levels_below_the_staging_buffers_first_are_not_held() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::*;
         // 1024x1024 BC7, 11 levels, all of its memory mapped.
         let rdesc = [3, 0, 0, 0, 1024, 0, 1024, (11 << 16) | 1, 98, 1, 0, 0x105, 0, 0];
@@ -2062,6 +2066,7 @@ mod title_memory_tests {
 
     #[test]
     fn a_streamed_mip_can_be_mapped_between_two_unmapped_ends() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::*;
         const MIP: usize = 64 << 10;
         const SIZE: usize = 4 * MIP;
@@ -2092,6 +2097,7 @@ mod title_memory_tests {
     /// zeros are zeros whatever the read buffer held before.
     #[test]
     fn an_uncommitted_tail_reads_as_zeros() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::*;
         const HEAD: usize = 0xb_0000;
         const SIZE: usize = 0x20_0000;
@@ -2132,6 +2138,7 @@ mod title_memory_tests {
     /// 1,920 for 8).
     #[test]
     fn the_small_texture_of_runs_72_and_73_detiles_the_same_both_ways() {
+        let _one = crate::address_space();
         use windows_sys::Win32::System::Memory::*;
         for (height, within) in [(4u32, 0x300usize), (8, 0x700), (4, 0xf00), (8, 0xf00)] {
             // The description as the log printed it, word for word.

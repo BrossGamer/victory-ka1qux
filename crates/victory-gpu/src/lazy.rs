@@ -1527,6 +1527,7 @@ mod tests {
 
     #[test]
     fn pages_outside_the_buffer_and_freed_pages_are_never_written() {
+        let _one = crate::address_space();
         test_on();
         let own = Own::new(3);
         // A stretch over the buffer's first page edge: only whole pages

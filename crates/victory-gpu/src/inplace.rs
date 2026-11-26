@@ -1653,6 +1653,7 @@ mod tests {
     /// Only private memory committed whole, read-write, is taken for a part.
     #[test]
     fn only_private_memory_committed_whole_is_a_part() {
+        let _one = crate::address_space();
         // SAFETY: an allocation of the test's own.
         unsafe {
             let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE, mem::PAGE_NOACCESS).cast::<u8>();
@@ -1715,6 +1716,7 @@ mod tests {
     /// whole is turned down without asking the host.
     #[test]
     fn warp_a_title_buffer_in_place_shows_its_bytes_at_its_offset() {
+        let _one = crate::address_space();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
@@ -1761,6 +1763,7 @@ mod tests {
     /// seen at the title's address. Not all committed: turned down.
     #[test]
     fn warp_a_stretch_of_a_section_in_place_through_a_view_of_ours() {
+        let _one = crate::address_space();
         let Some(device) = warp() else { return };
         if device.cast::<ID3D12Device13>().is_err() {
             return;
@@ -1803,6 +1806,7 @@ mod tests {
     /// The census names each kind of memory.
     #[test]
     fn census_tells_private_memory_from_views() {
+        let _one = crate::address_space();
         // SAFETY: an allocation of the test's own.
         unsafe {
             let base = mem::VirtualAlloc(std::ptr::null(), 8 * K64, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE) as u64;

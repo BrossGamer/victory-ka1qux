@@ -232,6 +232,7 @@ mod tests {
     /// false, the prints before the hole made, and the thread goes on.
     #[test]
     fn a_page_that_is_not_there_ends_the_pass_without_a_fault() {
+        let _one = crate::address_space();
         install();
         const PAGE: usize = 4096;
         // SAFETY: memory of the test's own.
