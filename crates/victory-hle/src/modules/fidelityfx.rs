@@ -66,22 +66,26 @@ const GET_RENDER_RESOLUTION: u64 = 0x1_0003;
 const DISPLAY_RESOLUTION_MOTION_VECTORS: u32 = 1 << 1;
 
 /// What AMD's documentation calls the named scaling modes: per-dimension
-/// factors 1.5 (Quality), 1.7 (Balanced), 2.0 (Performance) (FidelityFX SDK,
-/// `docs/techniques/super-resolution-ml.md`, "Scaling modes").
+/// factors 1.5 (Quality), 1.7 (Balanced), 2.0 (Performance), 3.0 (Ultra
+/// Performance) (FidelityFX SDK, `docs/techniques/super-resolution-ml.md`,
+/// "Scaling modes").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Preset {
     Quality,
     Balanced,
     Performance,
+    UltraPerformance,
 }
 
 impl Preset {
-    /// `quality`, `balanced` or `performance`, in any case.
+    /// `quality`, `balanced`, `performance` or `ultra-performance` (also
+    /// `ultra_performance` or `ultra`), in any case.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "quality" => Some(Self::Quality),
             "balanced" => Some(Self::Balanced),
             "performance" => Some(Self::Performance),
+            "ultra-performance" | "ultra_performance" | "ultra" => Some(Self::UltraPerformance),
             _ => None,
         }
     }
@@ -91,6 +95,7 @@ impl Preset {
             Self::Quality => "quality",
             Self::Balanced => "balanced",
             Self::Performance => "performance",
+            Self::UltraPerformance => "ultra-performance",
         }
     }
 
@@ -100,6 +105,7 @@ impl Preset {
             Self::Quality => 1,
             Self::Balanced => 2,
             Self::Performance => 3,
+            Self::UltraPerformance => 4,
         }
     }
 
@@ -109,6 +115,7 @@ impl Preset {
             Self::Quality => 1.5,
             Self::Balanced => 1.7,
             Self::Performance => 2.0,
+            Self::UltraPerformance => 3.0,
         }
     }
 
@@ -147,7 +154,7 @@ impl Request {
             return Ok(Self::Off);
         }
         Preset::from_name(value).map(Self::Preset).ok_or_else(|| {
-            format!("VICTORY_FSR={value}: expected quality, balanced, performance or off")
+            format!("VICTORY_FSR={value}: expected quality, balanced, performance, ultra-performance or off")
         })
     }
 
@@ -968,6 +975,7 @@ mod tests {
             (Preset::Quality, 1.5, 1),
             (Preset::Balanced, 1.7, 2),
             (Preset::Performance, 2.0, 3),
+            (Preset::UltraPerformance, 3.0, 4),
         ] {
             assert_eq!(preset.ratio(), ratio);
             assert_eq!(preset.quality_mode(), mode);
@@ -977,9 +985,11 @@ mod tests {
         assert_eq!(Preset::Quality.render_size([3840, 2160]), [2560, 1440]);
         assert_eq!(Preset::Balanced.render_size([3840, 2160]), [2258, 1270]);
         assert_eq!(Preset::Performance.render_size([3840, 2160]), [1920, 1080]);
+        assert_eq!(Preset::UltraPerformance.render_size([3840, 2160]), [1280, 720]);
         assert_eq!(Preset::Quality.render_size([1920, 1080]), [1280, 720]);
         assert_eq!(Preset::from_name(" Quality "), Some(Preset::Quality));
-        assert_eq!(Preset::from_name("ultra"), None);
+        assert_eq!(Preset::from_name("ultra"), Some(Preset::UltraPerformance));
+        assert_eq!(Preset::from_name("native"), None);
     }
 
     #[test]
