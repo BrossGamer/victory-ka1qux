@@ -6112,8 +6112,61 @@ pub(crate) fn stale_report() -> String {
 
 #[cfg(test)]
 mod lookup_tests {
-    use super::{lookup_as, register, unregister};
+    use super::{buffer_generation, buffers, lookup_as, register, unregister};
     use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::time::{Duration, Instant};
+
+    /// A registration or a release is counted ([`BUFFER_GENERATION`]) only
+    /// once the table has it: one that waits for the table's lock has not
+    /// counted, so a thread that reads the count and then the table never
+    /// keeps the old table's answer under the new count. The order that
+    /// fxceless/victory-fork pull request #1245 (and its by-hand version
+    /// bc6ee68e) fixed in the fork's cache: there the count came before the
+    /// insert. Here [`register`] and [`unregister`] count after the table
+    /// changed, and this test keeps it so. No card is needed: the key is the
+    /// address of a stack slot. Tried up to five times: an unrelated test may
+    /// count in the same moments (memory let go in place).
+    #[test]
+    fn a_registration_or_release_waiting_for_the_table_has_not_counted() {
+        for attempt in 0..5u64 {
+            let slot = [0u64; 8];
+            let start = (&raw const slot) as u64 + attempt * 8;
+            let resource = start as usize;
+            let table = buffers();
+            let before = buffer_generation();
+            let ready = Barrier::new(2);
+            let (counted_while_waiting, listed) = std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    ready.wait();
+                    register(resource, start, 8);
+                });
+                ready.wait();
+                // Time for a writer that counted before the lock to show it;
+                // one that waits for the lock stays blocked all the while.
+                let until = Instant::now() + Duration::from_millis(50);
+                while buffer_generation() == before && Instant::now() < until {
+                    std::thread::yield_now();
+                }
+                let counted = buffer_generation() != before;
+                let listed = table.contains_key(&(start, resource));
+                drop(table);
+                writer.join().unwrap();
+                (counted, listed)
+            });
+            let registered = buffer_generation();
+            // (The release waits for the lock the same way: here it does not
+            // wait, and counts when the entry is gone.)
+            unregister(resource, start);
+            assert!(!listed, "the entry is in the table the registration waits for");
+            assert!(registered != before, "the registration counted nothing");
+            assert!(buffer_generation() != registered, "the release counted nothing");
+            if !counted_while_waiting {
+                return;
+            }
+        }
+        panic!("a count moved five times while a registration waited for the table's lock");
+    }
 
     /// The answers a thread remembers (`VICTORY_SHADOW_CACHE=1`) are the
     /// table's: the same copy while the table stands, the inner buffer once
