@@ -774,6 +774,17 @@ const ANCHOR3B: [u8; 64] = [
     15, 15, 15, 15, 15, 15, 15, 3, 15, 15, 8,
 ];
 
+/// The channel rotation of a BC7 block: only modes 4 and 5 have the 2-bit
+/// field; in the other modes those control bits mean something else, and
+/// reading them as a rotation swapped channels (upstream VIctory PR #3111).
+fn rotation(ctrl: u16) -> usize {
+    if matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Endpoint bits of R G B A per mode (public), before p-bits and rotation.
 const BC7_BITS: [[u8; 4]; 8] = [
     [4, 4, 4, 0],
@@ -804,7 +815,7 @@ fn pbits(mode: u16) -> bool {
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -906,7 +917,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1243,6 +1254,22 @@ fn bc6<'a>(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn bc7_rotation_is_read_only_in_modes_4_and_5() {
+        for mode in 0u16..8 {
+            for rot in 0u16..4 {
+                let ctrl = (rot << 3) | mode;
+                let want = if matches!(mode, 4 | 5) {
+                    usize::from(rot)
+                } else {
+                    0
+                };
+                assert_eq!(rotation(ctrl), want, "mode {mode} rot {rot}");
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_tables_parse() {
         assert!(super::Tables::builtin().is_ok());
