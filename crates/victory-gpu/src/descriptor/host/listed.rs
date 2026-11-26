@@ -43,7 +43,7 @@ type Mark = Option<(usize, (u32, u32))>;
 /// A hash for a record's words: the standard library's is several times what
 /// this is, and it is run for every view of every table.
 #[derive(Default)]
-struct WordsHash(u64);
+pub(crate) struct WordsHash(u64);
 
 impl std::hash::Hasher for WordsHash {
     fn finish(&self) -> u64 {
@@ -232,6 +232,33 @@ impl HostHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tables of records that differ get hashes that differ (the key of a
+    /// table made afresh, `VICTORY_RECORD_HASH=1`).
+    #[test]
+    fn records_that_differ_hash_apart() {
+        use std::hash::{Hash, Hasher};
+        let of = |records: &[[u32; 3]]| {
+            let mut h = WordsHash::default();
+            records.iter().for_each(|r| r.hash(&mut h));
+            h.finish()
+        };
+        let mut seen = std::collections::HashSet::new();
+        // One record, one word or two of it different; runs of zeros; order.
+        for a in 0..64u32 {
+            for b in 0..64u32 {
+                for c in [0, 1, 0x8000_0000, u32::MAX] {
+                    assert!(seen.insert(of(&[[a, b, c]])), "{a} {b} {c}");
+                    assert!(seen.insert(of(&[[1, 2, 3], [a, b, c]])), "{a} {b} {c} after");
+                    assert!(seen.insert(of(&[[a, b, c], [1, 2, 3], [0, 0, 0]])), "{a} {b} {c} before");
+                }
+            }
+        }
+        assert!(seen.insert(of(&[])));
+        // (One record of zeros is among the above.)
+        let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
+        assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
 
     /// A view is made once in a recording, and again in the next one; a
     /// record that gives no view is asked again; the slots run out.

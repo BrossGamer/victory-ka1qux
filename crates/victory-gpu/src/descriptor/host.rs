@@ -16,7 +16,7 @@ use crate::host::host;
 mod listed;
 #[cfg(feature = "diagnostics")]
 pub(crate) use listed::line as list_views_line;
-pub(crate) use listed::list_views;
+pub(crate) use listed::{WordsHash, list_views};
 
 pub(crate) struct BufferRanges<T> {
     passes: u64,

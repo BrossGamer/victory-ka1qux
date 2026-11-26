@@ -870,6 +870,15 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether the key of a table made afresh (what its records hold) is hashed
+/// with a cheaper hash (`VICTORY_RECORD_HASH=1`; off by default). After
+/// avatarmanz/VIctory-7900XTX a1bdba4 and 4e77a879 (`RecordHash`; there on
+/// without a switch).
+fn record_hash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECORD_HASH").is_some_and(|v| v == "1"))
+}
+
 /// What a render target or depth view of the host is made from: the host
 /// texture, and [`crate::descriptor::RtvRecord::key`].
 type TargetKey = (usize, (usize, [u32; 7]));
@@ -3832,17 +3841,29 @@ impl State {
             }
             // The table and what its entries hold (record words).
             let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    half.contains(&(slot, k * 8)).hash(&mut h);
-                }
-                (table, n, h.finish())
+                // (A cheaper hash with `VICTORY_RECORD_HASH=1`: the standard
+                // library's took 3 % of the recording threads' time.)
+                let hashed = |mut h: &mut dyn std::hash::Hasher| {
+                    use std::hash::Hash;
+                    for k in 0..n {
+                        let at = table + u64::from(k) * 32;
+                        // SAFETY: a descriptor slot in title memory.
+                        unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                        // (Another table than the same slots made for a shader
+                        // that reads them in the title's formats.)
+                        half.contains(&(slot, k * 8)).hash(&mut h);
+                    }
+                };
+                let hash = if record_hash() {
+                    let mut h = crate::descriptor::host::WordsHash::default();
+                    hashed(&mut h);
+                    std::hash::Hasher::finish(&h)
+                } else {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    hashed(&mut h);
+                    std::hash::Hasher::finish(&h)
+                };
+                (table, n, hash)
             };
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
