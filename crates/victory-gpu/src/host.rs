@@ -4790,6 +4790,14 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        let [ns, one_pass, blocks, partial] = crate::shadow::under_stats().map(|n| n as f64 / frames);
+        if one_pass > 0.0 || ns > 0.0 {
+            tracing::info!(
+                "  compared and put in (VICTORY_UNDER_FUSED={}): {:.3} ms a frame; {one_pass:.0} pages in one pass,                  {blocks:.0} blocks of 32 bytes put in, {partial:.2} pages left half done for want of runs",
+                u8::from(crate::shadow::under_fused()),
+                ns / 1e6
+            );
+        }
     }
     if crate::shadow::refresh_compare() {
         let [read, taken, runs] = crate::shadow::compared_stats().map(|n| n as f64 / frames);

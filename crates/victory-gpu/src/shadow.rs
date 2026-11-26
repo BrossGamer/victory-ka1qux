@@ -24,6 +24,9 @@ use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 use crate::host::{HostList, host};
 use crate::watch::PAGE;
 
+mod under;
+pub(crate) use under::{on as under_fused, stats as under_stats};
+
 thread_local! {
     /// Room for a page of title memory read to be compared with the copy
     /// ([`Shadow::copy_changed`]) and for the runs found in it, kept
@@ -4010,16 +4013,40 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    let compared = std::time::Instant::now();
+                    if under::on() && merge_gap() == 0 {
+                        // Compared and put in in one pass; the runs found are
+                        // noted at once. If the allowance ran out in the
+                        // page, what came before is in and noted, and the
+                        // flights are settled as with the page left alone
+                        // (its refresh then takes the page again).
+                        let mut runs = Vec::new();
+                        let fits = under::changed_runs_put(title, held, runs_left, &mut runs);
+                        #[cfg(feature = "diagnostics")]
+                        under::count(0, compared.elapsed().as_nanos() as u64);
+                        under::count(1, 1);
+                        MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                        self.card_changed_runs(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
+                        if !fits {
+                            under::count(3, 1);
+                            return true;
+                        }
+                    } else {
+                        let runs = joined_over(changed_runs(title, held), merge_gap());
+                        if runs.len() > *runs_left {
+                            return true;
+                        }
+                        *runs_left -= runs.len();
+                        for (r, m) in runs {
+                            held[r..r + m].copy_from_slice(&title[r..r + m]);
+                            self.card_changed(at + r, at + r + m);
+                            MERGED[1].fetch_add(1, Ordering::Relaxed);
+                            MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        }
+                        #[cfg(feature = "diagnostics")]
+                        under::count(0, compared.elapsed().as_nanos() as u64);
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -4479,6 +4506,27 @@ impl Shadow {
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// [`Shadow::card_changed`] for many runs, under one hold of the list.
+    fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        let mut runs = runs.filter(|r| r.0 < r.1).peekable();
+        if runs.peek().is_none() {
+            return;
+        }
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        for (from, to) in runs {
+            match dirty.last_mut() {
+                Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
+                _ => dirty.push((from, to)),
+            }
+        }
+        if !card.queued.swap(true, Ordering::AcqRel) {
+            CARD_QUEUE.lock().unwrap_or_else(|e| e.into_inner()).push(std::ptr::from_ref(self) as usize);
+        }
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
