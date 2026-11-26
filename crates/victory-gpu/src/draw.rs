@@ -4158,7 +4158,13 @@ impl State {
                         }
                     }
                     None => {
-                        host.make_null(index);
+                        // (Renderer port 5: a constant buffer is read as raw
+                        // bytes, through a null raw view here.)
+                        if crate::port_cbv::on() && used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                            host.null_raw_at(index);
+                        } else {
+                            host.make_null(index);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
