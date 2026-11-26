@@ -3825,6 +3825,11 @@ impl HostHeap {
             return None;
         };
         if made[index as usize] != key {
+            // (Renderer port 5: how many of the records are constant buffers.)
+            let constant = matches!(view, View::Constant(..)) && crate::port_cbv::on();
+            if constant {
+                crate::port_cbv::mirrored();
+            }
             // A new record that names the view the slot shows already (the
             // title writes its per-frame records again, with the same
             // contents, under new names): the slot stays as it is.
@@ -3837,6 +3842,9 @@ impl HostHeap {
                     made[index as usize] = key;
                     self.made_fast_set(index, key);
                     SAME_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if constant {
+                        crate::port_cbv::mirrored_same();
+                    }
                     return Some(view);
                 }
                 SAME_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5316,9 +5324,21 @@ fn heap_constants() -> bool {
 /// aligned slices at each submission.)
 /// The last of the four says whether the copy is the view's own.
 fn constant_copy(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)> {
+    constant_copy_as(address, size, crate::port_cbv::on())
+}
+
+/// [`constant_copy`], for a constant buffer made a raw view (`raw`, renderer
+/// port 5, `crate::port_cbv`) or a constant buffer view.
+fn constant_copy_as(address: u64, size: u32, raw: bool) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64, bool)> {
     let len = u64::from(size);
     let shadow = prof::part!(prof::Part::MakeFind, crate::shadow::find(address, len))?;
-    if shadow.gpu(address).is_multiple_of(256) || !heap_constants() {
+    // (A raw view begins on 16 bytes of its buffer, not on 256.)
+    let aligned = if raw {
+        crate::port_cbv::raw_ok(shadow.offset(address))
+    } else {
+        shadow.gpu(address).is_multiple_of(256)
+    };
+    if aligned || !heap_constants() {
         return Some((shadow, address, len, false));
     }
     let reach = u64::from(constant_bytes(size));
@@ -5332,15 +5352,62 @@ fn constant_copy(address: u64, size: u32) -> Option<(std::sync::Arc<crate::shado
 pub(super) struct ConstantPlan {
     shadow: std::sync::Arc<crate::shadow::Shadow>,
     desc: D3D12_CONSTANT_BUFFER_VIEW_DESC,
+    /// Renderer port 5 (`crate::port_cbv`): the raw view the slot holds in
+    /// place of the constant buffer view.
+    raw: Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+}
+
+/// The raw view of the `bytes` bytes from byte `offset` of a buffer (on 16
+/// bytes), which translated shaders read a constant buffer through while
+/// renderer port 5 is on.
+fn raw_constant_desc(offset: u64, bytes: u64) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+    D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: offset / 4,
+                NumElements: (bytes / 4) as u32,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    }
 }
 
 /// What the host's call for a constant buffer view of `size` bytes at
 /// `address` needs: the copy, and where in it the view is. `None`: it
 /// cannot be made.
 fn plan_constant(address: u64, size: u32) -> Option<ConstantPlan> {
-    let (shadow, _, _, own) = constant_copy(address, size)?;
+    plan_constant_as(address, size, crate::port_cbv::on())
+}
+
+/// [`plan_constant`], for a raw view (`raw`, renderer port 5) or a constant
+/// buffer view.
+fn plan_constant_as(address: u64, size: u32, raw: bool) -> Option<ConstantPlan> {
+    let (shadow, _, _, own) = constant_copy_as(address, size, raw)?;
     if own {
         fate(FATE_CONSTANT_OWN);
+    }
+    if raw {
+        // A raw view of the bytes the constant buffer view read, ending where
+        // the copy of the title's memory does.
+        let offset = shadow.offset(address);
+        let bytes = crate::port_cbv::view_bytes(size).min(shadow.left(address)) & !3;
+        if !crate::port_cbv::raw_ok(offset) || bytes == 0 {
+            fate(FATE_CONSTANT_OFF_256);
+            once!(
+                address = format_args!("{address:#x}"),
+                "constant buffer not on 16 bytes of its host copy, or empty"
+            );
+            return None;
+        }
+        return Some(ConstantPlan {
+            shadow,
+            desc: D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
+            raw: Some(raw_constant_desc(offset, bytes)),
+        });
     }
     let gpu = shadow.gpu(address);
     if gpu % 256 != 0 {
@@ -5355,7 +5422,7 @@ fn plan_constant(address: u64, size: u32) -> Option<ConstantPlan> {
         BufferLocation: gpu,
         SizeInBytes: constant_bytes(size),
     };
-    Some(ConstantPlan { shadow, desc })
+    Some(ConstantPlan { shadow, desc, raw: None })
 }
 
 /// A buffer view ([`plan_view`]) settled but not made.
@@ -5416,7 +5483,13 @@ fn make_planned(plan: Option<&Plan>, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<
         Plan::Constant(plan) => {
             // SAFETY: a slot of our heap; the range lies in the host copy.
             prof::part!(prof::Part::MakeCreate, {
-                unsafe { host.device.CreateConstantBufferView(Some(&plan.desc), at) };
+                match &plan.raw {
+                    Some(raw) => {
+                        unsafe { host.device.CreateShaderResourceView(&plan.shadow.buffer, Some(raw), at) };
+                        crate::port_cbv::slot_made();
+                    }
+                    None => unsafe { host.device.CreateConstantBufferView(Some(&plan.desc), at) },
+                }
                 Some(Some(plan.shadow.held()))
             })
         }
@@ -5710,6 +5783,8 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Placed(false, _, desc) => {
             return null_like(desc[..10].try_into().unwrap_or(&[0; 10]), at);
         }
+        // (Renderer port 5: shaders read constant buffers as raw bytes.)
+        View::Constant(..) if crate::port_cbv::on() => return null_buffer_view(at),
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
@@ -6505,6 +6580,94 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(read[620..].iter().all(|&b| b == 0xEE), "nothing else was written");
         drop((others, typed_copy, structured_copy, cbv_copy));
         crate::shadow::force_exact_sub(None);
+        crate::shadow::unregister(RESOURCE, start);
+    }
+
+    /// Renderer port 5 (`crate::port_cbv`): a constant buffer of the title's
+    /// on 16 bytes of its copy, but not on 256, is a raw view of the shared
+    /// copy (no copy of its own, as a constant buffer view needs), reads the
+    /// 256-byte rows a constant buffer view read and no more, and one off 16
+    /// bytes still gets its own copy.
+    #[test]
+    fn a_constant_buffer_on_16_bytes_is_a_raw_view_of_the_shared_copy() {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        use windows::core::s;
+        const SOURCE: &str = "#define RS \"DescriptorTable(SRV(t0)), UAV(u0)\"\n\
+            ByteAddressBuffer c : register(t0);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            [RootSignature(RS)]\n\
+            [numthreads(80, 1, 1)]\n\
+            void main(uint3 id : SV_DispatchThreadID) {\n\
+                dst.Store(id.x * 4, c.Load(id.x * 4));\n\
+            }\n";
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        let Ok(mut rig) = crate::inplace::Rig::new(&host.device) else {
+            return;
+        };
+        let Some((out, out_data)) = host.shared_buffer(4096) else {
+            return;
+        };
+        const RESOURCE: usize = 0x62_0073;
+        let title: Vec<u8> = (0..16384usize).map(|i| (i * 7 + 3) as u8).collect();
+        let start = title.as_ptr() as u64;
+        crate::shadow::register(RESOURCE, start, title.len() as u64);
+        // 16 bytes in: on 16 bytes of the copy, not on 256.
+        let whole = constant_copy_as(start + 16, 64, true).unwrap();
+        assert!(!whole.3, "no copy of its own");
+        assert_eq!(whole.0.span(), (start, title.len() as u64), "the buffer's own copy");
+        let plan = plan_constant_as(start + 16, 64, true).expect("a plan");
+        assert!(plan.raw.is_some(), "a raw view");
+        // The same view as a constant buffer view needs a copy of its own.
+        assert!(constant_copy_as(start + 16, 64, false).unwrap().3);
+        // Off 16 bytes: a copy of its own, from its first byte.
+        let off = constant_copy_as(start + 20, 64, true).unwrap();
+        assert!(off.3 && off.0.span().0 == start + 20, "off 16 bytes: its own copy");
+        let made = make_planned(Some(&Plan::Constant(plan.clone())), heap.cpu(0)).expect("a view").expect("a host resource");
+        assert!(made.is_of(&plan.shadow), "the slot shows the copy the pass updates");
+        assert!(plan.shadow.update(start as usize, title.len()) > 0);
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names live through the call; then the blob's
+        // own bytes, which hold the root signature too.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("raw"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None).unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, bytes).unwrap();
+            let pso = host
+                .device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            (root, pso)
+        };
+        // SAFETY: a live buffer; an open list of the rig's; the slot views a live buffer.
+        unsafe {
+            std::ptr::write_bytes(out_data, 0xEE, 4096);
+            let gpu = out.GetGPUVirtualAddress();
+            rig.run(|list| {
+                list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootDescriptorTable(0, heap.gpu_handle(0));
+                list.SetComputeRootUnorderedAccessView(1, gpu);
+                list.Dispatch(1, 1, 1);
+            })
+            .unwrap();
+        }
+        // SAFETY: the buffer's mapping; the card is done.
+        let read = unsafe { std::slice::from_raw_parts(out_data, 320) };
+        assert_eq!(&read[..256], &title[16..272], "the 256 bytes the constant buffer view read");
+        assert!(read[256..].iter().all(|&b| b == 0), "nothing past the view's end");
+        drop((whole, off, made));
         crate::shadow::unregister(RESOURCE, start);
     }
 

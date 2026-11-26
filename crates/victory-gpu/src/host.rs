@@ -8493,6 +8493,13 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, false).map(|(gpu, data, _)| (gpu, data))
+    }
+
+    /// [`HostList::scratch`], and with `held` the buffer the memory is in
+    /// and its offset there, for a view of it (renderer port 5,
+    /// `crate::port_cbv`: the raw view of a constant buffer's copy).
+    pub(crate) fn scratch_in(&self, len: u64, held: bool) -> Option<(u64, *mut u8, Option<(ID3D12Resource, u64)>)> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -8501,8 +8508,9 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let whole = held.then(|| (buffer.clone(), 0));
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some((gpu, data, whole));
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
@@ -8521,8 +8529,9 @@ impl HostList {
         }
         let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
         let at = s.used;
+        let in_chunk = held.then(|| (s.chunks[s.current].0._buffer.clone(), at));
         s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        Some((gpu + at, (data + at as usize) as *mut u8, in_chunk))
     }
 
     /// The bytes of scratch chunks the list holds now (after a reset:
@@ -10020,6 +10029,7 @@ impl Meter {
         crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
         crate::port::log(frames);
+        crate::port_cbv::log(frames);
         late_line(frames);
         bake_line(frames);
         card_clock_line(frames, ms);
