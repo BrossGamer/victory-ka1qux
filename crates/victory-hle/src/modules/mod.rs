@@ -18,6 +18,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod fidelityfx;
+#[cfg(windows)]
 pub mod files;
 pub mod gameinput;
 pub mod kernel;
@@ -75,5 +77,11 @@ pub(crate) fn all() -> Vec<HleModule> {
     }
     #[cfg(windows)]
     all.push(xsystem::module());
+    // Held only while the host's FidelityFX serves; else the title's own
+    // loader runs.
+    #[cfg(windows)]
+    if fidelityfx::serving() {
+        all.push(fidelityfx::module());
+    }
     all
 }

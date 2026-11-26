@@ -170,6 +170,44 @@ missing in some launches and not in others):
   [LilBigJP/ztrx-ps5-save-import](https://github.com/LilBigJP/ztrx-ps5-save-import),
   to load a story save converted from another console and test the open world.
 
+**Upscaling and display** (all off unless you supply AMD's DLLs; nothing is
+downloaded, and none of them ships here)
+
+- The title's FidelityFX calls (the upscaler that Series S mode uses) can run on
+  your GPU through AMD's PC build instead of the console build.
+  Get the [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+  (release v2.4.0 was current on 2026-11-25) and copy
+  `Kits/FidelityFX/signedbin/amd_fidelityfx_upscaler_dx12.dll` (the only file
+  loaded; the folder's other DLLs may go along) into a `fidelityfx` folder
+  beside `victory.exe`, or name the folder with
+  `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`; the SDK's root works).
+  Without the file, or if it offers no upscaler for the GPU, the log says so in
+  one line and the title's own DLLs run. AMD's documentation says FSR 4
+  requires an AMD 7000 series discrete GPU or an AMD 9000 series GPU or later
+  (SDK `docs/techniques/super-resolution-ml.md`, which lists the RX 7800 XT
+  under its INT8 model), so the Radeon this was measured on is covered.
+- `VICTORY_FSR=quality|balanced|performance|off`. Unset, the host serves
+  whatever FidelityFX calls the title makes when the DLL is there; `off` never
+  does. A preset also makes a Series X title that does not use FidelityFX on
+  its own pick it, rendering at AMD's named ratio of its output size (1.5x:
+  2560x1440 for 3840x2160; 1.7x: 2258x1270; 2x: 1920x1080), through a
+  *title profile* (`VICTORY_FSR_PROFILE`, or `[paths].fsr_profile`): a text
+  file you keep that says where in the title's code the upscaler is picked.
+  Nothing about a title is built into this program. The file has lines `key =
+  value` (`#` comments): `build` (optional, the executable's BLAKE3), `picker`
+  (a byte pattern, `??` for any byte, of the function that picks the upscaler:
+  replaced by `mov eax, 7; ret`), and, for the render scale, `scale` (a pattern
+  of the function), `scale.loads` (offsets in the match of its two
+  `vmovss xmm, [rip+disp32]` loads) and `scale.slot` (the offset of four `0xCC`
+  padding bytes that take the new scale). Each pattern must match exactly once
+  in the executable sections or nothing is written; the patched copy is in
+  memory only. The idea is Marvisak/VIctory PR 1793's; the log's `fsr` lines say
+  what was done, and the first dispatch says whether the title renders at the
+  preset's size.
+- Series S mode presents the world and the interface as two planes; they are
+  blended into one 1080p image (from Linox-IDK/LNX-victory), or one plane is
+  shown alone with `VICTORY_PRESENT_PLANE=<n>`.
+
 **Frame time** (the street of the open world, ~6,100 draws a frame, 0.83 s a
 frame after the merge of victory-fork's main, 0.42 s with these):
 
@@ -367,6 +405,12 @@ repository.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)** and victory-fork's
   pull request #994 by PiloteCode: the ray-tracing work ported here, and the
   material-record texture order (off by default).
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** pull request 1793
+  by AwkGrep256 (the idea of finding the title's upscaler picker by a pattern at
+  launch), **[Linox-IDK/LNX-victory](https://github.com/Linox-IDK/LNX-victory)**
+  (the Series S plane composition) and DexNom/VIctory (the host FidelityFX
+  module's context checks and input preparation); the module itself is
+  upstream's. AMD's FidelityFX SDK (MIT) names the API's descriptions.
 - **[XCL](https://github.com/xcl-dev/xcl)**: a different project with the same
   aim, whose public notes on the console's formats and on driver behaviour
   pointed at several problems. No code of it is used here.
