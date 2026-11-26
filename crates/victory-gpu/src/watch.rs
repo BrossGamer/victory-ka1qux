@@ -2258,6 +2258,10 @@ pub(crate) fn handle_write_fault(at: usize, instruction: usize) -> bool {
     }
     let handled = write_fault_locked(&mut g, at, instruction);
     drop(g);
+    if handled {
+        // Who wrote a block of the title's descriptor heap last (`crate::port_descriptors`).
+        crate::port_descriptors::faulted(at, instruction);
+    }
     add(T::GuardFaultUs, entered.elapsed().as_micros() as u64);
     add(T::GuardWaitUs, waited.as_micros() as u64);
     handled

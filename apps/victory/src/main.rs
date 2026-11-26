@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(windows)]
+mod descriptor_profile;
 mod inspect;
 #[cfg(windows)]
 mod prebuild;
@@ -234,6 +236,7 @@ fn show_config() -> Result<()> {
     println!("data_dir    : {}", cfg.data_dir.display());
     println!("fidelityfx  : {}", status(&cfg.fidelityfx_dir));
     println!("fsr_profile : {}", status(&cfg.fsr_profile));
+    println!("descriptors : {}", status(&cfg.descriptors_profile));
     for t in &cfg.test_titles {
         println!("test_title  : {}", status(&Some(t.clone())));
     }

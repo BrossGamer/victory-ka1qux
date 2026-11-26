@@ -107,6 +107,49 @@ fn select_fsr(
     Ok(())
 }
 
+/// `VICTORY_PORT_DESCRIPTORS=1` with the user's profile of the title's code
+/// (`VICTORY_DESCRIPTORS_PROFILE`, `crate::descriptor_profile`): the title's own
+/// stores of descriptor records into its heap are made to tell the layer their
+/// slots (`victory_loader::descriptor_sites`). Each store is found once by its
+/// pattern in the executable sections of the mapped image, or left alone. Run
+/// before the imports are bound and before any of the title's code runs.
+#[cfg(windows)]
+fn mark_descriptor_stores(image: &victory_loader::LoadedImage, cfg: &victory_core::Config, build: &str) -> Result<()> {
+    use crate::descriptor_profile::{Profile, patch_image};
+    if !victory_hle::port_descriptors::on() {
+        return Ok(());
+    }
+    let Some(path) = &cfg.descriptors_profile else {
+        println!(
+            "descriptors    VICTORY_PORT_DESCRIPTORS=1 without a title profile (VICTORY_DESCRIPTORS_PROFILE): the heap's changed pages are looked at as before"
+        );
+        return Ok(());
+    };
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading the descriptor profile {}", path.display()))?;
+    let profile = Profile::parse(&text).with_context(|| format!("the descriptor profile {}", path.display()))?;
+    if profile.build.as_deref().is_some_and(|b| b != build) {
+        println!(
+            "descriptors    not applied (the profile is for another build of the title): the heap's changed pages are looked at as before"
+        );
+        return Ok(());
+    }
+    let (base, size) = (image.base(), image.info().size_of_image as usize);
+    // SAFETY: the image is mapped, whole to `size_of_image`, and nothing of it
+    // has run yet; the marks are a static.
+    let out = unsafe { patch_image(base, size, &image.info().sections, &profile, victory_hle::port_descriptors::marks_address()) };
+    for note in &out.notes {
+        println!("descriptors    {note}");
+    }
+    println!(
+        "descriptors    {} of {} descriptor record stores of the title patched to mark their slots",
+        out.done,
+        profile.len()
+    );
+    victory_hle::port_descriptors::hooked(base, size, out.done);
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -155,6 +198,9 @@ pub fn run(
         image.base(),
         image.info().image_base
     );
+    if execute {
+        mark_descriptor_stores(&image, &cfg, hash.as_str())?;
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

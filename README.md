@@ -117,6 +117,34 @@ avatarmanz/VIctory-7900XTX), `VICTORY_CARD_SYNC_BATCH=1` (victory-fork #1227),
 and victory-fork's main), `VICTORY_FILL_WORKERS` (upstream #2900) and
 `VICTORY_MARKS_THREADS` (upstream #2914).
 
+**The title's descriptor stores tell their slots** (`VICTORY_PORT_DESCRIPTORS=1`
+with `VICTORY_DESCRIPTORS_PROFILE`, or `[paths].descriptors_profile`; off by
+default, not measured on the test machine yet). The layer finds the descriptor
+records the title copies into its shader-visible heap as bytes by write-watching
+the heap and reading and comparing every record of every changed 64 KiB page
+(some 290 pages and 600,000 slots a frame in the open world, 50 to 60 ms in
+`sync_heaps`). With the switch the title's few stores that fill its draws'
+tables are patched, in the copy in memory, to mark their slot in a map of ours
+(code of ours does the same store and sets two bytes), the title's `memcpy` and
+`memmove` mark the view records they copy into the heap, our own `Create*View`
+and copies mark too, and `sync_heaps` compares and mirrors only the marked
+slots. A fallback keeps it right where a store is missed: every 8
+frames (`VICTORY_PORT_DESCRIPTORS_EVERY`) the write watch is asked and 16 pages
+a frame (`VICTORY_PORT_DESCRIPTORS_CHECK`) are read whole as before; a view
+record found there that no mark told of is made, counted, and logged with the
+place in the title's code that last wrote its block. Where the stores are is
+told by a *descriptor profile* you keep, like the FSR title profile: lines `build`
+(optional, the executable's BLAKE3) and any number of `store = <offset> <length>
+: <pattern>` (the store's offset in the match and its length, then a byte
+pattern, `??` for any byte); each pattern must match exactly once in the
+executable sections or that store is left alone. The log's `descriptors` lines
+and `descriptor marks` line say what was patched and, per frame, the slots
+told, the fallback's pages and the view records it found that no mark told
+of. The idea and the code's shape are avatarmanz/VIctory-7900XTX's "Renderer
+port 2" (GPL-3.0); the stub also keeps the flags, which the original left to the
+code after the store, and the comparing is done by the code of
+`VICTORY_HEAP_SYNC_BATCH` (used here whether or not that switch is on).
+
 **Picture fixes from other projects**, on by default with a switch to go back:
 early depth for pixel shaders that ask for it (victory-fork #907, upstream
 #2085; `VICTORY_EARLY_DEPTH=0`), normalized integer codes to the nearest float

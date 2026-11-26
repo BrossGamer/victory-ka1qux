@@ -19,6 +19,9 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// The switch and marks of the descriptor stores' patch, for the launcher.
+#[cfg(windows)]
+pub use victory_gpu::port_descriptors;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

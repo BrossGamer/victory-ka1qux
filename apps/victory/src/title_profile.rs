@@ -320,7 +320,7 @@ fn find_once(
 }
 
 /// The offsets in `code` where `pattern` matches.
-fn matches(code: &[u8], pattern: &[Option<u8>]) -> Vec<usize> {
+pub(crate) fn matches(code: &[u8], pattern: &[Option<u8>]) -> Vec<usize> {
     // Look for its longest fixed run, then check the rest around each hit.
     let (anchor_at, anchor) = longest_fixed_run(pattern);
     let mut out = Vec::new();
