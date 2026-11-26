@@ -2307,3 +2307,98 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// `v_mullit_f32`, the lighting multiply: a third operand that is not a
+/// positive ordered number, or a second that is NaN, negative infinity or
+/// negative maximum-finite, gives negative maximum-finite; zero (a flushed
+/// denormal too) as either factor gives +0; a NaN left factor passes
+/// through; the output modifiers act on the result, scale before clamp.
+/// The cases and the rules are those of Marvisak/VIctory #2938.
+#[test]
+fn v_mullit_f32_applies_lighting_rules() {
+    let f = f32::to_bits;
+    let one = f(1.0);
+    let min = f(f32::MIN_POSITIVE);
+    let lowest = f(-f32::MAX);
+    let inf = f(f32::INFINITY);
+    let snan = 0x7f81_2345;
+    let qnan = 0x7fc1_2345;
+    let negative_zero = f(-0.0);
+
+    let run = |code: [u32; 2], rows: &[([u32; 4], u32)]| {
+        let shader = build_valu_cs(&code);
+        let inputs: Vec<_> = rows.iter().map(|&(inputs, _)| inputs).collect();
+        run_cases(&shader, &inputs, |backend, i, input, result| {
+            assert_eq!(
+                result, rows[i].1,
+                "{backend}: v_mullit_f32 {code:08x?}, inputs {input:08x?}"
+            );
+        });
+    };
+    let code = vop3(0x150, 0, vgpr(1), vgpr(2), vgpr(3));
+
+    run(
+        code,
+        &[
+            ([f(1.5), f(-4.0), one, 0], f(-6.0)),
+            ([f(1.5), f(4.0), inf, 0], f(6.0)),
+            ([f(-2.0), inf, one, 0], f(f32::NEG_INFINITY)),
+            ([f(f32::MAX), f(2.0), one, 0], inf),
+            ([f(2.0), lowest - 1, one, 0], f(f32::NEG_INFINITY)),
+            ([f(-1.0), lowest, one, 0], lowest),
+            ([0, f(f32::NEG_INFINITY), one, 0], lowest),
+            ([0, qnan, one, 0], lowest),
+            ([one, one, f(-1.0), 0], lowest),
+            ([one, one, negative_zero, 0], lowest),
+            ([0, inf, 1, 0], lowest),
+            ([one, one, qnan, 0], lowest),
+            ([negative_zero, inf, one, 0], 0),
+            ([inf, 1, one, 0], 0),
+            ([snan, negative_zero, one, 0], 0),
+            ([snan, one, one, 0], snan),
+            ([qnan, one, one, 0], qnan),
+            ([min, f(-0.5), one, 0], negative_zero),
+            ([min, 0x3f7f_ffff, one, 0], 0),
+            ([min + 1, 0x3f7f_fffe, one, 0], min),
+            (
+                [0x3f7f_fffe, (min + 1) | negative_zero, one, 0],
+                min | negative_zero,
+            ),
+            ([0x00f8_0000, 0x3f04_2108, one, 0], min),
+        ],
+    );
+
+    // The sign modifiers apply to the gate input and to raw NaN bits.
+    let [hi, lo] = code;
+    run([hi | 1 << 10, lo], &[([one, one, f(-1.0), 0], one)]);
+    run([hi, lo | 1 << 31], &[([one, one, one, 0], lowest)]);
+    run(
+        [hi, lo | 1 << 29],
+        &[([snan, one, one, 0], snan | negative_zero)],
+    );
+
+    // Scaling comes before the clamp; scaling alone keeps NaNs.
+    run(
+        [hi, lo | 1 << 27],
+        &[
+            ([f(0.5), f(0.5), one, 0], f(0.5)),
+            ([one, one, 0, 0], f(f32::NEG_INFINITY)),
+            ([snan, one, one, 0], snan),
+        ],
+    );
+    run(
+        [hi | 1 << 15, lo | 2 << 27],
+        &[([f(0.75), one, one, 0], one)],
+    );
+    run(
+        [hi, lo | 3 << 27],
+        &[([min, one, one, 0], 0), ([one, one, 0, 0], 0xfeff_ffff)],
+    );
+    run([hi | 1 << 15, lo], &[([snan, one, one, 0], 0)]);
+
+    // An inline float constant in src2, with the multiplicands still dynamic.
+    run(
+        vop3(0x150, 0, vgpr(1), vgpr(2), 242),
+        &[([f(2.0), f(3.0), 0, 0], f(6.0))],
+    );
+}

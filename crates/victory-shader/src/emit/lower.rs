@@ -35,6 +35,11 @@ pub(super) mod marks;
 #[path = "halves.rs"]
 mod halves;
 
+/// The lighting multiply `v_mullit_f32` (Marvisak/VIctory #2938), a child
+/// module so it shares the emitter's state.
+#[path = "lighting_mul.rs"]
+mod lighting_mul;
+
 type Why = &'static str;
 
 /// What the dwords of a descriptor the host has no value for read as.
@@ -8175,6 +8180,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_mullit_f32" => self.lighting_mul(inst, guard),
             "v_fma_f32" | "v_fmaak_f32" | "v_fmamk_f32" => {
                 // shortcut: DXIL has no fused f32 multiply-add; FMad lets the driver fuse.
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
