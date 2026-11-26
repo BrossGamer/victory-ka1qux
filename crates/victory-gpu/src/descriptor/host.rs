@@ -1743,6 +1743,10 @@ impl Drop for HostHeap {
         if let Some(named) = BAKE_NAMED.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             named.retain(|&(heap, _), _| heap != key);
         }
+        // The run of slots the title-memory-by-address module held in it.
+        if !self.sampler {
+            crate::memory::forget_heap(self);
+        }
     }
 }
 

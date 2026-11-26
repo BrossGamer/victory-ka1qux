@@ -559,6 +559,20 @@ fn title_addresses(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
     })
 }
 
+/// A view heap is gone ([`HostHeap`]'s drop): the run of slots this module
+/// kept for it goes too. The table is keyed by the heap's address, and a
+/// heap made at the same address later would otherwise find a run it never
+/// had (its slots not held for it, its copies' views counted as made)
+/// (after victory-fork pull request 1276, which did this for the two
+/// caches of the heap pass; here those are fields of the heap and go with
+/// it).
+pub(crate) fn forget_heap(heap: &HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        m.heaps.remove(&key);
+    }
+}
+
 /// `records`: the root views of the shader's root SRVs; with the builder
 /// asked for, the blocks of list upload memory they point into are looked
 /// through for title addresses (after victory-fork pull request 994,
@@ -752,6 +766,28 @@ pub(crate) fn ready(
 
 #[cfg(test)]
 mod record_tests {
+    /// The run of slots kept for a view heap does not outlive it.
+    #[test]
+    fn a_dropped_view_heap_loses_its_run_of_slots() {
+        use crate::descriptor::host::HostHeap;
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        {
+            let mut guard = super::MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = super::Memory::new();
+            }
+            guard.as_mut().expect("memory by address").heaps.insert(key, (1, 1));
+        }
+        drop(heap);
+        let guard = super::MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!guard.as_ref().expect("memory by address").heaps.contains_key(&key));
+    }
+
     #[test]
     fn title_addresses_are_found_in_geometry_records() {
         // A geometry description as the builder copies it into upload
