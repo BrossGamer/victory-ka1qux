@@ -2808,6 +2808,18 @@ pub(crate) fn unified_alive() -> [[u64; 2]; 2] {
     out
 }
 
+/// For `crate::unified`'s cap and line: the windows alive that it placed
+/// and that are shorter than `limit` bytes, as (windows, bytes).
+pub(crate) fn unified_alive_below(limit: u64) -> [u64; 2] {
+    let mut out = [0u64; 2];
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    for s in loose.values().filter(|s| s.unified & 3 != 0 && s.len < limit) {
+        out[0] += 1;
+        out[1] += s.len;
+    }
+    out
+}
+
 /// For `crate::unified`'s census: the windows alive that are copies, as
 /// (start, bytes, lowest and highest title address asked in them, whether
 /// any ask had no length).

@@ -28,7 +28,7 @@
 //! stop being consecutive before its window's end (its shader may read on),
 //! small private allocations, memory that is neither private nor a view,
 //! asks that find the host's shared GPU memory nearly used, and anything
-//! shorter than [`LEAST`]. [`Reason`] names each, the log counts them
+//! shorter than [`least`]. [`Reason`] names each, the log counts them
 //! ([`tick`]), and a diagnostics build gives a census of the copies alive
 //! with what the switch would do with each ([`census`]).
 //!
@@ -76,8 +76,9 @@ use crate::shadow::WINDOW as CELL;
 /// The longest window in place (a window is the cells its ask lies in).
 pub(crate) const EXTENT_MOST: u64 = 32 << 20;
 /// A window in place shorter than this stays a copy: each is a host heap,
-/// a buffer and (over views) a view of ours.
-const LEAST: u64 = 256 << 10;
+/// a buffer and (over views) a view of ours. `VICTORY_UNIFIED_LEAST_KB`
+/// names another length ([`least`]).
+const LEAST_DEFAULT: u64 = 256 << 10;
 /// The shortest committed run of private memory given windows in place:
 /// the title's arenas, not the allocations it makes and frees as it goes.
 const SMALLEST_RUN: u64 = 64 << 20;
@@ -106,6 +107,39 @@ pub fn in_place_on() -> bool {
     on()
 }
 
+/// The shortest window in place, in bytes (`VICTORY_UNIFIED_LEAST_KB`: 256
+/// by default; from 64, the grain heaps are opened on, to 4096, a cell).
+///
+/// A study of a normal run found 329 windows left to copies only because
+/// their run of title memory was shorter than 256 KiB (1.3 GB of cells):
+/// each a 4 MiB copy compared with the title's bytes at every refresh. In
+/// place, the shortest costs a heap of 64 KiB, a buffer and, over physical
+/// pages, a view of ours; [`say`] counts what such windows cost (the heaps,
+/// the time to open them, the host's shared GPU memory), and
+/// `VICTORY_UNIFIED_SMALL_MAX` (1024) caps how many windows shorter than
+/// [`LEAST_DEFAULT`] are alive at once.
+fn least() -> u64 {
+    static LEAST: OnceLock<u64> = OnceLock::new();
+    *LEAST.get_or_init(|| {
+        let kb = std::env::var("VICTORY_UNIFIED_LEAST_KB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        least_for(kb)
+    })
+}
+
+/// [`least`] for a setting in KiB: between the grain and a cell, 256 KiB
+/// when unset or not a number.
+fn least_for(kb: Option<u64>) -> u64 {
+    kb.map_or(LEAST_DEFAULT, |kb| kb.saturating_mul(1024).clamp(GRAIN, CELL))
+}
+
+/// The most windows alive at once that are shorter than [`LEAST_DEFAULT`]
+/// (`VICTORY_UNIFIED_SMALL_MAX`, 1024): only such windows exist with
+/// `VICTORY_UNIFIED_LEAST_KB` below 256.
+fn small_most() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_UNIFIED_SMALL_MAX").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024))
+}
+
 /// The most window bytes in place at once (`VICTORY_UNIFIED_MB`, 8192).
 fn most() -> u64 {
     static MOST: OnceLock<u64> = OnceLock::new();
@@ -130,7 +164,7 @@ pub(crate) enum Reason {
     /// consecutive before the end of its window (and the title's memory
     /// goes on).
     RootRunEnds,
-    /// Shorter than [`LEAST`].
+    /// Shorter than [`least`].
     Short,
     /// Private memory not committed read-write (or not all of the ask).
     NotWhole,
@@ -143,6 +177,9 @@ pub(crate) enum Reason {
     NoRoom,
     /// `VICTORY_UNIFIED_MB` windows are in place.
     OverCap,
+    /// `VICTORY_UNIFIED_SMALL_MAX` windows shorter than [`LEAST_DEFAULT`]
+    /// are in place.
+    SmallCap,
     /// The runtime was changing mappings in the range.
     Mapping,
     /// Our view of the pages (or the private memory) was not committed
@@ -152,7 +189,7 @@ pub(crate) enum Reason {
     Refused,
 }
 
-const REASONS: usize = 13;
+const REASONS: usize = 14;
 
 impl Reason {
     fn text(self) -> &'static str {
@@ -161,12 +198,13 @@ impl Reason {
             Reason::Neither => "memory that is neither private nor physical pages",
             Reason::NotConsecutive => "physical pages not consecutive in one section as far as the ask goes",
             Reason::RootRunEnds => "root view: physical pages stop being consecutive before its window ends",
-            Reason::Short => "a run shorter than the least window in place",
+            Reason::Short => "a run shorter than the least window in place (VICTORY_UNIFIED_LEAST_KB)",
             Reason::NotWhole => "private memory not committed read-write around the ask",
             Reason::SmallAllocation => "private memory, a committed run shorter than the title's arenas",
             Reason::TooLong => "an ask over more cells than the longest window in place",
             Reason::NoRoom => "the host's shared GPU memory is nearly used",
             Reason::OverCap => "VICTORY_UNIFIED_MB is reached",
+            Reason::SmallCap => "VICTORY_UNIFIED_SMALL_MAX is reached",
             Reason::Mapping => "the runtime was changing mappings there",
             Reason::NotCommitted => "pages not committed whole when the heap was opened",
             Reason::Refused => "the host refused the heap",
@@ -175,7 +213,7 @@ impl Reason {
 
     /// Whether the refusal may be gone a moment later (not remembered).
     fn passing(self) -> bool {
-        matches!(self, Reason::NoRoom | Reason::OverCap | Reason::Mapping)
+        matches!(self, Reason::NoRoom | Reason::OverCap | Reason::SmallCap | Reason::Mapping)
     }
 
     fn all() -> [Reason; REASONS] {
@@ -191,6 +229,7 @@ impl Reason {
             TooLong,
             NoRoom,
             OverCap,
+            SmallCap,
             Mapping,
             NotCommitted,
             Refused,
@@ -237,6 +276,24 @@ pub(crate) struct Made {
 /// of and the host's description of private memory. Makes and opens
 /// nothing.
 pub(crate) fn plan(address: u64, need_end: u64, reach: bool) -> Result<Plan, Reason> {
+    plan_with(address, need_end, reach, rules())
+}
+
+/// What [`plan`] reads of the environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Rules {
+    /// The shortest window in place, in bytes ([`least`]).
+    pub(crate) least: u64,
+}
+
+/// The rules the environment sets.
+fn rules() -> Rules {
+    static RULES: OnceLock<Rules> = OnceLock::new();
+    *RULES.get_or_init(|| Rules { least: least() })
+}
+
+/// [`plan`] under `rules`.
+pub(crate) fn plan_with(address: u64, need_end: u64, reach: bool, rules: Rules) -> Result<Plan, Reason> {
     if address < 0x1_0000 {
         return Err(Reason::Undescribed);
     }
@@ -254,7 +311,7 @@ pub(crate) fn plan(address: u64, need_end: u64, reach: bool) -> Result<Plan, Rea
         if hi < need {
             return Err(if reach { Reason::RootRunEnds } else { Reason::NotConsecutive });
         }
-        if hi - lo < LEAST {
+        if hi - lo < rules.least {
             return Err(Reason::Short);
         }
         return Ok(Plan {
@@ -277,7 +334,7 @@ pub(crate) fn plan(address: u64, need_end: u64, reach: bool) -> Result<Plan, Rea
         return Err(Reason::NotWhole);
     }
     let (lo, hi) = (cell_lo.max(lowest), cell_hi.min(highest));
-    if hi - lo < LEAST {
+    if hi - lo < rules.least {
         return Err(Reason::Short);
     }
     Ok(Plan { start: lo, len: hi - lo, kind: Kind::Private, section: 0, offset: 0, allocation, reaches: true })
@@ -399,6 +456,12 @@ static NOT_HERE: Mutex<Option<HashMap<(u64, bool), (Reason, Instant)>>> = Mutex:
 /// refused after that.
 static MADE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static LET_GO: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Since the start: windows made that are shorter than [`LEAST_DEFAULT`]
+/// (only with `VICTORY_UNIFIED_LEAST_KB` below it) and their bytes; and the
+/// microseconds the host took to open the heaps (and buffers, and our views)
+/// of all windows made.
+static SMALL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static OPENED_US: AtomicU64 = AtomicU64::new(0);
 static STAYED: AtomicU64 = AtomicU64::new(0);
 /// Asks left to a copy, by [`Reason`]: how often and the bytes of the cells
 /// they were for.
@@ -455,10 +518,18 @@ pub(crate) fn make(address: u64, need_end: u64, reach: bool) -> Option<Made> {
     if alive[0][1] + alive[1][1] + plan.len > most() {
         return refuse(cell, reach, Reason::OverCap);
     }
+    // Only with `VICTORY_UNIFIED_LEAST_KB` below 256: each such window is a
+    // heap (and over physical pages a view of ours) for less than a copy
+    // would hold, so how many there are at once is capped.
+    let small = plan.len < LEAST_DEFAULT;
+    if small && crate::shadow::unified_alive_below(LEAST_DEFAULT)[0] >= small_most() {
+        return refuse(cell, reach, Reason::SmallCap);
+    }
     if !room(plan.len) {
         return refuse(cell, reach, Reason::NoRoom);
     }
     let host = crate::host::host()?;
+    let opening = Instant::now();
     let opened = match plan.kind {
         Kind::Physical => {
             // The runtime changes no mapping in the range while our view
@@ -492,6 +563,11 @@ pub(crate) fn make(address: u64, need_end: u64, reach: bool) -> Option<Made> {
         }
     };
     let physical = plan.kind == Kind::Physical;
+    OPENED_US.fetch_add(opening.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if small {
+        SMALL[0].fetch_add(1, Ordering::Relaxed);
+        SMALL[1].fetch_add(plan.len, Ordering::Relaxed);
+    }
     MADE[if physical { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
     MADE[if physical { 1 } else { 3 }].fetch_add(plan.len, Ordering::Relaxed);
     if !physical {
@@ -601,7 +677,7 @@ pub(crate) fn tick() {
              pages that are consecutive in one section and over private memory in committed runs of {} MiB or more; windows shorter than {} KiB, \
              at most {} MB in place, {} MB of the host's shared GPU memory kept",
             SMALLEST_RUN >> 20,
-            LEAST >> 10,
+            least() >> 10,
             most() >> 20,
             RESERVE >> 20
         );
@@ -648,6 +724,38 @@ pub(crate) fn say() {
         shared,
         left
     );
+    say_costs(shared);
+}
+
+/// With `VICTORY_UNIFIED_LEAST_KB` below its default: what windows shorter
+/// than 256 KiB cost, to be read beside the frame times of the same scene
+/// with and without it. Heaps are opened for each window (and over physical
+/// pages a view of ours is mapped), so the count of heaps is the count of
+/// windows; the shared GPU memory is the host's own budget line.
+fn say_costs(shared: Option<(u64, u64)>) {
+    if least() == LEAST_DEFAULT && SMALL[0].load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let small = crate::shadow::unified_alive_below(LEAST_DEFAULT);
+    let alive = crate::shadow::unified_alive();
+    let heaps = MADE[0].load(Ordering::Relaxed) + MADE[2].load(Ordering::Relaxed);
+    tracing::info!(
+        "windows in place shorter than {} KiB (VICTORY_UNIFIED_LEAST_KB={}, at most {} alive): {} alive ({} MB); made since the start {} ({} MB); \
+         heaps of all windows alive now {} (views of ours {}), opened in {:.0} us on average (heap, buffer and view); \
+         the host's shared GPU memory in use / budget: {:?} MB; asks left to copies as shorter than the least: {}",
+        LEAST_DEFAULT >> 10,
+        least() >> 10,
+        small_most(),
+        small[0],
+        small[1] >> 20,
+        SMALL[0].load(Ordering::Relaxed),
+        SMALL[1].load(Ordering::Relaxed) >> 20,
+        alive[0][0] + alive[1][0],
+        alive[0][0],
+        OPENED_US.load(Ordering::Relaxed) as f64 / heaps.max(1) as f64,
+        shared,
+        LEFT[Reason::Short as usize][0].load(Ordering::Relaxed)
+    );
 }
 
 /// Windows in place were let go because the title's views of their pages
@@ -668,6 +776,9 @@ pub(crate) fn census() -> Vec<String> {
     let mut seen = 0usize;
     let mut tally: BTreeMap<&'static str, [u64; 3]> = BTreeMap::new();
     let mut ok = [[0u64; 3]; 2];
+    // Windows left as shorter than the least that the least of 64 KiB would
+    // place: how many, their bytes, the bytes in place.
+    let mut shorter = [0u64; 3];
     for (start, len, lowest, highest, unsized_ask) in windows {
         // Asking the host about private memory takes a millisecond or so
         // for a big arena: a look is at most half a second long.
@@ -688,6 +799,13 @@ pub(crate) fn census() -> Vec<String> {
                 let e = tally.entry(reason.text()).or_default();
                 e[0] += 1;
                 e[1] += len;
+                if reason == Reason::Short
+                    && let Ok(plan) = plan_with(address, end, unsized_ask, Rules { least: GRAIN })
+                {
+                    shorter[0] += 1;
+                    shorter[1] += len;
+                    shorter[2] += plan.len;
+                }
             }
         }
     }
@@ -704,6 +822,12 @@ pub(crate) fn census() -> Vec<String> {
     for (reason, [n, bytes, _]) in tally {
         lines.push(format!("census,   left to a copy: {reason}: {n} windows, {} MB", mb(bytes)));
     }
+    lines.push(format!(
+        "census,   VICTORY_UNIFIED_LEAST_KB=64 would place {} more ({} MB of windows, {} MB in place) of those left as shorter than the least",
+        shorter[0],
+        mb(shorter[1]),
+        mb(shorter[2])
+    ));
     lines
 }
 
@@ -764,6 +888,30 @@ mod tests {
         assert!(plan(ask, ask + 1, true).is_err());
     }
 
+    /// The least window in place is a knob: a run of two pages is a copy
+    /// by default and a window in place with the least at the grain; the
+    /// setting is kept between the grain and a cell.
+    #[test]
+    fn the_least_window_in_place_is_a_knob() {
+        let base = 0x7_c400_0000usize;
+        let section = 4343;
+        inplace::title_memory_view(base, 2 * K64, section, 0);
+        inplace::title_memory_view(base + 2 * K64, K64, section + 1, 0);
+        let ask = base as u64 + 0x1234;
+        let by_default = Rules { least: LEAST_DEFAULT };
+        assert_eq!(plan_with(ask, ask + 0x100, false, by_default), Err(Reason::Short));
+        let p = plan_with(ask, ask + 0x100, false, Rules { least: GRAIN }).expect("128 KiB is a window with the least at the grain");
+        assert_eq!((p.start, p.len, p.kind), (base as u64, 2 * K64 as u64, Kind::Physical));
+        // A single page of 64 KiB is a window with the least at the grain.
+        assert!(plan_with(base as u64 + 2 * K64 as u64 + 8, base as u64 + 2 * K64 as u64 + 16, false, Rules { least: GRAIN }).is_ok());
+        assert_eq!(least_for(None), LEAST_DEFAULT);
+        assert_eq!(least_for(Some(64)), 64 << 10);
+        assert_eq!(least_for(Some(4)), GRAIN, "below the grain: the grain");
+        assert_eq!(least_for(Some(1 << 20)), CELL, "above a cell: a cell");
+        assert_eq!(least_for(Some(u64::MAX)), CELL);
+        inplace::views_gone(base, 3 * K64);
+    }
+
     /// An ask over more cells than the longest window: not placed.
     #[test]
     fn a_window_in_place_is_at_most_so_many_cells() {
@@ -802,7 +950,7 @@ mod tests {
             assert_ne!(part, 0);
             forget_runs(0, 0);
             // The committed part ends 1 MiB past a cell's start, wherever the
-            // system put the reservation: a part that ended within `LEAST` of
+            // system put the reservation: a part that ended within the least window of
             // it would leave the last cell's window too short (a refusal that
             // came with 6 % of the addresses).
             let end = (part + SMALLEST_RUN).next_multiple_of(CELL) + (1 << 20);
