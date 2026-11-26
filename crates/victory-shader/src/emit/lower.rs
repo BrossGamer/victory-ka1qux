@@ -1527,16 +1527,19 @@ impl<'a> Lower<'a> {
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
             // exactly in waves of 32: the thread relabelling makes each host wave one half of a
             // console wave (lanes 32k..32k+31). Not when it crosses halves (`v_mbcnt`,
-            // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
+            // `v_readlane`, `v_writelane`, `ds_permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
-            // group over 32 threads with LDS): those still need 64-lane waves.
+            // group over 32 threads with LDS): those still need 64-lane waves. (`ds_bpermute`
+            // permutes lanes 0..31 and 32..63 on their own, as RDNA2 does in wave64: it stays
+            // inside a half too, `VICTORY_HALF_LOCAL=0` takes it as crossing.)
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+                let half_local = console_threads::half_local_on();
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
                         || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                         || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
+                        || n.starts_with("ds_bpermute") && !half_local
                         || reads_mask_as_data(x.st, i)
                 }) || lane_constant_masks(x.st)
                     || !x.st.wide.is_empty();
@@ -1596,7 +1599,7 @@ impl<'a> Lower<'a> {
                             "v_readlane"
                         } else if n == "v_writelane_b32" {
                             "v_writelane"
-                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") {
+                        } else if n.starts_with("ds_permute") || n.starts_with("ds_bpermute") && !half_local {
                             "ds_(b)permute"
                         } else if reads_mask_as_data(x.st, i) {
                             "mask as data"
@@ -5140,7 +5143,11 @@ impl<'a> Lower<'a> {
             // host (it left through a branch, not a guard) is read as the
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
-            if self.exchange.as_ref().is_some_and(|e| !e.1) {
+            // A console wave64 permutes its lanes 0..31 and 32..63 each on their own (RDNA2
+            // ISA, 10.4.4): the lane named is the address modulo 32 in the lane's own half,
+            // which a host wave of 32 holds whole (`VICTORY_HALF_LOCAL=0`: any lane of the wave).
+            let half = self.x.native.wave64 && console_threads::half_local_on();
+            if !half && self.exchange.as_ref().is_some_and(|e| !e.1) {
                 // a console wave of 64 run as two host waves: the lane named
                 // may be in the other one
                 return Err("a lane permute across two host waves");
@@ -5151,8 +5158,15 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            let last = self.s.m.i32(if half { 31 } else { self.wave() - 1 });
+            let mut src = self.s.m.bin(c, Bin::And, src, last);
+            if half && self.halves.is_none() {
+                // the host wave holds both halves: stay in this lane's
+                let lane = self.lane_index();
+                let upper = self.s.m.i32(32);
+                let own = self.s.m.bin(c, Bin::And, lane, upper);
+                src = self.s.m.bin(c, Bin::Or, src, own);
+            }
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -7888,9 +7902,16 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. The row mask names the
+            // four rows of a console wave64: in host waves of 32 the host lane would number
+            // the rows of the half alone (rows 0 and 1 for both).
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let of_row = if console_threads::half_local_on() && self.halves.is_some() {
+                self.console_lane_in_wave()
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, of_row, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);

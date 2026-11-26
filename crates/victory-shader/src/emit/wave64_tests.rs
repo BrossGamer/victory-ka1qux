@@ -1036,6 +1036,109 @@ fn a_skip_whose_scalar_an_inner_branch_changes_is_kept() {
     assert!(ir::without_skips(&p, true).is_none());
 }
 
+/// A wave64 program of 64 threads, all lanes running, for a host of 32-lane waves: `v1` =
+/// `0x1000_0001` + lane, `v2` = `0xDEAD_0000` + lane, `v3` = (lane + 1) * 4, then `op`, then v2
+/// stored at the lane's dword.
+fn lane_program(op: &[u32]) -> NativeProgram {
+    let mut words = vec![
+        0x4A02_00FF, // v_add_nc_u32 v1, lit, v0
+        0x1000_0001,
+        0x4A04_00FF, // v_add_nc_u32 v2, lit, v0
+        0xDEAD_0000,
+        0x4A06_0081, // v_add_nc_u32 v3, 1, v0
+        0x3406_0682, // v_lshlrev_b32 v3, 2, v3
+    ];
+    words.extend_from_slice(op);
+    words.extend_from_slice(&[
+        0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 2 << 8 | 5, // buffer_store_dword v2, v5, s[8:11], 0 offen
+    ]);
+    native_of(&words, true, 64)
+}
+
+/// `v_mov_b32_dpp v2, v1` with a row control, the row and bank write masks, no bound control.
+fn dpp_row(ctrl: u16, row_mask: u8) -> Vec<u32> {
+    vec![0x7E04_02FA, u32::from(row_mask) << 28 | 0xF << 24 | u32::from(ctrl) << 8 | 1]
+}
+
+/// `v_mov_b32_dpp8 v2, v1` taking lane 7 - n of every group of 8 in lane n.
+fn dpp8_reverse() -> Vec<u32> {
+    let sel: u32 = (0..8).map(|n| (7 - n) << (3 * n)).sum();
+    vec![0x7E04_02E9, 1 | sel << 8]
+}
+
+/// What the program of [`lane_program`] has in v1 of `lane`.
+fn lane_v1(lane: u32) -> u32 {
+    0x1000_0001 + lane
+}
+
+/// The wave64 program `op` translated for a host of `host_wave`-lane waves and run on the
+/// hardware device (None without one that takes it; an error with the translation's refusal):
+/// how many of its 64 lanes differ from `expected`.
+fn wrong_lanes(op: &[u32], expected: &dyn Fn(u32) -> u32, host_wave: u32) -> Result<Option<usize>, String> {
+    let native = lane_program(op);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lowered_on(&native, &p, &HashSet::new(), host_wave).map_err(|e| e.to_string())?;
+    let Some(got) = whole_uav(&shader, [0, 0], 64) else { return Ok(None) };
+    Ok(Some((0..64u32).filter(|&l| got[l as usize] != expected(l)).count()))
+}
+
+/// Cross-lane operations that only read lanes of their own 32-lane half of a wave64 (DPP rows,
+/// DPP8, `ds_swizzle_b32` in its group-of-32 mode, `ds_bpermute_b32`) and DPP row write masks
+/// that name the four rows of the wave, in a host of waves of 32 and of 64: the console's
+/// results (RDNA2) in all 64 lanes, with no refusal for the lanes of the other half.
+/// (After Marvisak/VIctory#3115, which refuses these where this translation, with its host
+/// waves each one half of the console's, runs them.)
+#[test]
+fn half_local_cross_lane_ops_of_wave64_match_rdna2_in_waves_of_32_and_64() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let v2 = |l: u32| 0xDEAD_0000 + l;
+    // every row (the mask names rows 0-3 of the console's 64 lanes)
+    let shr = |row_mask: u8| {
+        move |l: u32| {
+            if row_mask >> (l >> 4) & 1 != 0 && l & 15 != 0 { lane_v1(l - 1) } else { v2(l) }
+        }
+    };
+    let cases: Vec<(&str, Vec<u32>, Box<dyn Fn(u32) -> u32>)> = vec![
+        ("row_ror:4", dpp_row(0x124, 0xF), Box::new(|l| lane_v1(l & !15 | (l + 12) & 15))),
+        ("row_mirror", dpp_row(0x140, 0xF), Box::new(|l| lane_v1(l ^ 15))),
+        ("row_share:3", dpp_row(0x153, 0xF), Box::new(|l| lane_v1(l & !15 | 3))),
+        ("dpp8 reversed", dpp8_reverse(), Box::new(|l| lane_v1(l ^ 7))),
+        ("ds_swizzle_b32 SWAP(16)", ds_swizzle(2, 1, 0x401F).to_vec(), Box::new(|l| lane_v1(l ^ 16))),
+        ("ds_bpermute_b32 lane + 1 in the half", ds(0xB3, 2, 3, 1).to_vec(), Box::new(|l| lane_v1(l & 32 | (l + 1) & 31))),
+        ("row_shr:1 row_mask 0xF", dpp_row(0x111, 0xF), Box::new(shr(0xF))),
+        ("row_shr:1 row_mask 0x5", dpp_row(0x111, 0x5), Box::new(shr(0x5))),
+        ("row_shr:1 row_mask 0x3", dpp_row(0x111, 0x3), Box::new(shr(0x3))),
+        ("row_shr:1 row_mask 0xC", dpp_row(0x111, 0xC), Box::new(shr(0xC))),
+    ];
+    for host_wave in [32, 64] {
+        for (label, op, expected) in &cases {
+            let got = wrong_lanes(op, expected, host_wave);
+            assert!(matches!(got, Ok(Some(0)) | Ok(None)), "{label} in host waves of {host_wave}: {got:?}");
+        }
+        eprintln!("ran on the hardware device (host waves of {host_wave}): {} cases exact in all 64 lanes", cases.len());
+    }
+    // What the translation did before (not asserted).
+    // SAFETY: tests that read this switch hold ONE_AT_A_TIME
+    unsafe { std::env::set_var("VICTORY_HALF_LOCAL", "0") };
+    for host_wave in [32, 64] {
+        for (label, op, expected) in &cases {
+            match wrong_lanes(op, expected, host_wave) {
+                Ok(Some(n)) if n > 0 => eprintln!("before, host waves of {host_wave}: {label}: {n} of 64 lanes wrong"),
+                Err(why) => eprintln!("before, host waves of {host_wave}: {label}: refused ({why})"),
+                _ => {}
+            }
+        }
+    }
+    unsafe { std::env::remove_var("VICTORY_HALF_LOCAL") };
+}
+
+/// `ds_swizzle_b32 vdst, vaddr offset:offset`.
+const fn ds_swizzle(vdst: u8, vaddr: u8, offset: u16) -> [u32; 2] {
+    [0x36 << 26 | 0x35 << 18 | offset as u32, (vdst as u32) << 24 | vaddr as u32]
+}
+
 /// `v_writelane_b32 vN, sX, K`.
 fn writelane(n: u32, x: u32, lane: u32) -> Vec<u32> {
     vec![0xD761_0000 | n, (128 + lane) << 9 | x]

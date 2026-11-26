@@ -27,6 +27,15 @@ pub(super) fn ticket_on() -> bool {
     std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
 }
 
+/// Whether the cross-lane operations that only read lanes of their own 32-lane half of a
+/// console wave64 count the lanes by the console's (the rows of a DPP row write mask, the
+/// half of a `ds_bpermute_b32`), and run in host waves of 32 without the halves meeting.
+/// `VICTORY_HALF_LOCAL=0`: the host lane everywhere, a permute across the two host waves
+/// refused, as before.
+pub(super) fn half_local_on() -> bool {
+    std::env::var_os("VICTORY_HALF_LOCAL").is_none_or(|v| v != "0")
+}
+
 /// The dwords of group-shared memory a compute shader may have (32 KiB).
 const LDS_DWORDS_MOST: u32 = 8192;
 
@@ -88,6 +97,21 @@ impl<'a> Lower<'a> {
         self.wave_base = Some(base);
         self.wave_rank = Some(rank);
         Some(base)
+    }
+
+    /// This thread's console lane (0..63) in a console wave64: with `halves` (two host waves of
+    /// 32 lanes) its console thread index in the wave, whose host wave holds the 32 lanes of one
+    /// half; else the host lane, which is the console lane. The host lane of a half only tells
+    /// the lane within the half, which is not enough where the half itself matters (the rows 0-3
+    /// of a DPP row write mask, `VICTORY_HALF_LOCAL`).
+    pub(super) fn console_lane_in_wave(&mut self) -> V {
+        if self.halves.is_none() {
+            return self.lane_index();
+        }
+        let e = self.s.entry;
+        let f = self.console_thread();
+        let k63 = self.s.m.i32(63);
+        self.s.m.bin(e, Bin::And, f, k63)
     }
 
     /// The console thread index of this thread in the group: `wave_base` plus the lane's rank
