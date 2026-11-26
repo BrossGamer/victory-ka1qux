@@ -32,6 +32,11 @@ use windows_sys::core::BOOL;
 
 use crate::{HleExport, HleModule, hle_export};
 
+/// Where the title's physical pages lie and how it maps them: counted in
+/// diagnostics builds and logged with the memory lines; the code itself is
+/// always built so that its tests run everywhere.
+mod census;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -369,6 +374,11 @@ struct Section {
     /// committed for all of them, and these bits live and die with the
     /// section, so a page number used again in a new section starts clear.
     committed: Box<[AtomicU64]>,
+    /// How many 64 KiB slices the section has.
+    slices: usize,
+    /// With [`pages_ordered`]: the slices given to page numbers so far
+    /// (the next one to give is this index).
+    bound: AtomicUsize,
 }
 
 impl Section {
@@ -376,6 +386,8 @@ impl Section {
         Section {
             handle,
             committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            slices: pages,
+            bound: AtomicUsize::new(0),
         }
     }
 }
@@ -453,10 +465,42 @@ fn lean_remaps() -> bool {
 /// skipped; logged now and then.
 static LEAN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Whether page numbers are given their slice of a section when they are
+/// first used, in the order they are used in, not when they are made
+/// (`VICTORY_PAGES_ORDERED=1`; off by default). The title picks the pages
+/// it maps and the order it maps them in, whatever order they were made
+/// in, so pages that it maps side by side were often made far apart and
+/// show slices that are not consecutive: each such neighbour ends a run,
+/// and the host GPU can read in place only a run of consecutive slices
+/// (`victory_gpu`'s `inplace::run_around`). Given in the order of use, the
+/// pages of one mapping call, or of one DirectStorage request, that no
+/// earlier use has placed get slices that follow on one another, so what
+/// the title maps together is one run from the first time on. A page
+/// keeps its slice for good once it has one: a later mapping that mixes
+/// pages placed at different times has runs as short as before. Nothing
+/// of the title sees a slice, only what a mapping shows, so no title code
+/// can tell; pages still unused have no slice, cost nothing and are
+/// committed when first mapped or written, as before.
+fn pages_ordered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_PAGES_ORDERED").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "physical pages get their slice of a section in the order they are first used, not the order they were made in (VICTORY_PAGES_ORDERED=1)"
+            );
+        }
+        on
+    })
+}
+
 #[derive(Default)]
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    /// With [`pages_ordered`]: page numbers made and not yet used, with the
+    /// section whose slice each will get ([`Physical::bind`]).
+    unbound: HashMap<usize, Arc<Section>>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each page shows: by its section and its index there, the
@@ -465,6 +509,53 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    /// Gives `page` its slice of its section, the next one not given
+    /// ([`pages_ordered`]), if it is made and has none yet. A section has
+    /// a slice for each of its page numbers, so the slices do not run out.
+    fn bind(&mut self, page: usize) {
+        if self.pages.contains_key(&page) {
+            return;
+        }
+        let Some(section) = self.unbound.remove(&page) else {
+            return;
+        };
+        let index = section.bound.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(index < section.slices, "a section's slices run out only if page numbers are bound twice");
+        self.pages.insert(page, Slice { section, index });
+    }
+
+    /// Binds every page of `pages` that has no slice yet, in order.
+    fn bind_all(&mut self, pages: &[usize]) {
+        if !self.unbound.is_empty() {
+            for &page in pages {
+                self.bind(page);
+            }
+        }
+    }
+
+    /// Binds the pages of a scatter (address, page number; number 0
+    /// clears an address) that have no slice yet in the order of their
+    /// addresses: what the title puts side by side gets slices that follow
+    /// on one another, whatever order the array lists it in.
+    fn bind_by_address(&mut self, entries: &[(usize, usize)]) {
+        if self.unbound.is_empty() {
+            return;
+        }
+        let mut fresh: Vec<(usize, usize)> =
+            entries.iter().copied().filter(|&(_, page)| page != 0 && self.unbound.contains_key(&page)).collect();
+        fresh.sort_by_key(|&(address, _)| address);
+        for (_, page) in fresh {
+            self.bind(page);
+        }
+    }
+
+    /// Whether `page` was made and not freed, bound or not.
+    fn knows(&self, page: usize) -> bool {
+        self.pages.contains_key(&page) || self.unbound.contains_key(&page)
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -530,6 +621,12 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// section into the next are two runs, so two views (`runs` and the loop
 /// of [`XMemMapPhysicalPages`] compare the section as well as the index).
 fn allocate_physical(n: usize, per: Option<usize>, out: &mut [usize]) -> Option<usize> {
+    allocate_physical_as(n, per, pages_ordered(), out)
+}
+
+/// [`allocate_physical`] with the pages' slices given now (`ordered` off)
+/// or when each is first used (`ordered`, [`pages_ordered`]).
+fn allocate_physical_as(n: usize, per: Option<usize>, ordered: bool, out: &mut [usize]) -> Option<usize> {
     let per = per.unwrap_or(n).max(1);
     let mut sections: Vec<(Arc<Section>, usize)> = Vec::with_capacity(n.div_ceil(per));
     let mut left = n;
@@ -570,16 +667,22 @@ fn allocate_physical(n: usize, per: Option<usize>, out: &mut [usize]) -> Option<
     let mut k = 0;
     for (section, pages_here) in sections {
         for index in 0..pages_here {
-            let slice = Slice {
-                section: section.clone(),
-                index,
-            };
             let number = first + k * FRAMES;
-            physical.pages.insert(number, slice);
+            if ordered {
+                physical.unbound.insert(number, section.clone());
+            } else {
+                let slice = Slice {
+                    section: section.clone(),
+                    index,
+                };
+                physical.pages.insert(number, slice);
+            }
             out[k] = number;
             k += 1;
         }
     }
+    drop(physical);
+    census::allocated(n, made);
     Some(made)
 }
 
@@ -625,8 +728,12 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let page = unsafe { *pages.add(i) };
+        physical.pages.remove(&page);
+        physical.unbound.remove(&page);
     }
+    drop(physical);
+    census::freed(n);
     1
 }
 
@@ -683,7 +790,11 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let mut physical = physical();
+    // A page with no slice yet gets the next one: the pages of a request
+    // that nothing has placed follow on one another ([`pages_ordered`]).
+    physical.bind_all(pages);
+    census::touched(pages);
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -703,7 +814,15 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// Whether every page under `[offset, offset + len)` is known (a write that
 /// fails with them known is a host failure).
 pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
-    runs(pages, offset, len).is_some()
+    // A question, not a use: it gives no page a slice.
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        return false;
+    };
+    let physical = physical();
+    pages.iter().all(|&page| physical.knows(page))
 }
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
@@ -824,6 +943,20 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if !pages.is_null() && n > 0 && (pages_ordered() || cfg!(feature = "diagnostics")) {
+        // SAFETY: the title passes `n` page numbers.
+        let list = unsafe { std::slice::from_raw_parts(pages, n) };
+        let mut physical = physical();
+        // Pages of one call that have no slice yet get slices that follow
+        // on one another, in the order of the array ([`pages_ordered`]).
+        physical.bind_all(list);
+        census::mapped(&physical, census::Kind::Map, list.iter().enumerate().map(|(i, &page)| (address as usize + i * PAGE, page)));
+    }
+    map_physical(address, n, pages)
+}
+
+/// [`XMemMapPhysicalPages`] after the pages have their slices.
+fn map_physical(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
@@ -839,6 +972,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    // Whatever the caller has not placed yet (nothing, unless the pages
+    // came by a way that does not).
+    physical.bind_all(pages);
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -873,6 +1009,13 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    if !pages.is_null() && n > 0 && (pages_ordered() || cfg!(feature = "diagnostics")) {
+        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+        let entries: Vec<(usize, usize)> = (0..n).map(|i| unsafe { (*addresses.add(i) as usize, *pages.add(i)) }).collect();
+        let mut physical = physical();
+        physical.bind_by_address(&entries);
+        census::mapped(&physical, census::Kind::Scatter, entries.iter().copied());
+    }
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -885,7 +1028,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        if map_physical(address, 1, page).is_null() {
             return 0;
         }
     }
@@ -904,6 +1047,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _changing = mapping_extent(&physical, to, len)
         .map_or_else(victory_gpu::title_memory_remapping, |(at, len)| victory_gpu::title_memory_remapping_range(at, len));
     unmap(&mut physical, to, len);
+    #[cfg(feature = "diagnostics")]
+    let mut shown: Vec<(usize, usize)> = Vec::new();
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -921,10 +1066,14 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        shown.push(slice.key(0));
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
     }
+    #[cfg(feature = "diagnostics")]
+    census::aliased(&shown);
     true
 }
 
@@ -1295,6 +1444,8 @@ pub(crate) fn host_memory_module() -> HleModule {
 }
 
 pub(crate) fn module() -> HleModule {
+    #[cfg(feature = "diagnostics")]
+    census::register();
     HleModule {
         name: "xmem",
         dlls: &["xmem.dll"],
@@ -1916,6 +2067,168 @@ mod tests {
         for (at, n) in [(a, 5), (b, 2)] {
             assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
         }
+        assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
+    }
+
+    /// `n` pages of one new allocation whose slices are given when each is
+    /// first used (`VICTORY_PAGES_ORDERED=1`).
+    fn allocate_ordered(n: usize) -> Vec<usize> {
+        let mut pages = vec![0; n];
+        assert_eq!(allocate_physical_as(n, None, true, &mut pages), Some(1));
+        pages
+    }
+
+    /// The index of the slice a page shows, if it has one.
+    fn index_of(page: usize) -> Option<usize> {
+        physical().pages.get(&page).map(|s| s.index)
+    }
+
+    fn has_no_slice(page: usize) -> bool {
+        physical().unbound.contains_key(&page)
+    }
+
+    fn reserve_pages(n: usize) -> *mut c_void {
+        let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!at.is_null());
+        at
+    }
+
+    fn lengths(pages: &[usize]) -> Vec<usize> {
+        runs(pages, 0, pages.len() * PAGE).expect("known pages").iter().map(|&(_, n)| n).collect()
+    }
+
+    #[test]
+    fn ordered_pages_have_no_slice_until_they_are_used() {
+        let pages = allocate_ordered(4);
+        for w in pages.windows(2) {
+            assert_eq!(w[1], w[0] + FRAMES, "numbers are given out in ascending order all the same");
+        }
+        assert!(pages.iter().all(|&p| has_no_slice(p) && index_of(p).is_none()));
+        // Asking whether they are known uses none of them.
+        assert!(pages_known(&pages, 0, 4 * PAGE));
+        assert!(!pages_known(&pages, 0, 4 * PAGE + 1), "too few pages for the bytes");
+        assert!(pages.iter().all(|&p| has_no_slice(p)));
+        // A page that nothing has used is not shown anywhere.
+        assert!(shown_at(&pages, 0, 4 * PAGE).is_empty());
+        // Freed, it is no longer known; the others still are.
+        assert_eq!(XMemFreePhysicalPages(1, pages[3..].as_ptr()), 1);
+        assert!(!pages_known(&pages[3..], 0, 1));
+        assert!(pages_known(&pages[..3], 0, 3 * PAGE));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn pages_mapped_together_follow_on_one_another_from_the_first_time() {
+        // Mapped out of order, none used before: slices follow the order of
+        // the mapping, so the three are one view of one run.
+        let pages = allocate_ordered(4);
+        let at = reserve_pages(3);
+        let order = [pages[3], pages[1], pages[2]];
+        assert_eq!(XMemMapPhysicalPages(at, 3, order.as_ptr()), at);
+        assert_eq!([index_of(pages[3]), index_of(pages[1]), index_of(pages[2])], [Some(0), Some(1), Some(2)]);
+        assert!(has_no_slice(pages[0]), "a page not mapped is still free to place");
+        assert_eq!(lengths(&order), [3]);
+        {
+            let physical = physical();
+            let (len, slice) = physical.views.get(&(at as usize)).expect("one view");
+            assert_eq!((*len, slice.index), (3 * PAGE, 0));
+        }
+        // The same call when the slices were given at once: out of order
+        // pages are runs of one and two, as they have always been.
+        let early = allocate(4);
+        assert_eq!(lengths(&[early[3], early[1], early[2]]), [1, 2]);
+        // What is mapped is the page's own memory: a byte written at the
+        // second address is the first byte of the second page.
+        // SAFETY: three pages mapped read-write at `at`.
+        unsafe { at.wrapping_byte_add(PAGE).cast::<u8>().write(0x6b) };
+        assert_eq!(page_bytes(pages[1])[0], 0x6b);
+        assert_eq!(XMemMapPhysicalPages(at, 3, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, early.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_scatter_places_new_pages_in_the_order_of_their_addresses() {
+        let pages = allocate_ordered(3);
+        let at = reserve_pages(3);
+        let address = |k: usize| at.wrapping_byte_add(k * PAGE);
+        // The array lists the page for the last address first.
+        let entries = [(address(2) as usize, pages[2]), (address(0) as usize, pages[0]), (address(1) as usize, pages[1])];
+        physical().bind_by_address(&entries);
+        assert_eq!([index_of(pages[0]), index_of(pages[1]), index_of(pages[2])], [Some(0), Some(1), Some(2)]);
+        let addresses = [address(2), address(0), address(1)];
+        let listed = [pages[2], pages[0], pages[1]];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, listed.as_ptr()), 1);
+        // Side by side, the three views show consecutive slices.
+        {
+            let physical = physical();
+            let shown: Vec<usize> = (0..3).map(|k| physical.views.get(&(address(k) as usize)).expect("a view").1.index).collect();
+            assert_eq!(shown, [0, 1, 2]);
+        }
+        // A page already placed keeps its slice for good.
+        let again = [(address(0) as usize, pages[2])];
+        physical().bind_by_address(&again);
+        assert_eq!(index_of(pages[2]), Some(2));
+        let addresses = [address(0), address(1), address(2)];
+        assert_eq!(XMemMapPhysicalPagesScatter(addresses.as_ptr(), 3, [0usize; 3].as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_request_written_to_pages_that_nothing_used_gets_them_in_order() {
+        // DirectStorage's way: the pages of a request, named in the order
+        // of the destination, before anything is mapped.
+        let pages = allocate_ordered(3);
+        let request = [pages[2], pages[0]];
+        let data: Vec<u8> = (0..2 * PAGE).map(|i| (i * 31 % 251) as u8).collect();
+        assert!(write_physical(&request, 0, &data));
+        assert_eq!([index_of(pages[2]), index_of(pages[0])], [Some(0), Some(1)]);
+        assert!(has_no_slice(pages[1]));
+        assert_eq!(lengths(&request), [2]);
+        assert_eq!(page_bytes(pages[2]), data[..PAGE]);
+        assert_eq!(page_bytes(pages[0]), data[PAGE..]);
+        assert!(page_window(&request, 0, 2 * PAGE).is_some(), "one run: a window in place");
+        // Mapped afterwards, in the same order, they are one view.
+        let at = reserve_pages(2);
+        assert_eq!(XMemMapPhysicalPages(at, 2, request.as_ptr()), at);
+        assert_eq!(physical().views.get(&(at as usize)).map(|v| v.0), Some(2 * PAGE));
+        // SAFETY: two pages mapped read-write at `at`.
+        assert_eq!(unsafe { at.wrapping_byte_add(PAGE).cast::<u8>().read() }, data[PAGE]);
+        assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_section_gives_each_of_its_slices_once() {
+        let pages = allocate_ordered(8);
+        let mut taken = Vec::new();
+        for k in [5, 2, 7, 0, 3, 6, 1, 4] {
+            physical().bind(pages[k]);
+            taken.push(index_of(pages[k]).expect("bound"));
+        }
+        assert_eq!(taken, [0, 1, 2, 3, 4, 5, 6, 7], "the slices go out in the order the pages were used");
+        // Binding again changes nothing.
+        physical().bind(pages[5]);
+        assert_eq!(index_of(pages[5]), Some(0));
+        assert_eq!(XMemFreePhysicalPages(8, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn ordered_pages_of_sections_of_a_few_pages_stay_in_their_section() {
+        let mut pages = [0usize; 5];
+        assert_eq!(allocate_physical_as(5, Some(2), true, &mut pages), Some(3));
+        // Sections of pages 0-1, 2-3 and 4. Used out of order.
+        for k in [4, 3, 0, 2, 1] {
+            physical().bind(pages[k]);
+        }
+        let key = |k: usize| physical().pages[&pages[k]].key(0);
+        assert_eq!([0, 1, 2, 3, 4].map(|k| key(k).1), [0, 1, 1, 0, 0]);
+        assert_eq!(key(0).0, key(1).0);
+        assert_ne!(key(1).0, key(2).0);
+        assert_eq!(key(2).0, key(3).0);
+        assert_ne!(key(3).0, key(4).0);
+        assert_eq!(lengths(&[pages[0], pages[1]]), [2]);
+        assert_eq!(lengths(&[pages[2], pages[3]]), [1, 1], "slice 1 then slice 0");
         assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 }

@@ -701,6 +701,19 @@ fn log_memory_map() {
     );
 }
 
+/// Sources of lines for the memory report that other crates keep (each
+/// returns its lines; the report prefixes them with `memory, `).
+static MEMORY_LINES: Mutex<Vec<fn() -> Vec<String>>> = Mutex::new(Vec::new());
+
+/// Adds a source of lines to the memory report, logged with the others
+/// every few seconds; the same function twice counts once.
+pub fn add_memory_lines(source: fn() -> Vec<String>) {
+    let mut sources = MEMORY_LINES.lock().unwrap_or_else(|e| e.into_inner());
+    if !sources.iter().any(|&known| known as usize == source as usize) {
+        sources.push(source);
+    }
+}
+
 /// Logs where the memory is: the process and the PC, then what this crate
 /// holds by kind (alive now), then the host buffers made since the start.
 fn log_memory() {
@@ -908,6 +921,14 @@ fn log_memory() {
     }
     if crate::unified::on() {
         crate::unified::say();
+    }
+    // What other crates add to the memory lines (the runtime's census of
+    // the title's physical pages).
+    let sources: Vec<fn() -> Vec<String>> = MEMORY_LINES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for source in sources {
+        for line in source() {
+            tracing::info!("memory, {line}");
+        }
     }
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
